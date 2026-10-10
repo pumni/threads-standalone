@@ -2,9 +2,9 @@
 
 ## Current checkpoint
 
-SPLIT-06 (`pumni/threads-standalone#12`) authorizes the synthetic-only port of Standalone WorkflowPlan and Recurrence on top of the previously accepted account, API READ, browser READ, mutation journal, and Nurture capabilities. Workflows run in the foreground, sequentially; only an explicitly invoked workflow may post text, as its final step through the SPLIT-04 operation journal. Recurrence create/load/run accepts only READ-only workflow snapshots and remains fixed-anchor and foreground, with no daemon, catch-up, replay, or mutation. The import namespace remains `threads_platform`; the package is `threads-standalone`; the CLI is `threads-local`.
+SPLIT-07 (`pumni/threads-standalone#14`) authorizes cross-platform packaging, dependency/security checks, and synthetic end-to-end QA only. Preserve all account, API READ, browser READ, journaled mutation, Nurture, WorkflowPlan, and READ-only Recurrence behavior. No live Threads call, production release, real state migration, or licensing decision is part of this checkpoint. The import namespace remains `threads_platform`; the package is `threads-standalone`; the CLI is `threads-local`.
 
-The frozen source is `pumni/thread@0dfbd36ff3756f8a68edcd6cc0bd083f6f3570a1`; the authorized destination base is `pumni/threads-standalone@eed547afbaa76fbf25d1f05a17b37c70eaa1ef73`. Keep the old source read-only and stop on any unexpected destination baseline drift. SPLIT-07 is not authorized by this checkpoint.
+The frozen source is `pumni/thread@0dfbd36ff3756f8a68edcd6cc0bd083f6f3570a1`; the authorized destination base is `pumni/threads-standalone@693d4eaaa41ef7988bd9e78a085df245d681eb20`. Keep the old source read-only and stop on any unexpected destination baseline drift. SPLIT-08 and later are not authorized by this checkpoint.
 
 ## Scope and data boundaries
 
@@ -19,8 +19,8 @@ The frozen source is `pumni/thread@0dfbd36ff3756f8a68edcd6cc0bd083f6f3570a1`; th
 - Tests and examples use synthetic UUIDs/IDs/text, fake API/HTTP and Playwright objects, and temporary local roots only. Never contact live Threads, publish/reply/moderate, or read/copy operator accounts, token values, browser data, local operation journals, private evidence, or raw live API data.
 - Do not add Controller, Worker/WorkerJob, PostgreSQL, SQLAlchemy, Alembic, asyncpg, FastAPI, Uvicorn, or a runtime/test/CI dependency on `pumni/thread`.
 - No first-party LICENSE, SPDX declaration, or open-source license claim is authorized. Preserve any original notice and keep the open provenance/license decision documented in `docs/PROVENANCE_DECISION.md`.
-- Implement one authorized checkpoint at a time. SPLIT-07 and later remain unauthorized until separate coordinator review.
+- Implement one authorized checkpoint at a time. SPLIT-08 and later remain unauthorized until separate coordinator review.
 
 ## Validation
 
-Use the locked uv environment. Run `uv sync --locked`, Ruff lint/format, Pyright, pytest, `uv build`, isolated installed-wheel CLI and synthetic API/mutation/Nurture/Workflow/Recurrence smoke, architecture/privacy checks, the full-history secret scan, and `git diff --check`. Hosted CI at the exact Draft PR head is required for checkpoint acceptance.
+Use the locked uv environment on Windows and Linux. Run `uv sync --locked`, Ruff lint/format, Pyright, the complete synthetic pytest suite, `uv build`, and a fresh wheel environment outside the checkout using locked dependencies with no `PYTHONPATH`. Audit runtime dependencies, wheel contents, architecture/privacy boundaries, sanitized errors, path/state handling, account locks, and ambiguous/no-retry behavior. Hosted Windows and Ubuntu CI plus the full-history secret scan at the exact Draft PR head are required for checkpoint acceptance.

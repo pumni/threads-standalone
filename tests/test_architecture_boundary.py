@@ -68,12 +68,22 @@ def test_runtime_dependencies_have_no_old_repo_or_distributed_stack() -> None:
     forbidden_locked = {
         "alembic",
         "asyncpg",
+        "celery",
+        "confluent-kafka",
         "fastapi",
+        "kafka-python",
         "sqlalchemy",
+        "psycopg2",
+        "psycopg2-binary",
         "uvicorn",
         "psycopg",
+        "redis",
     }
     assert locked_names.isdisjoint(forbidden_locked)
+    assert all("git" not in item.get("source", {}) for item in lock["package"])
+    assert all(
+        "pumni/thread" not in str(item.get("source", {})).casefold() for item in lock["package"]
+    )
 
 
 def test_playwright_import_is_confined_to_its_lazy_engine_adapter() -> None:

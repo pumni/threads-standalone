@@ -10,8 +10,8 @@ permissions:
   pull-requests: read
 
 jobs:
-  quality:
-    name: quality and wheel smoke
+  secret-scan:
+    name: full-history Gitleaks
     runs-on: ubuntu-latest
     steps:
       - name: Checkout full history for secret scan
@@ -26,14 +26,35 @@ jobs:
           GITLEAKS_ENABLE_COMMENTS: "false"
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
 
+      - name: Scan complete Git history
+        run: gitleaks detect --source . --redact --exit-code=2 --log-opts=--all
+
+  quality:
+    name: locked QA (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.14"]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Install uv and Python
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.12.23"
-          python-version: "3.14"
+          python-version: ${{ matrix.python-version }}
 
       - name: Sync locked environment
         run: uv sync --locked
+
+      - name: Audit locked runtime dependency tree
+        run: uv tree --locked --no-dev
 
       - name: Ruff lint
         run: uv run --locked ruff check .
@@ -44,40 +65,41 @@ jobs:
       - name: Pyright
         run: uv run --locked pyright
 
-      - name: Synthetic smoke tests
+      - name: Full synthetic test suite
         run: uv run --locked pytest
 
       - name: Build wheel and source distribution
         run: uv build
 
-      - name: Smoke-test installed wheel in an isolated environment
-        run: >-
-          uv run --isolated --no-project
-          --with dist/threads_standalone-0.1.0-py3-none-any.whl threads-local --help
-
-      - name: Smoke-test synthetic WorkflowPlan and recurrence from the installed wheel
+      - name: Install wheel with locked dependencies and test outside the checkout
         env:
+          PYTHONPATH: ""
           THREADS_STANDALONE_WHEEL_SMOKE: "1"
-        run: >-
-          uv run --isolated --no-project
-          --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest --with pytest-asyncio
-          pytest
-          tests/test_workflow_cli.py::test_cli_workflow_mixed_reads_buffer_exact_output_and_uses_one_http_context
-          tests/test_workflow_cli.py::test_cli_workflow_post_success_is_exact_and_never_echoes_text
-          tests/test_recurrence_cli.py::test_cli_recurrence_create_list_show_keep_workflow_metadata_private
-
-      - name: Smoke-test mocked API read and journaled mutation from the installed wheel
-        run: >-
-          uv run --isolated --no-project
-          --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest --with pytest-asyncio
-          pytest tests/test_api_contract.py::test_wheel_smoke_quota_read
-          tests/test_mutation_runtime.py::test_success_has_durable_phase_order_exact_text_request_and_one_publish
-          tests/test_browser_runtime.py::test_wheel_smoke_browser_read
-
-      - name: Smoke-test synthetic Nurture observe, apply, and insights from the installed wheel
-        env:
-          THREADS_STANDALONE_WHEEL_SMOKE: "1"
-        run: >-
-          uv run --isolated --no-project
-          --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest --with pytest-asyncio
-          pytest tests/test_nurture_cli.py::test_wheel_smoke_nurture_observe_apply_and_insights
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $requirements = Join-Path $env:RUNNER_TEMP 'locked-wheel-smoke-requirements.txt'
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          $wheel = Get-ChildItem -LiteralPath $dist -Filter 'threads_standalone-0.1.0-*.whl' | Select-Object -First 1
+          if (-not $wheel) { throw 'built wheel was not found' }
+          $env:THREADS_STANDALONE_WHEEL_PATH = $wheel.FullName
+          uv export --locked --no-emit-project --output-file $requirements | Out-Null
+          $venv = Join-Path $env:RUNNER_TEMP 'wheel-smoke-venv'
+          uv venv --python 3.14 $venv
+          if ($IsWindows) {
+            $python = Join-Path $venv 'Scripts/python.exe'
+            $cli = Join-Path $venv 'Scripts/threads-local.exe'
+          } else {
+            $python = Join-Path $venv 'bin/python'
+            $cli = Join-Path $venv 'bin/threads-local'
+          }
+          uv pip sync --python $python $requirements
+          uv pip install --python $python --no-deps $wheel.FullName
+          Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+          Push-Location $env:RUNNER_TEMP
+          try {
+            & $cli --help
+            & $python -m pytest (Join-Path $env:GITHUB_WORKSPACE 'tests')
+          } finally {
+            Pop-Location
+          }
