@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .pytest-tmp-split02/
 .pytest-tmp-split03/
+.pytest-tmp-split04/
 .ruff_cache/
 .pyright/
 build/

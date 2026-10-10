@@ -52,7 +52,7 @@ def test_help_lists_every_account_and_api_read_command(capsys: pytest.CaptureFix
     assert "publish" not in output
 
 
-def test_help_lists_local_browser_commands_without_mutation_commands(
+def test_help_lists_local_browser_and_mutation_commands_without_distributed_commands(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit) as exit_info:
@@ -60,9 +60,22 @@ def test_help_lists_local_browser_commands_without_mutation_commands(
 
     assert exit_info.value.code == 0
     output = capsys.readouterr().out
-    for command in ("account", "profile", "thread", "feed", "api"):
+    for command in (
+        "account",
+        "profile",
+        "thread",
+        "feed",
+        "api",
+        "post",
+        "reply",
+        "post-image",
+        "post-video",
+        "post-carousel",
+        "moderate-reply",
+        "operation",
+    ):
         assert command in output
-    for forbidden in ("publish", "reply", "worker"):
+    for forbidden in ("controller", "worker", "postgres"):
         assert forbidden not in output
 
 
