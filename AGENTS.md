@@ -2,7 +2,9 @@
 
 ## Current checkpoint
 
-SPLIT-07 (`pumni/threads-standalone#14`) authorizes cross-platform packaging, dependency/security checks, and synthetic end-to-end QA only. Preserve all account, API READ, browser READ, journaled mutation, Nurture, WorkflowPlan, and READ-only Recurrence behavior. No live Threads call, production release, real state migration, or licensing decision is part of this checkpoint. The import namespace remains `threads_platform`; the package is `threads-standalone`; the CLI is `threads-local`.
+SPLIT-08 (`pumni/threads-standalone#16`) authorizes synthetic offline v1 state compatibility, fresh-process reads, cold-copy verification, rollback rehearsal, and supporting documentation only. Destination base is `db7a3236cad881f9ed097d99cebdc76e6ac7e6c4`; frozen source is `pumni/thread@0dfbd36ff3756f8a68edcd6cc0bd083f6f3570a1` and remains READ-ONLY. Work on `codex/split-08-synthetic-state-rehearsal` from that exact base. Stop on any unexpected baseline drift.
+
+All fixture state must be newly generated under an explicit temporary root. Never inspect or copy an operator data root, account state, token value, browser profile/cookie, local operation journal, or private evidence. Use a fresh interpreter for zero-write audit; do not invoke `nurture run` or `recurrence run` to claim read-only behavior because they may write receipts or recurrence records. Do not edit product codecs/schema or add a migration utility. The real operator rehearsal is not authorized or performed. The import namespace remains `threads_platform`; the package is `threads-standalone`; the CLI is `threads-local`.
 
 The frozen source is `pumni/thread@0dfbd36ff3756f8a68edcd6cc0bd083f6f3570a1`; the authorized destination base is `pumni/threads-standalone@693d4eaaa41ef7988bd9e78a085df245d681eb20`. Keep the old source read-only and stop on any unexpected destination baseline drift. SPLIT-08 and later are not authorized by this checkpoint.
 
@@ -19,7 +21,7 @@ The frozen source is `pumni/thread@0dfbd36ff3756f8a68edcd6cc0bd083f6f3570a1`; th
 - Tests and examples use synthetic UUIDs/IDs/text, fake API/HTTP and Playwright objects, and temporary local roots only. Never contact live Threads, publish/reply/moderate, or read/copy operator accounts, token values, browser data, local operation journals, private evidence, or raw live API data.
 - Do not add Controller, Worker/WorkerJob, PostgreSQL, SQLAlchemy, Alembic, asyncpg, FastAPI, Uvicorn, or a runtime/test/CI dependency on `pumni/thread`.
 - No first-party LICENSE, SPDX declaration, or open-source license claim is authorized. Preserve any original notice and keep the open provenance/license decision documented in `docs/PROVENANCE_DECISION.md`.
-- Implement one authorized checkpoint at a time. SPLIT-08 and later remain unauthorized until separate coordinator review.
+- Implement one authorized checkpoint at a time. SPLIT-09 cutover and SPLIT-10 source cleanup remain unauthorized until separate coordinator review.
 
 ## Validation
 
