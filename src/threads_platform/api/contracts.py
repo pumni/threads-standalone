@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import StrEnum
+from typing import Literal, Protocol
+
+from pydantic import SecretStr
+
+
+class DiscoverySearchMode(StrEnum):
+    KEYWORD = "KEYWORD"
+    TAG = "TAG"
+
+
+class DiscoverySearchType(StrEnum):
+    TOP = "TOP"
+    RECENT = "RECENT"
+
+
+class ThreadPostInsightName(StrEnum):
+    LIKES = "likes"
+    REPLIES = "replies"
+    REPOSTS = "reposts"
+    QUOTES = "quotes"
+
+
+THREAD_POST_INSIGHT_ORDER = (
+    ThreadPostInsightName.LIKES,
+    ThreadPostInsightName.REPLIES,
+    ThreadPostInsightName.REPOSTS,
+    ThreadPostInsightName.QUOTES,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadPostInsightMetric:
+    name: ThreadPostInsightName
+    value: int | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.name) is not ThreadPostInsightName
+            or (self.value is not None and type(self.value) is not int)
+            or (self.value is not None and self.value < 0)
+        ):
+            raise ValueError("invalid Threads post insight metric")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ThreadPostInsights:
+    media_id: str
+    period: Literal["lifetime"]
+    metrics: tuple[ThreadPostInsightMetric, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.media_id) is not str
+            or not self.media_id
+            or type(self.period) is not str
+            or self.period != "lifetime"
+            or type(self.metrics) is not tuple
+        ):
+            raise ValueError("invalid Threads post insights result")
+        for metric in self.metrics:
+            if (
+                type(metric) is not ThreadPostInsightMetric
+                or type(metric.name) is not ThreadPostInsightName
+                or (metric.value is not None and type(metric.value) is not int)
+                or (metric.value is not None and metric.value < 0)
+            ):
+                raise ValueError("invalid Threads post insight metric")
+        if tuple(metric.name for metric in self.metrics) != THREAD_POST_INSIGHT_ORDER:
+            raise ValueError("invalid Threads post insights result")
+
+    def __repr__(self) -> str:
+        return f"ThreadPostInsights(period={self.period!r}, metrics={self.metrics!r})"
+
+
+@dataclass(frozen=True, slots=True)
+class PublishingQuota:
+    usage: int | None = None
+    total: int | None = None
+    reply_usage: int | None = None
+    reply_total: int | None = None
+    duration_seconds: int | None = None
+    reply_duration_seconds: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteMedia:
+    media_id: str
+    text: str | None = None
+    permalink: str | None = None
+    published_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteReply:
+    reply_id: str
+    text: str | None
+    timestamp: str | None
+    root_post_id: str | None
+    replied_to_id: str | None
+    is_reply_owned_by_me: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReplyPage:
+    replies: tuple[RemoteReply, ...]
+    next_cursor: str | None
+    has_more: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteDiscoveryThread:
+    remote_thread_id: str
+    author_remote_id: str | None
+    username: str | None
+    text: str | None
+    permalink: str | None
+    media_type: str | None
+    timestamp: datetime | None
+    is_quote_post: bool | None
+    has_replies: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class RemotePublicProfile:
+    remote_author_id: str
+    username: str
+    display_name: str | None
+    biography: str | None
+    profile_picture_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryPage:
+    threads: tuple[RemoteDiscoveryThread, ...]
+    next_cursor: str | None
+    has_more: bool
+
+
+class ThreadsAPIError(Exception):
+    """A sanitized Threads API failure. Response bodies are never attached."""
+
+    def __init__(self, code: str, retry_after: timedelta | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+        self.retry_after = retry_after
+
+
+class ThreadsTransportError(ThreadsAPIError):
+    def __init__(self) -> None:
+        super().__init__("THREADS_TRANSPORT_FAILURE")
+
+
+class ThreadsContractError(ThreadsAPIError):
+    def __init__(self) -> None:
+        super().__init__("THREADS_DOCUMENTATION_CONTRACT_MISMATCH")
+
+
+class ThreadsAPI(Protocol):
+    async def get_media(self, token: SecretStr, media_id: str) -> RemoteMedia: ...
+
+    async def get_post_insights(self, token: SecretStr, media_id: str) -> ThreadPostInsights: ...
+
+    async def get_publishing_quota(self, token: SecretStr) -> PublishingQuota: ...
+
+    async def get_replies(
+        self, token: SecretStr, thread_id: str, after: str | None
+    ) -> ReplyPage: ...
+
+    async def get_conversation(
+        self, token: SecretStr, thread_id: str, after: str | None
+    ) -> ReplyPage: ...
+
+    async def search_threads(
+        self,
+        token: SecretStr,
+        query: str,
+        *,
+        search_mode: DiscoverySearchMode,
+        search_type: DiscoverySearchType,
+        after: str | None,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int,
+    ) -> DiscoveryPage: ...
+
+    async def get_public_profile(self, token: SecretStr, username: str) -> RemotePublicProfile: ...
+
+    async def get_profile_posts(
+        self, token: SecretStr, username: str, *, after: str | None, limit: int
+    ) -> DiscoveryPage: ...
+
+    async def get_mentions(
+        self,
+        token: SecretStr,
+        *,
+        after: str | None,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int,
+    ) -> DiscoveryPage: ...
+
+
+class ThreadsCredentialErrorCode(StrEnum):
+    NOT_CONFIGURED = "THREADS_CREDENTIAL_NOT_CONFIGURED"
+    EXPIRED = "THREADS_CREDENTIAL_EXPIRED"
+    REAUTHORIZATION_REQUIRED = "THREADS_REAUTHORIZATION_REQUIRED"
+    SECRET_UNAVAILABLE = "THREADS_CREDENTIAL_SECRET_UNAVAILABLE"
+    INVALID = "THREADS_CREDENTIAL_INVALID"
+
+
+class ThreadsCredentialError(Exception):
+    """A sanitized credential failure that is safe to print in CLI output."""
+
+    def __init__(self, code: ThreadsCredentialErrorCode) -> None:
+        super().__init__(code.value)
+        self.code = code.value
+        self.retryable = code is ThreadsCredentialErrorCode.SECRET_UNAVAILABLE
+
+
+class ThreadsCredentialSecretResolver(Protocol):
+    async def resolve(self, credential_ref: str) -> SecretStr: ...

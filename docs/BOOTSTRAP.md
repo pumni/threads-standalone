@@ -1,14 +1,20 @@
-# Bootstrap acceptance
+# SPLIT-02 acceptance
 
-## SPLIT-01 scope
+## Checkpoint scope
 
-This bootstrap uses Python 3.14, a `threads-standalone` distribution, the retained `threads_platform` import namespace, and the `threads-local` entrypoint. The command only parses `--help`; no network, browser, credentials, local state, PostgreSQL, Worker, or Control Plane code is present.
+This destination implementation ports local account metadata, environment-backed credential references, and the complete frozen-source Threads API READ CLI surface. The package is `threads-standalone`, the import namespace remains `threads_platform`, and the executable is `threads-local`.
 
-The package is a new skeleton. It has no runtime dependency on the public `pumni/thread` repository and contains no source or test copied from that repository.
+Account documents retain schema v1, UUIDs, aliases, and optional `env://` credential references. The secret value is read from the explicitly named process environment variable for each API invocation and is not persisted or cached. `THREADS_LOCAL_DATA_ROOT` and its path protections remain in force.
+
+API reads are `quota`, `media`, `post-insights`, `public-profile`, `profile-posts`, `search`, `mentions`, `replies`, and `conversation`. Paging cursors, CLI flags, request fields, normalized error codes, and bounded/sanitized CLI output are covered by synthetic tests in `docs/API_READ_PARITY.md`.
+
+## Hard exclusions
+
+No API mutation, browser/profile behavior, Controller, Worker/WorkerJob, PostgreSQL/SQLAlchemy/Alembic/asyncpg, FastAPI/Uvicorn, old-repository runtime dependency, real token, local account root, live API request, or production-read claim is included. Later standalone capability checkpoints require separate authorization.
 
 ## Local gates
 
-Run from a clean checkout:
+Run from a clean checkout with Python 3.14 and uv:
 
 ```powershell
 uv sync --locked
@@ -17,12 +23,13 @@ uv run --locked ruff format --check .
 uv run --locked pyright
 uv run --locked pytest
 uv build
-uv run --isolated --no-project --with dist/*.whl threads-local --help
+uv run --isolated --no-project --with dist/threads_standalone-0.1.0-py3-none-any.whl threads-local --help
+uv run --isolated --no-project --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest pytest tests/test_api_contract.py::test_wheel_smoke_quota_read
 git diff --check
 ```
 
-CI also runs a secret scan and the same locked quality/build gates. It requires only the repository-scoped ephemeral `GITHUB_TOKEN`; no Threads, database, or personal access token is configured.
+GitHub Actions additionally runs a full-history secret scan and the locked quality/build/wheel smoke gates. API smoke responses are fake HTTP responses; no Threads credential or network access is used by tests.
 
-## Repository controls
+## Provenance and data controls
 
-The destination was verified PRIVATE before its first file push; on 2026-10-10 the operator explicitly changed GitHub visibility to PUBLIC to enable hosted CI. The current PUBLIC status is intentional, but this does not authorize uploading any local account state, profile, token, journal, operator evidence, remote IDs, raw cursor, username, URLs or post/draft content. Maintain an independent Git history and protect the default branch with required CI and secret scan after coordinator acceptance. Do not enable publishing, mutation, PostgreSQL, Worker, or source-monorepo dependencies.
+The file-level audit and remaining license decision are in [PROVENANCE_DECISION.md](PROVENANCE_DECISION.md). The destination is public. Never commit token values, cookies, browser profiles, real account state, remote identifiers/cursors, usernames, URLs or content from live Threads responses, operation journals, private evidence, or personal email addresses.

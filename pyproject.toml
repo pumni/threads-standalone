@@ -5,10 +5,14 @@ build-backend = "uv_build"
 [project]
 name = "threads-standalone"
 version = "0.1.0"
-description = "Private Standalone product bootstrap skeleton"
+description = "Standalone local account and Threads API tooling"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
-dependencies = []
+dependencies = [
+  "httpx2>=2,<3",
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.7,<3",
+]
 
 [project.scripts]
 threads-local = "threads_platform.standalone.__main__:main"
