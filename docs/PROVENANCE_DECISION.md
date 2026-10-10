@@ -2,7 +2,7 @@
 
 ## Status
 
-**File-level transfer audit: PASS for the listed SPLIT-02, SPLIT-03, SPLIT-04, and SPLIT-05 files. Public distribution/license policy: OPEN under `pumni/threads-standalone#2`.** The owner-directed engineering migration allows the bounded transfer recorded below; it is not a blanket relicensing or legal determination. No first-party LICENSE or SPDX marker is added.
+**File-level transfer audit: PASS for the listed SPLIT-02 through SPLIT-06 files. Public distribution/license policy: OPEN under `pumni/threads-standalone#2`.** The owner-directed engineering migration allows the bounded transfer recorded below; it is not a blanket relicensing or legal determination. No first-party LICENSE or SPDX marker is added.
 
 ## Audit method and limitations
 
@@ -79,9 +79,24 @@ The imports in the transferred files were adapted only from monorepo API/process
 
 The transferred tests contain only deterministic fake API values, synthetic account/remote identifiers, test-only text and temporary filesystem state. Source history and header checks do not prove a general public reuse license; only the bounded provenance classification above is recorded.
 
-## Source tests audited but not transferred
+## SPLIT-06 WorkflowPlan and Recurrence transfer audit
 
-The following source test histories were inspected for origin/restrictions and behavior; destination coverage was written as targeted synthetic tests rather than copying these files: `tests/unit/test_standalone_api.py`, `tests/unit/test_standalone_cli.py`, `tests/unit/test_standalone_app.py`, `tests/unit/test_standalone_runtime.py`, `tests/unit/test_browser_adapter.py`, `tests/unit/test_browser_capabilities.py`, `tests/unit/test_threads_api_contract.py`, `tests/unit/test_threads_discovery_contract.py`, `tests/unit/test_threads_credential_secrets.py`, `tests/unit/test_threads_httpx2_transport.py`, and `tests/unit/test_standalone_architecture.py`. The SPLIT-04 mutation runtime test file listed above is the only transferred source test in this checkpoint; other CLI, API, and architecture coverage is destination-authored and uses synthetic values and fake transports. No Worker fixture or live-evidence test was transferred.
+Before copying, the source history, file headers, repository license/notice inventory, and third-party attribution/restriction markers were checked for each implementation and test source below at the frozen source SHA. The listed first-party histories resolve to the repository owner `pumni`; no file contains a copyright, SPDX, generated-code, or third-party implementation notice, and the source repository has no first-party LICENSE, COPYING, or NOTICE. The audit classification is limited to `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` under the coordinator authorization for #12. Public reuse rights remain undecided under issue #2.
+
+| Frozen source path | Destination path | Classification | Treatment |
+| --- | --- | --- | --- |
+| `src/threads_platform/standalone/workflows.py` | `src/threads_platform/standalone/workflows.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Ported strict WorkflowPlan v1 parsing, bounded sequential execution, step errors, and the optional final `post_text` route. Imports were mapped to the existing destination API, browser, mutation, and runtime contracts; browser runtime construction remains conditional on browser steps. |
+| `src/threads_platform/standalone/recurrences.py` | `src/threads_platform/standalone/recurrences.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Ported recurrence record/snapshot v1, local atomic persistence, path checks, process lock, fixed-anchor foreground runner, skip/no-replay behavior, and read-only snapshot validation. Imports were mapped to the destination locks and WorkflowPlan module. |
+| `src/threads_platform/standalone/__main__.py` | `src/threads_platform/standalone/__main__.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Adapted only WorkflowPlan/Recurrence imports, command handlers, formatting, parser entries, and sanitized errors. Existing account, API, browser, mutation, and Nurture branches remain. |
+| `tests/unit/test_standalone_workflows.py` | `tests/test_workflows.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred 19 synthetic Workflow test functions; API/browser/mutation dependencies map to destination contracts and fake runtimes. |
+| `tests/unit/test_standalone_recurrences.py` | `tests/test_recurrences.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred 28 synthetic Recurrence test functions; state and clock use temporary directories and fake timing. |
+| Selected Workflow and Recurrence CLI tests from `tests/unit/test_standalone_cli.py` | `tests/test_workflow_cli.py`, `tests/test_recurrence_cli.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred seven Workflow and three Recurrence CLI regression functions only. Destination imports were mapped; the API-only workflow regression now asserts the browser runtime is not constructed. Other source CLI tests and helpers were not copied. |
+
+The destination-only tests and documentation use synthetic identifiers, test text, fake API/HTTP/browser adapters, temporary roots, and fake time. The new CI wheel smoke invokes fake Workflow reads, a fake final post, and recurrence create/list/show. It performs no live API request or mutation. No token, real account state, browser profile/cookie, local journal, private evidence, or private source data was accessed or copied. No third-party implementation, binary, dependency, or license declaration was added; `uv.lock` is unchanged. Issue #2 remains OPEN.
+
+## Other source tests audited but not transferred
+
+Other source test histories were inspected for origin/restrictions and behavior, but those files were not transferred: `tests/unit/test_standalone_api.py`, `tests/unit/test_standalone_app.py`, `tests/unit/test_standalone_runtime.py`, `tests/unit/test_browser_adapter.py`, `tests/unit/test_browser_capabilities.py`, `tests/unit/test_threads_api_contract.py`, `tests/unit/test_threads_discovery_contract.py`, `tests/unit/test_threads_credential_secrets.py`, `tests/unit/test_threads_httpx2_transport.py`, and `tests/unit/test_standalone_architecture.py`. Only the specific Workflow and Recurrence CLI functions listed in the SPLIT-06 audit table were selected from `test_standalone_cli.py`; the mixed source CLI file was not copied. No Worker fixture or live-evidence test was transferred.
 
 ## Third-party dependency review
 

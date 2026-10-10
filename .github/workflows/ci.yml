@@ -55,6 +55,17 @@ jobs:
           uv run --isolated --no-project
           --with dist/threads_standalone-0.1.0-py3-none-any.whl threads-local --help
 
+      - name: Smoke-test synthetic WorkflowPlan and recurrence from the installed wheel
+        env:
+          THREADS_STANDALONE_WHEEL_SMOKE: "1"
+        run: >-
+          uv run --isolated --no-project
+          --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest --with pytest-asyncio
+          pytest
+          tests/test_workflow_cli.py::test_cli_workflow_mixed_reads_buffer_exact_output_and_uses_one_http_context
+          tests/test_workflow_cli.py::test_cli_workflow_post_success_is_exact_and_never_echoes_text
+          tests/test_recurrence_cli.py::test_cli_recurrence_create_list_show_keep_workflow_metadata_private
+
       - name: Smoke-test mocked API read and journaled mutation from the installed wheel
         run: >-
           uv run --isolated --no-project

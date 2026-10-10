@@ -1,4 +1,40 @@
-# SPLIT-05 acceptance
+# SPLIT-06 acceptance
+
+## Checkpoint scope
+
+This checkpoint ports Standalone WorkflowPlan and Recurrence from frozen source `pumni/thread@0dfbd36ff3756f8a68edcd6cc0bd083f6f3570a1` onto destination baseline `pumni/threads-standalone@eed547afbaa76fbf25d1f05a17b37c70eaa1ef73`. The Python namespace remains `threads_platform`; the command remains `threads-local`. The full mapping and limits are in [WORKFLOW_RECURRENCE_PARITY.md](WORKFLOW_RECURRENCE_PARITY.md).
+
+`threads-local workflow run FILE` loads and validates the whole v1 plan before account lookup, then executes its steps sequentially in the foreground. It accepts 1–32 steps, at most 65,536 bytes, and one `post_text` mutation only as the last step. A post runs only after explicit operator invocation and goes through the existing SPLIT-04 mutation runtime and operation journal. API-only plans do not instantiate a browser runtime. Output is buffered until completion; a failure stops the workflow and no step is retried by the runner.
+
+Recurrence commands are `create FILE --every-seconds N`, `list`, `show ID`, `run ID`, and `disable ID`. A create validates the workflow as READ-only and atomically snapshots its bytes. Each load/run validates the v1 snapshot again and rejects mutation or unclassified future steps. Record v1 has exactly the documented metadata keys; snapshot, `record.json`, and `runner.lock` are stored under `<data-root>/recurrences/<id>/`. `run` is an operator-started foreground loop using a fixed anchor: missed boundaries are skipped, interrupted occurrences are marked and not replayed, and no daemon or remote mutation is created. Existing account and SPLIT-04 operation-journal schemas are unchanged. No automatic migration or conversion of local recurrence data is performed.
+
+All new tests are synthetic and use temporary local roots, fake API/HTTP calls, fixed UUIDs, and fake recurrence timing. No live Threads call, account state, token, browser profile, or operator journal is used. Workflow browser reads retain the existing local browser lock and only initialize that runtime for a workflow containing a browser step.
+
+## Local gates
+
+From a clean Python 3.14 checkout, run:
+
+```powershell
+uv sync --locked
+uv run --locked ruff check .
+uv run --locked ruff format --check .
+uv run --locked pyright
+uv run --locked pytest
+uv build
+uv run --isolated --no-project --with dist/threads_standalone-0.1.0-py3-none-any.whl threads-local --help
+uv run --isolated --no-project --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest --with pytest-asyncio pytest tests/test_workflow_cli.py::test_cli_workflow_mixed_reads_buffer_exact_output_and_uses_one_http_context tests/test_workflow_cli.py::test_cli_workflow_post_success_is_exact_and_never_echoes_text tests/test_recurrence_cli.py::test_cli_recurrence_create_list_show_keep_workflow_metadata_private
+git diff --check
+```
+
+GitHub Actions additionally runs full-history secret scanning, architecture/privacy checks, and the same locked build/wheel checks at the Draft PR head. Smoke behavior is synthetic; it does not require a Threads credential or old-repository checkout.
+
+## Hard exclusions
+
+No Controller, Worker/WorkerJob, scheduler, PostgreSQL/SQLAlchemy/Alembic/asyncpg, FastAPI/Uvicorn, old-repository runtime dependency, live API request, browser login, or production-read claim is included. No first-party LICENSE, SPDX declaration, or public reuse claim is added; issue #2 remains open. SPLIT-07 needs separate authorization.
+
+## Prior checkpoint reference
+
+## SPLIT-05 acceptance (previous checkpoint)
 
 ## Checkpoint scope
 

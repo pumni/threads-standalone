@@ -7,6 +7,7 @@ import asyncio
 import re
 import sys
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -22,6 +23,10 @@ from threads_platform.api.contracts import (
     ReplyPage,
     ThreadsAPIError,
     ThreadsCredentialError,
+)
+from threads_platform.browser.capabilities import (
+    BrowserFeedResultV1,
+    BrowserTargetOpenResultV1,
 )
 from threads_platform.standalone.accounts import (
     LocalAccount,
@@ -71,6 +76,23 @@ from threads_platform.standalone.nurture_runner import (
     NurtureRunResult,
 )
 from threads_platform.standalone.nurture_store import NurtureStore
+from threads_platform.standalone.recurrences import (
+    LocalRecurrenceRunner,
+    LocalRecurrenceStore,
+    RecurrenceRecord,
+    StandaloneRecurrenceError,
+)
+from threads_platform.standalone.workflows import (
+    FeedStep,
+    LocalWorkflowRuntime,
+    ProfileStep,
+    StandaloneWorkflowError,
+    ThreadStep,
+    WorkflowPlan,
+    WorkflowStepResult,
+    is_read_only_workflow,
+    load_workflow,
+)
 
 
 def _format_scalar(value: int | str | None) -> str:
@@ -129,11 +151,25 @@ def _format_public_profile(profile: RemotePublicProfile) -> str:
     )
 
 
-def _format_discovery_page(kind: str, page: DiscoveryPage, limit: int) -> str:
+def _format_discovery_page(
+    kind: str,
+    page: DiscoveryPage,
+    limit: int,
+    *,
+    workflow_step: int | None = None,
+) -> str:
     threads = page.threads[: min(max(limit, 0), 50)]
+    heading = (
+        f"{kind} " if workflow_step is None else f"workflow step={workflow_step} action={kind} "
+    )
+    thread_heading = (
+        "thread "
+        if workflow_step is None
+        else f"workflow step={workflow_step} action={kind} thread "
+    )
     lines = [
         (
-            f"{kind} count={len(threads)} "
+            f"{heading}count={len(threads)} "
             f"has_more={str(page.has_more).lower()} "
             f"next_cursor={_format_discovery_cursor(page.next_cursor)}\n"
         )
@@ -143,7 +179,7 @@ def _format_discovery_page(kind: str, page: DiscoveryPage, limit: int) -> str:
         quote = "-" if thread.is_quote_post is None else str(thread.is_quote_post).lower()
         has_replies = "-" if thread.has_replies is None else str(thread.has_replies).lower()
         lines.append(
-            f"thread {_format_bounded_text(thread.remote_thread_id, 255)} "
+            f"{thread_heading}{_format_bounded_text(thread.remote_thread_id, 255)} "
             f"username={_format_bounded_text(thread.username, 255)} "
             f"timestamp={_format_bounded_text(timestamp, 64)} "
             f"media_type={_format_bounded_text(thread.media_type, 80)} "
@@ -289,6 +325,134 @@ async def _run_carousel_post_command(
         assert app.mutations is not None
         result = await app.mutations.publish_carousel(alias, manifest)
     return f"published-carousel operation={result.operation_id} media={result.media_id}\n"
+
+
+async def _run_workflow_command(
+    plan: WorkflowPlan,
+    root: Path,
+    store: LocalAccountStore,
+) -> str:
+    results = await _execute_workflow_plan(plan, root, store)
+    return _format_workflow_results(results)
+
+
+async def _execute_workflow_plan(
+    plan: WorkflowPlan,
+    root: Path,
+    store: LocalAccountStore,
+) -> tuple[WorkflowStepResult, ...]:
+    browser_steps = (FeedStep, ProfileStep, ThreadStep)
+    needs_browser = any(isinstance(step, browser_steps) for step in plan.steps)
+    needs_mutation = not is_read_only_workflow(plan)
+    browser: Any = None
+    if needs_browser:
+        from threads_platform.standalone.runtime import LocalRuntime
+
+        browser = LocalRuntime(root, store)
+    async with build_standalone_app(root, store, include_mutations=needs_mutation) as app:
+        runtime = LocalWorkflowRuntime(app.api, app.mutations, browser)
+        return await runtime.run(plan)
+
+
+async def _run_recurrence_command(
+    recurrence_id: str,
+    root: Path,
+    accounts: LocalAccountStore,
+    recurrences: LocalRecurrenceStore,
+) -> None:
+    async def execute_once(plan: WorkflowPlan) -> object:
+        return await _execute_workflow_plan(plan, root, accounts)
+
+    await LocalRecurrenceRunner(recurrences).run(recurrence_id, execute_once)
+
+
+def _format_recurrence_record(record: RecurrenceRecord) -> str:
+    last_outcome = record.last_outcome or "-"
+    last_error = record.last_error_code or "-"
+    last_step = _format_scalar(record.last_step_index)
+    return (
+        f"recurrence id={record.id} status={record.status} account={record.account} "
+        f"every_seconds={record.interval_seconds} "
+        f"next_due_at={_format_recurrence_timestamp(record.next_due_at)} "
+        f"last_outcome={last_outcome} last_error_code={last_error} "
+        f"last_step_index={last_step}\n"
+    )
+
+
+def _format_recurrence_timestamp(value: datetime) -> str:
+    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _format_workflow_results(results: tuple[WorkflowStepResult, ...]) -> str:
+    lines: list[str] = []
+    for result in results:
+        value = result.value
+        if isinstance(value, PublishingQuota):
+            lines.append(
+                f"workflow step={result.index} action=quota "
+                f"usage={_format_scalar(value.usage)} total={_format_scalar(value.total)} "
+                f"reply_usage={_format_scalar(value.reply_usage)} "
+                f"reply_total={_format_scalar(value.reply_total)}\n"
+            )
+        elif isinstance(value, RemoteMedia):
+            lines.append(
+                f"workflow step={result.index} action=media id={value.media_id} "
+                f"timestamp={_format_scalar(value.published_at)} "
+                f"permalink={_format_scalar(value.permalink)} "
+                f"text={_format_text(value.text)}\n"
+            )
+        elif isinstance(value, ReplyPage):
+            lines.append(
+                f"workflow step={result.index} action={result.action} "
+                f"count={len(value.replies)} has_more={str(value.has_more).lower()} "
+                f"next_cursor={_format_scalar(value.next_cursor)}\n"
+            )
+            for reply in value.replies:
+                lines.append(
+                    f"workflow step={result.index} action={result.action} reply {reply.reply_id} "
+                    f"timestamp={_format_scalar(reply.timestamp)} "
+                    f"root={_format_scalar(reply.root_post_id)} "
+                    f"parent={_format_scalar(reply.replied_to_id)} "
+                    f"text={_format_text(reply.text)}\n"
+                )
+        elif isinstance(value, BrowserTargetOpenResultV1):
+            lines.append(
+                f"workflow step={result.index} action={result.action} recognized "
+                f"target={_format_bounded_text(value.target_ref, 255)}\n"
+            )
+        elif isinstance(value, BrowserFeedResultV1):
+            lines.append(
+                f"workflow step={result.index} action=feed count={len(value.observations)} "
+                f"truncated={str(value.truncated).lower()}\n"
+            )
+            for item in value.observations:
+                lines.append(
+                    f"workflow step={result.index} action=feed item position={item.position} "
+                    f"thread_ref={_format_bounded_text(item.thread_ref, 255)} "
+                    f"author={_format_bounded_text(item.author_username, 30)} "
+                    f"text={_format_bounded_text(item.text_excerpt, 500)}\n"
+                )
+        elif isinstance(value, RemotePublicProfile):
+            lines.append(
+                f"workflow step={result.index} action=public_profile {_format_public_profile(value)}"
+            )
+        elif isinstance(value, DiscoveryPage):
+            lines.append(
+                _format_discovery_page(
+                    result.action,
+                    value,
+                    50,
+                    workflow_step=result.index,
+                )
+            )
+        else:
+            assert result.action == "post_text"
+            lines.append(
+                f"workflow step={result.index} action=post_text published "
+                f"operation={value.operation_id} media={value.media_id}\n"
+            )
+    lines.append(f"workflow completed steps={len(results)}\n")
+    return "".join(lines)
 
 
 async def _run_nurture_command(
@@ -545,6 +709,24 @@ def _build_parser() -> argparse.ArgumentParser:
     show_parser = operation_commands.add_parser("show")
     show_parser.add_argument("operation_id")
 
+    workflow_parser = commands.add_parser("workflow")
+    workflow_commands = workflow_parser.add_subparsers(dest="workflow_command", required=True)
+    run_workflow_parser = workflow_commands.add_parser("run")
+    run_workflow_parser.add_argument("file")
+
+    recurrence_parser = commands.add_parser("recurrence")
+    recurrence_commands = recurrence_parser.add_subparsers(dest="recurrence_command", required=True)
+    create_recurrence_parser = recurrence_commands.add_parser("create")
+    create_recurrence_parser.add_argument("file")
+    create_recurrence_parser.add_argument("--every-seconds", type=int, required=True)
+    recurrence_commands.add_parser("list")
+    show_recurrence_parser = recurrence_commands.add_parser("show")
+    show_recurrence_parser.add_argument("id")
+    run_recurrence_parser = recurrence_commands.add_parser("run")
+    run_recurrence_parser.add_argument("id")
+    disable_recurrence_parser = recurrence_commands.add_parser("disable")
+    disable_recurrence_parser.add_argument("id")
+
     nurture_parser = commands.add_parser("nurture")
     nurture_commands = nurture_parser.add_subparsers(dest="nurture_command", required=True)
     run_nurture_parser = nurture_commands.add_parser("run")
@@ -605,6 +787,46 @@ def _run_browser_command(args: argparse.Namespace, root: Path, store: LocalAccou
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        if args.command == "workflow":
+            plan = load_workflow(Path(args.file))
+            root = resolve_standalone_data_root()
+            store = LocalAccountStore(root)
+            store.get(plan.account)
+            output = asyncio.run(_run_workflow_command(plan, root, store))
+            sys.stdout.write(output)
+            return 0
+
+        if args.command == "recurrence":
+            root = resolve_standalone_data_root()
+            accounts = LocalAccountStore(root)
+            recurrences = LocalRecurrenceStore(root, accounts)
+            if args.recurrence_command == "create":
+                record = recurrences.create(Path(args.file), args.every_seconds)
+                sys.stdout.write(
+                    f"recurrence created id={record.id} account={record.account} "
+                    f"every_seconds={record.interval_seconds} "
+                    f"next_due_at={_format_recurrence_timestamp(record.next_due_at)}\n"
+                )
+                return 0
+            if args.recurrence_command == "list":
+                for record in recurrences.list():
+                    sys.stdout.write(_format_recurrence_record(record))
+                return 0
+            if args.recurrence_command == "show":
+                sys.stdout.write(_format_recurrence_record(recurrences.get(args.id)))
+                return 0
+            if args.recurrence_command == "disable":
+                record = recurrences.disable(args.id)
+                sys.stdout.write(f"recurrence disabled id={record.id}\n")
+                return 0
+            record = recurrences.get(args.id)
+            if record.status != "ENABLED":
+                raise StandaloneRecurrenceError("RECURRENCE_DISABLED")
+            sys.stdout.write(f"recurrence starting id={record.id}\n")
+            sys.stdout.flush()
+            asyncio.run(_run_recurrence_command(args.id, root, accounts, recurrences))
+            return 0
+
         if args.command == "post-carousel":
             manifest = load_carousel_manifest(Path(args.manifest))
             root = resolve_standalone_data_root()
@@ -710,6 +932,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except NurtureRunnerInterrupted as error:
         sys.stderr.write(f"ERROR {error.code} run={error.run_id}\n")
         return 130
+    except StandaloneWorkflowError as error:
+        suffix = f" step={error.step_index}" if error.step_index is not None else ""
+        if error.operation_id is not None:
+            suffix += f" operation={error.operation_id}"
+        sys.stderr.write(f"ERROR {error.code}{suffix}\n")
+        return 1
+    except StandaloneRecurrenceError as error:
+        sys.stderr.write(f"ERROR {error.code}\n")
+        return 1
     except KeyboardInterrupt:
         sys.stderr.write("ERROR INTERRUPTED\n")
         return 130
