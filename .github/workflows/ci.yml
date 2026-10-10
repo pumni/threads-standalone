@@ -62,3 +62,11 @@ jobs:
           pytest tests/test_api_contract.py::test_wheel_smoke_quota_read
           tests/test_mutation_runtime.py::test_success_has_durable_phase_order_exact_text_request_and_one_publish
           tests/test_browser_runtime.py::test_wheel_smoke_browser_read
+
+      - name: Smoke-test synthetic Nurture observe, apply, and insights from the installed wheel
+        env:
+          THREADS_STANDALONE_WHEEL_SMOKE: "1"
+        run: >-
+          uv run --isolated --no-project
+          --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest --with pytest-asyncio
+          pytest tests/test_nurture_cli.py::test_wheel_smoke_nurture_observe_apply_and_insights

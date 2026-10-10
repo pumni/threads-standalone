@@ -19,15 +19,27 @@ from threads_platform.standalone.mutations import LocalOperationStore, LocalThre
 class StandaloneAppContext:
     accounts: LocalAccountStore
     api: LocalThreadsApiRuntime
-    mutations: LocalThreadsMutationRuntime
+    mutations: LocalThreadsMutationRuntime | None
+    browser: None = None
 
 
 @asynccontextmanager
 async def build_standalone_app(
     root: Path,
     accounts: LocalAccountStore | None = None,
+    *,
+    include_api: bool = True,
+    include_mutations: bool = True,
+    include_browser: bool = False,
 ) -> AsyncGenerator[StandaloneAppContext]:
-    """Build the account/API runtime and own the one-command HTTP client lifetime."""
+    """Build the requested local runtimes and own the HTTP client lifetime."""
+    if include_mutations and not include_api:
+        raise ValueError("standalone mutations require API access")
+    if not include_api:
+        raise ValueError("the API composition requires API access")
+    if include_browser:
+        raise ValueError("browser commands use their isolated local composition")
+
     local_accounts = accounts if accounts is not None else LocalAccountStore(root)
     async with build_threads_http_client(Settings()) as client:
         http_api = HttpThreadsAPI(client)
@@ -37,11 +49,18 @@ async def build_standalone_app(
             http_api,
             secret_resolver,
         )
-        mutations = LocalThreadsMutationRuntime(
-            root,
-            local_accounts,
-            http_api,
-            secret_resolver,
-            LocalOperationStore(root),
+        mutations = None
+        if include_mutations:
+            mutations = LocalThreadsMutationRuntime(
+                root,
+                local_accounts,
+                http_api,
+                secret_resolver,
+                LocalOperationStore(root),
+            )
+        yield StandaloneAppContext(
+            accounts=local_accounts,
+            api=api,
+            mutations=mutations,
+            browser=None,
         )
-        yield StandaloneAppContext(accounts=local_accounts, api=api, mutations=mutations)

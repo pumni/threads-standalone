@@ -6,7 +6,7 @@ This public repository must contain only source and synthetic examples. Never co
 
 ## Current capabilities
 
-The current checkpoint provides local account metadata, read-only `threads-local api` commands, and explicit journaled mutation commands. It stores only `env://` credential references; the secret itself must be supplied in the process environment when a command runs.
+The current checkpoint adds the existing Nurture v1 flow to local account metadata, read-only `threads-local api` commands, journaled mutations and bounded browser reads. Account files keep only `env://` credential references; an operator supplies the secret in the process environment when a command runs.
 
 Example command shapes (all identifiers below are synthetic placeholders):
 
@@ -25,13 +25,20 @@ threads-local post-video demo https://example.invalid/video.mp4
 threads-local post-carousel demo carousel-manifest.json
 threads-local moderate-reply demo SYNTHETIC_REPLY_ID hide
 threads-local operation show SYNTHETIC_OPERATION_UUID
+threads-local nurture run demo --preset recruitment
+threads-local nurture run demo --preset recruitment --apply --reply-file synthetic-reply.json
+threads-local nurture run demo --preset recruitment --apply --post-file synthetic-content.json
+threads-local nurture run demo --preset recruitment --apply --quote-file synthetic-quote.json
+threads-local nurture insights refresh demo --preset recruitment
 ```
 
 Post, reply, media, carousel, and moderation commands can cause remote side effects when an operator runs them with real credentials. Each mutation uses the local v1 operation journal and account process lock; an ambiguous result is recorded for review and is never retried automatically. Quote publishing is available through the runtime contract and is not exposed as a direct CLI command. See [MUTATION_PARITY.md](docs/MUTATION_PARITY.md) for the journal and failure behavior.
 
+Nurture observe is read-only and API-only: it constructs neither the browser runtime nor a mutation runtime. It records bounded receipts and fingerprints under the local data root. A Nurture reply, text post or quote requires `--apply` and a valid operator-authored draft/candidate bound to the selected target or preset. The runner durably reserves state before at most one SPLIT-04 journaled mutation and does not retry an ambiguous or published target. With no actionable draft, the command may return a recommendation, but performs no mutation. Insights refresh is explicit, read-only, and limited to content verified through a `PUBLISHED` operation journal entry. See [NURTURE_PARITY.md](docs/NURTURE_PARITY.md) for schemas, fingerprints, test mapping and the historical evidence boundary.
+
 Set `THREADS_LOCAL_DATA_ROOT` to the intended local data directory before using account commands. Set the named `THREADS_PLATFORM_THREADS_TOKEN_*` variable in the process environment before API commands. Do not place its value in command arguments, shell history, files tracked by Git, test fixtures, or logs.
 
-API reads and mutation commands call the official Threads API when run by an operator. Automated API and mutation tests use only fake HTTP responses; destination behavior has not been live-verified.
+API reads and mutation commands call the official Threads API when run by an operator. All Nurture, API, and mutation tests use fake API/HTTP responses and temporary synthetic state; no live Threads request or mutation is made by tests. Nurture behavior in the destination has not been live-verified.
 
 SPLIT-03 also restores the local, explicitly invoked browser commands:
 
@@ -61,9 +68,10 @@ uv run --locked pytest
 uv build
 uv run --isolated --no-project --with dist/threads_standalone-0.1.0-py3-none-any.whl threads-local --help
 uv run --isolated --no-project --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest --with pytest-asyncio pytest tests/test_api_contract.py::test_wheel_smoke_quota_read tests/test_mutation_runtime.py::test_success_has_durable_phase_order_exact_text_request_and_one_publish
+uv run --isolated --no-project --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest pytest tests/test_nurture_cli.py::test_wheel_smoke_nurture_observe_apply_and_insights
 ```
 
-CI also scans for secrets and runs the locked gates, package build, installed-wheel CLI check, and mocked API read/mutation smoke. It does not need a Threads credential, database, or old-repository checkout.
+CI also scans full Git history for secrets and runs the locked gates, package build, installed-wheel CLI check, and fake API/read/mutation/Nurture smoke. It does not need a Threads credential, database, or old-repository checkout.
 
 ## Provenance and license status
 

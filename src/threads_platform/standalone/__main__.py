@@ -24,6 +24,7 @@ from threads_platform.api.contracts import (
     ThreadsCredentialError,
 )
 from threads_platform.standalone.accounts import (
+    LocalAccount,
     LocalAccountStore,
     StandaloneAccountError,
     resolve_standalone_data_root,
@@ -38,6 +39,38 @@ from threads_platform.standalone.mutations import (
     validate_media_post_inputs,
     validate_reply_moderation_inputs,
 )
+from threads_platform.standalone.nurture import (
+    NurturePresetError,
+    NurturePresetV1,
+    get_nurture_preset,
+)
+from threads_platform.standalone.nurture_content import (
+    ContentCandidateV1,
+    NurtureContentError,
+    load_content_candidate,
+)
+from threads_platform.standalone.nurture_draft import (
+    NurtureDraft,
+    NurtureDraftError,
+    load_nurture_draft,
+)
+from threads_platform.standalone.nurture_insights import (
+    NurtureInsightsError,
+    NurtureInsightsResult,
+    NurtureInsightsService,
+)
+from threads_platform.standalone.nurture_quote_draft import (
+    NurtureQuoteDraft,
+    NurtureQuoteDraftError,
+    load_nurture_quote_draft,
+)
+from threads_platform.standalone.nurture_runner import (
+    NurtureRunner,
+    NurtureRunnerError,
+    NurtureRunnerInterrupted,
+    NurtureRunResult,
+)
+from threads_platform.standalone.nurture_store import NurtureStore
 
 
 def _format_scalar(value: int | str | None) -> str:
@@ -199,12 +232,14 @@ async def _run_api_command(args: argparse.Namespace, root: Path, store: LocalAcc
 
 async def _run_post_command(args: argparse.Namespace, root: Path, store: LocalAccountStore) -> str:
     async with build_standalone_app(root, store) as app:
+        assert app.mutations is not None
         result = await app.mutations.publish_text(args.alias, args.text)
     return f"published operation={result.operation_id} media={result.media_id}\n"
 
 
 async def _run_reply_command(args: argparse.Namespace, root: Path, store: LocalAccountStore) -> str:
     async with build_standalone_app(root, store) as app:
+        assert app.mutations is not None
         result = await app.mutations.create_reply(
             args.alias,
             args.thread_id,
@@ -218,6 +253,7 @@ async def _run_moderate_reply_command(
     alias: str, reply_id: str, action: str, root: Path, store: LocalAccountStore
 ) -> str:
     async with build_standalone_app(root, store) as app:
+        assert app.mutations is not None
         result = await app.mutations.moderate_reply(alias, reply_id, action)
     return f"moderated operation={result.operation_id} action={result.action}\n"
 
@@ -232,6 +268,7 @@ async def _run_media_post_command(
     media_url = args.image_url if media_type == "IMAGE" else args.video_url
     validate_media_post_inputs(media_url, args.text, args.alt_text)
     async with build_standalone_app(root, store) as app:
+        assert app.mutations is not None
         if media_type == "IMAGE":
             result = await app.mutations.publish_image(
                 args.alias, args.image_url, args.text, alt_text=args.alt_text
@@ -249,8 +286,176 @@ async def _run_carousel_post_command(
     alias: str, manifest: CarouselManifest, root: Path, store: LocalAccountStore
 ) -> str:
     async with build_standalone_app(root, store) as app:
+        assert app.mutations is not None
         result = await app.mutations.publish_carousel(alias, manifest)
     return f"published-carousel operation={result.operation_id} media={result.media_id}\n"
+
+
+async def _run_nurture_command(
+    root: Path,
+    accounts: LocalAccountStore,
+    account: LocalAccount,
+    preset: NurturePresetV1,
+    *,
+    apply_requested: bool = False,
+    draft: NurtureDraft | None = None,
+    quote_draft: NurtureQuoteDraft | None = None,
+    content_candidate: ContentCandidateV1 | None = None,
+) -> NurtureRunResult:
+    async with build_standalone_app(
+        root,
+        accounts,
+        include_api=True,
+        include_mutations=(
+            draft is not None
+            or quote_draft is not None
+            or (content_candidate is not None and apply_requested)
+        ),
+        include_browser=False,
+    ) as app:
+        if draft is not None and app.mutations is None:
+            raise NurtureRunnerError("RUN_FAILED")
+        if quote_draft is not None and app.mutations is None:
+            raise NurtureRunnerError("RUN_FAILED")
+        return await NurtureRunner(app.api, NurtureStore(root)).run_with_selection(
+            account,
+            preset,
+            apply_requested=apply_requested,
+            draft=draft,
+            quote_draft=quote_draft,
+            content_candidate=content_candidate,
+            mutations=app.mutations,
+        )
+
+
+def _format_nurture_run(
+    account: LocalAccount,
+    preset: NurturePresetV1,
+    result: NurtureRunResult,
+) -> str:
+    run = result.receipt
+    decision = run.decision_codes[0] if run.decision_codes else "NO_ACTION"
+    target = f" target={result.target_fingerprint}" if result.target_fingerprint else ""
+    candidate = (
+        f" candidate={result.content_candidate_id}"
+        if result.content_candidate_id is not None
+        else ""
+    )
+    return (
+        f"nurture run={run.id} account={account.alias} preset={preset.id} "
+        f"outcome={run.outcome} discovered={run.discovered_count} "
+        f"selected={run.selected_count} decision={decision}{target}{candidate}\n"
+    )
+
+
+async def _run_nurture_insights_command(
+    root: Path,
+    accounts: LocalAccountStore,
+    account: LocalAccount,
+    preset: NurturePresetV1,
+) -> NurtureInsightsResult:
+    async with build_standalone_app(
+        root,
+        accounts,
+        include_api=True,
+        include_mutations=False,
+        include_browser=False,
+    ) as app:
+        service = NurtureInsightsService(
+            app.api,
+            NurtureStore(root),
+            LocalOperationStore(root),
+        )
+        return await service.refresh(account, preset)
+
+
+def _format_nurture_insights(result: NurtureInsightsResult) -> str:
+    return (
+        f"nurture-insights refreshed={result.refreshed} "
+        f"skipped_spacing={result.skipped_spacing} scoreable={result.scoreable} "
+        f"insufficient={result.insufficient} below={result.below} "
+        f"baseline={result.baseline} above={result.above} top={result.top}\n"
+    )
+
+
+def _handle_nurture_insights_cli_command(args: argparse.Namespace) -> int:
+    try:
+        preset = get_nurture_preset(args.preset)
+    except NurturePresetError as error:
+        raise NurtureInsightsError(error.code) from None
+    root = resolve_standalone_data_root()
+    accounts = LocalAccountStore(root)
+    account = accounts.get(args.alias)
+    result = asyncio.run(_run_nurture_insights_command(root, accounts, account, preset))
+    sys.stdout.write(_format_nurture_insights(result))
+    return 0
+
+
+def _handle_nurture_command(args: argparse.Namespace) -> int:
+    if args.nurture_command == "insights":
+        return _handle_nurture_insights_cli_command(args)
+    return _handle_nurture_cli_command(args)
+
+
+def _run_nurture_cli(
+    args: argparse.Namespace,
+    root: Path,
+    accounts: LocalAccountStore,
+) -> str:
+    try:
+        preset = get_nurture_preset(args.preset)
+    except NurturePresetError as error:
+        raise NurtureRunnerError(error.code) from None
+    account = accounts.get(args.alias)
+    draft: NurtureDraft | None = None
+    quote_draft: NurtureQuoteDraft | None = None
+    content_candidate: ContentCandidateV1 | None = None
+    if args.reply_file is not None:
+        try:
+            draft = load_nurture_draft(Path(args.reply_file))
+        except NurtureDraftError as error:
+            raise NurtureRunnerError(error.code) from None
+    if args.post_file is not None:
+        try:
+            content_candidate = load_content_candidate(
+                Path(args.post_file), account_alias=account.alias, preset_id=preset.id
+            )
+        except NurtureContentError as error:
+            raise NurtureRunnerError(error.code) from None
+    if args.quote_file is not None:
+        try:
+            quote_draft = load_nurture_quote_draft(Path(args.quote_file))
+        except NurtureQuoteDraftError as error:
+            raise NurtureRunnerError(error.code) from None
+    result = asyncio.run(
+        _run_nurture_command(
+            root,
+            accounts,
+            account,
+            preset,
+            apply_requested=args.apply,
+            draft=draft,
+            quote_draft=quote_draft,
+            content_candidate=content_candidate,
+        )
+    )
+    return _format_nurture_run(account, preset, result)
+
+
+def _handle_nurture_cli_command(args: argparse.Namespace) -> int:
+    supplied_draft_files = sum(
+        value is not None for value in (args.reply_file, args.post_file, args.quote_file)
+    )
+    if supplied_draft_files > 1:
+        raise NurtureRunnerError("NURTURE_INPUT_CONFLICT")
+    if args.reply_file is not None and not args.apply:
+        raise NurtureRunnerError("INVALID_NURTURE_DRAFT")
+    if args.quote_file is not None and not args.apply:
+        raise NurtureRunnerError("INVALID_NURTURE_QUOTE_DRAFT")
+    root = resolve_standalone_data_root()
+    accounts = LocalAccountStore(root)
+    sys.stdout.write(_run_nurture_cli(args, root, accounts))
+    return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -339,6 +544,23 @@ def _build_parser() -> argparse.ArgumentParser:
     operation_commands = operation_parser.add_subparsers(dest="operation_command", required=True)
     show_parser = operation_commands.add_parser("show")
     show_parser.add_argument("operation_id")
+
+    nurture_parser = commands.add_parser("nurture")
+    nurture_commands = nurture_parser.add_subparsers(dest="nurture_command", required=True)
+    run_nurture_parser = nurture_commands.add_parser("run")
+    run_nurture_parser.add_argument("alias")
+    run_nurture_parser.add_argument("--preset", required=True)
+    run_nurture_parser.add_argument("--apply", action="store_true")
+    run_nurture_parser.add_argument("--reply-file")
+    run_nurture_parser.add_argument("--post-file")
+    run_nurture_parser.add_argument("--quote-file")
+    insights_nurture_parser = nurture_commands.add_parser("insights")
+    nurture_insights_commands = insights_nurture_parser.add_subparsers(
+        dest="nurture_insights_command", required=True
+    )
+    refresh_insights_parser = nurture_insights_commands.add_parser("refresh")
+    refresh_insights_parser.add_argument("alias")
+    refresh_insights_parser.add_argument("--preset", required=True)
     return parser
 
 
@@ -401,6 +623,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 asyncio.run(_run_moderate_reply_command(args.alias, reply_id, action, root, store))
             )
             return 0
+
+        if args.command == "nurture":
+            return _handle_nurture_command(args)
 
         root = resolve_standalone_data_root()
         store = LocalAccountStore(root)
@@ -476,6 +701,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     ) as error:
         sys.stderr.write(f"ERROR {error.code}\n")
         return 1
+    except NurtureRunnerError as error:
+        suffix = f" run={error.run_id}" if error.run_id is not None else ""
+        if error.operation_id is not None:
+            suffix += f" operation={error.operation_id}"
+        sys.stderr.write(f"ERROR {error.code}{suffix}\n")
+        return 1
+    except NurtureRunnerInterrupted as error:
+        sys.stderr.write(f"ERROR {error.code} run={error.run_id}\n")
+        return 130
     except KeyboardInterrupt:
         sys.stderr.write("ERROR INTERRUPTED\n")
         return 130

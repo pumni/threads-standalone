@@ -2,7 +2,7 @@
 
 ## Status
 
-**File-level transfer audit: PASS for the listed SPLIT-02, SPLIT-03, and SPLIT-04 files. Public distribution/license policy: OPEN under `pumni/threads-standalone#2`.** The owner-directed engineering migration allows the bounded transfer recorded below; it is not a blanket relicensing or legal determination. No first-party LICENSE or SPDX marker is added.
+**File-level transfer audit: PASS for the listed SPLIT-02, SPLIT-03, SPLIT-04, and SPLIT-05 files. Public distribution/license policy: OPEN under `pumni/threads-standalone#2`.** The owner-directed engineering migration allows the bounded transfer recorded below; it is not a blanket relicensing or legal determination. No first-party LICENSE or SPDX marker is added.
 
 ## Audit method and limitations
 
@@ -48,6 +48,36 @@ The following paths were checked against frozen source history and file headers 
 | `tests/unit/test_standalone_mutations.py` | `tests/test_mutation_runtime.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred and import-adapted the owner's synthetic runtime/journal tests; credential and remote identifiers are explicit synthetic sentinels, and all state uses pytest temporary directories. |
 
 The SPLIT-04 tests contain no real token, account record, live Threads ID/content, browser profile or cookie, journal from an operator machine, or private evidence. HTTP behavior is exercised through fake handlers only. This transfer does not grant a general license or change the separate owner decision on public distribution.
+
+## SPLIT-05 Nurture transfer audit
+
+The authorized source is `pumni/thread@0dfbd36ff3756f8a68edcd6cc0bd083f6f3570a1`; the destination branch starts at `pumni/threads-standalone@d28bb979d720ffc6b493e76e9709d80bc0709d5c`. Before transfer, each of the nine Nurture implementation files and ten Nurture test files below was checked with source `git log --follow`, header search, and repository notice/license inventory. Every inspected file history resolves to the repository owner `pumni`; no file has a copyright, SPDX, third-party license, or generated-code notice. The frozen source has no first-party `LICENSE`, `COPYING`, or `NOTICE`. This source-history classification follows only the coordinator's bounded owner-directed transfer authorization; it does not determine general reuse rights or settle the public distribution license tracked under issue #2.
+
+| Frozen source path | Destination path | Classification | Treatment |
+| --- | --- | --- | --- |
+| `src/threads_platform/standalone/nurture.py` | `src/threads_platform/standalone/nurture.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Preserved the strict v1 recruitment preset and deterministic policy. |
+| `src/threads_platform/standalone/nurture_runner.py` | `src/threads_platform/standalone/nurture_runner.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Preserved sequential observe/apply orchestration, receipts, and mutation boundary. |
+| `src/threads_platform/standalone/nurture_discovery.py` | `src/threads_platform/standalone/nurture_discovery.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Preserved bounded API discovery, normalization, ranking, dedupe, and cooldown rules. |
+| `src/threads_platform/standalone/nurture_conversations.py` | `src/threads_platform/standalone/nurture_conversations.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Preserved bounded owned-thread reply discovery and fail-closed ownership checks. |
+| `src/threads_platform/standalone/nurture_store.py` | `src/threads_platform/standalone/nurture_store.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Preserved local v1 receipts, target/content state, insights snapshots, lock and path safety. |
+| `src/threads_platform/standalone/nurture_content.py` | `src/threads_platform/standalone/nurture_content.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Preserved operator content validation and source/draft/content fingerprints. |
+| `src/threads_platform/standalone/nurture_draft.py` | `src/threads_platform/standalone/nurture_draft.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Preserved strict private reply-draft validation and redacted representations. |
+| `src/threads_platform/standalone/nurture_quote_draft.py` | `src/threads_platform/standalone/nurture_quote_draft.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Preserved strict private quote-draft validation and redacted representations. |
+| `src/threads_platform/standalone/nurture_insights.py` | `src/threads_platform/standalone/nurture_insights.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Preserved explicit, bounded, journal-linked read-only insights refresh. |
+| `tests/unit/test_standalone_nurture.py` | `tests/test_nurture.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred synthetic preset/policy tests. |
+| `tests/unit/test_standalone_nurture_apply.py` | `tests/test_nurture_apply.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred synthetic reply/quote apply, reservation, ambiguity, and CLI tests. |
+| `tests/unit/test_standalone_nurture_content.py` | `tests/test_nurture_content.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred synthetic content packet and fingerprint tests. |
+| `tests/unit/test_standalone_nurture_conversations.py` | `tests/test_nurture_conversations.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred synthetic inbound conversation normalization tests. |
+| `tests/unit/test_standalone_nurture_discovery.py` | `tests/test_nurture_discovery.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred bounded source, normalization, ranking and dedupe tests. |
+| `tests/unit/test_standalone_nurture_durability.py` | `tests/test_nurture_durability.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred synthetic receipt/state durability, locking and recovery tests. |
+| `tests/unit/test_standalone_nurture_insights.py` | `tests/test_nurture_insights.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred synthetic snapshot, journal-link, bound and score tests. |
+| `tests/unit/test_standalone_nurture_own_content.py` | `tests/test_nurture_own_content.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred synthetic content provenance, apply, and cooldown tests. |
+| `tests/unit/test_standalone_nurture_runner.py` | `tests/test_nurture_runner.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred synthetic observe, receipt, cancellation, output and no-mutation tests. |
+| `tests/unit/test_standalone_nurture_runner_inbound.py` | `tests/test_nurture_runner_inbound.py` | `FIRST_PARTY_AUTHORIZED_FOR_OWNER_DIRECTED_TRANSFER` | Transferred synthetic inbound priority and ownership tests. |
+
+The imports in the transferred files were adapted only from monorepo API/process-lock owners to the already present standalone `api.contracts`, `api.client`, and `locks` modules. `tests/test_nurture_cli.py` is destination-authored and uses synthetic UUIDs, temporary roots, a fake API, and the existing local mutation journal. No third-party implementation, binary, or fixture was copied. The transferred first-party test fixtures contain only synthetic values; no live payload, account value, token, browser profile, local journal, or private evidence was copied. No dependency or license declaration was added. Issue #2 remains OPEN; no first-party `LICENSE` or SPDX marker is added.
+
+The transferred tests contain only deterministic fake API values, synthetic account/remote identifiers, test-only text and temporary filesystem state. Source history and header checks do not prove a general public reuse license; only the bounded provenance classification above is recorded.
 
 ## Source tests audited but not transferred
 
