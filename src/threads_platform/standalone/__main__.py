@@ -8,6 +8,7 @@ import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from threads_platform.api.contracts import (
@@ -196,11 +197,23 @@ def _build_parser() -> argparse.ArgumentParser:
     add_parser = account_commands.add_parser("add")
     add_parser.add_argument("alias")
     account_commands.add_parser("list")
+    login_parser = account_commands.add_parser("login")
+    login_parser.add_argument("alias")
     credential_parser = account_commands.add_parser("credential")
     credential_commands = credential_parser.add_subparsers(dest="credential_command", required=True)
     set_env_parser = credential_commands.add_parser("set-env")
     set_env_parser.add_argument("alias")
     set_env_parser.add_argument("variable_name")
+
+    profile_parser = commands.add_parser("profile")
+    profile_parser.add_argument("alias")
+    profile_parser.add_argument("username")
+    thread_parser = commands.add_parser("thread")
+    thread_parser.add_argument("alias")
+    thread_parser.add_argument("thread_ref")
+    feed_parser = commands.add_parser("feed")
+    feed_parser.add_argument("alias")
+    feed_parser.add_argument("--limit", type=int, default=10)
 
     api_parser = commands.add_parser("api")
     api_commands = api_parser.add_subparsers(dest="api_command", required=True)
@@ -234,6 +247,44 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _format_feed_result(result: Any) -> str:
+    lines = [f"feed count={len(result.observations)} truncated={str(result.truncated).lower()}\n"]
+    for item in result.observations:
+        lines.append(
+            f"item position={item.position} "
+            f"thread_ref={_format_bounded_text(item.thread_ref, 255)} "
+            f"author={_format_bounded_text(item.author_username, 30)} "
+            f"text={_format_bounded_text(item.text_excerpt, 500)}\n"
+        )
+    return "".join(lines)
+
+
+def _run_browser_command(args: argparse.Namespace, root: Path, store: LocalAccountStore) -> int:
+    """Load the browser stack only for an explicitly selected local browser command."""
+    from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
+
+    runtime = LocalRuntime(root, store)
+    try:
+        if args.command == "account":
+            asyncio.run(runtime.login(args.alias))
+            sys.stdout.write(f"login browser closed {args.alias}\n")
+            return 0
+        if args.command == "profile":
+            result = asyncio.run(runtime.open_profile(args.alias, args.username))
+            sys.stdout.write(f"profile recognized target={result.target_ref}\n")
+            return 0
+        if args.command == "thread":
+            result = asyncio.run(runtime.open_thread(args.alias, args.thread_ref))
+            sys.stdout.write(f"thread recognized target={result.target_ref}\n")
+            return 0
+        result = asyncio.run(runtime.browse_feed(args.alias, args.limit))
+        sys.stdout.write(_format_feed_result(result))
+        return 0
+    except StandaloneRuntimeError as error:
+        sys.stderr.write(f"ERROR {error.code}\n")
+        return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
@@ -244,6 +295,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 account = store.add(args.alias)
                 sys.stdout.write(f"added {account.alias} {account.id}\n")
                 return 0
+            if args.account_command == "login":
+                return _run_browser_command(args, root, store)
             if args.account_command == "credential":
                 bind_env_credential(store, args.alias, args.variable_name)
                 sys.stdout.write(f"credential configured {args.alias}\n")
@@ -251,6 +304,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             for account in store.list():
                 sys.stdout.write(f"{account.alias} {account.id}\n")
             return 0
+
+        if args.command in {"profile", "thread", "feed"}:
+            return _run_browser_command(args, root, store)
 
         sys.stdout.write(asyncio.run(_run_api_command(args, root, store)))
         return 0

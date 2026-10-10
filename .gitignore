@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .pytest-tmp-split02/
+.pytest-tmp-split03/
 .ruff_cache/
 .pyright/
 build/
@@ -17,6 +18,7 @@ dist/
 /data/
 /accounts/
 /profiles/
+/locks/
 /browser-profiles/
 /local-state/
 /operations/

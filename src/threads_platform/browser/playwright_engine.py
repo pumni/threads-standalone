@@ -1,0 +1,573 @@
+from __future__ import annotations
+
+import asyncio
+import re
+from pathlib import Path
+from typing import cast
+from urllib.parse import urlsplit
+
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    ProxySettings,
+    Route,
+    async_playwright,
+)
+from playwright.async_api import (
+    Error as PlaywrightError,
+)
+from playwright.async_api import (
+    TimeoutError as PlaywrightTimeoutError,
+)
+
+from threads_platform.browser.contracts import (
+    BROWSER_FEED_CANDIDATE_BOUND,
+    BROWSER_FEED_ORIGIN,
+    BrowserContractError,
+    BrowserEngineSession,
+    BrowserLaunchRequest,
+    BrowserNetworkProtocol,
+    BrowserNetworkRouteUnsupported,
+    BrowserProcessCrashed,
+    BrowserRuntimeUnavailable,
+    NavigationTimeout,
+    RemoteSessionStateUncertain,
+    UnsupportedUIState,
+)
+
+_FEED_SCAN_SCRIPT = r"""
+({allowedOrigin, candidateBound}) => {
+  if (window.location.origin !== allowedOrigin) {
+    return {ok: false, reason: 'origin_mismatch'};
+  }
+  const anchors = document.querySelectorAll('a[href]');
+  if (anchors.length > 1000) return {ok: false};
+  const permalinks = [];
+  for (const anchor of anchors) {
+    const href = anchor.getAttribute('href');
+    if (typeof href !== 'string') continue;
+    try {
+      const url = new URL(href, window.location.href);
+      if (url.origin !== allowedOrigin) continue;
+      if (!/^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}\/?$/.test(url.pathname)) {
+        continue;
+      }
+      permalinks.push(url.pathname);
+      if (permalinks.length > candidateBound) return {ok: false};
+    } catch (_) {
+      continue;
+    }
+  }
+  return {ok: true, permalinks};
+}
+"""
+
+
+_THREAD_OPEN_SCRIPT = r"""
+({allowedOrigin, targetRef, targetAuthor}) => {
+  const normalizePath = (path) => path.endsWith('/') ? path.slice(0, -1) : path;
+  const semanticPath = (href) => {
+    if (typeof href !== 'string') return null;
+    try {
+      const url = new URL(href, allowedOrigin);
+      if (url.origin !== allowedOrigin || url.search || url.hash) return null;
+      return normalizePath(url.pathname);
+    } catch (_) {
+      return null;
+    }
+  };
+  if (window.location.origin !== allowedOrigin) return {outcome: 'uncertain'};
+  if (normalizePath(window.location.pathname) !== targetRef) return {outcome: 'uncertain'};
+
+  const anchors = document.querySelectorAll('a[href]');
+  if (anchors.length > 1000) return {outcome: 'invalid'};
+  const hasTargetPermalink = Array.from(anchors).some(
+    (anchor) => semanticPath(anchor.getAttribute('href')) === targetRef
+  );
+  if (!hasTargetPermalink) return {outcome: 'missing_permalink'};
+  const authorPath = `/@${targetAuthor}`;
+  const hasTargetAuthor = Array.from(anchors).some(
+    (anchor) => semanticPath(anchor.getAttribute('href')) === authorPath
+  );
+  if (!hasTargetAuthor) return {outcome: 'missing_author'};
+  return {outcome: 'recognized'};
+}
+"""
+
+_BROWSER_READ_READINESS_TIMEOUT_SECONDS = 2.0
+_BROWSER_READ_READINESS_POLL_SECONDS = 0.05
+
+_PROFILE_OPEN_SCRIPT = r"""
+({allowedOrigin, targetRef, ancestorBound}) => {
+  const normalizePath = (path) => path.endsWith('/') ? path.slice(0, -1) : path;
+  const anchorPath = (href) => {
+    if (typeof href !== 'string' || !href.startsWith('/') || href.startsWith('//') ||
+        href.includes('?') || href.includes('#')) {
+      return null;
+    }
+    return normalizePath(href);
+  };
+  const isPostPermalink = (href) => {
+    if (typeof href !== 'string' || !href.startsWith('/') || href.startsWith('//')) {
+      return false;
+    }
+    const pathname = href.split(/[?#]/, 1)[0];
+    return /^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}\/?$/.test(pathname);
+  };
+  if (window.location.origin !== allowedOrigin) return {outcome: 'uncertain'};
+  if (normalizePath(window.location.pathname) !== targetRef) return {outcome: 'uncertain'};
+
+  const anchors = Array.from(document.querySelectorAll('a[href]'));
+  if (anchors.length > 1000) return {outcome: 'invalid'};
+  const headings = document.querySelectorAll('h1');
+  const headingBound = 8;
+  if (headings.length === 0 || headings.length > headingBound) return {outcome: 'invalid'};
+  const exactTargetAnchors = anchors.filter(
+    (anchor) => anchorPath(anchor.getAttribute('href')) === targetRef
+  );
+  if (exactTargetAnchors.length === 0) return {outcome: 'uncertain'};
+
+  const qualifyingHeaders = new Set();
+  for (let headingIndex = 0; headingIndex < headings.length; headingIndex += 1) {
+    const heading = headings[headingIndex];
+    if (!heading || !(heading.textContent || '').replace(/\s+/g, ' ').trim()) continue;
+
+    let node = heading.parentElement;
+    let profileHeader = null;
+    for (let depth = 1; node && depth <= ancestorBound; depth += 1) {
+      if (node.tagName === 'DIV') {
+        profileHeader = node;
+        break;
+      }
+      node = node.parentElement;
+    }
+    if (profileHeader === null) continue;
+
+    const headerLinks = anchors.filter((link) => profileHeader.contains(link));
+    if (headerLinks.some((link) => isPostPermalink(link.getAttribute('href')))) continue;
+    if (headerLinks.some((link) => anchorPath(link.getAttribute('href')) === targetRef)) {
+      qualifyingHeaders.add(profileHeader);
+    }
+  }
+  if (qualifyingHeaders.size !== 1) return {outcome: 'invalid'};
+  return {outcome: 'recognized'};
+}
+"""
+
+
+class PlaywrightBrowserEngine:
+    """Pinned Playwright/Chromium lifecycle for local browser profiles."""
+
+    def __init__(self, *, navigation_timeout_ms: int = 30_000) -> None:
+        if navigation_timeout_ms < 1:
+            raise ValueError("navigation timeout must be positive")
+        self._navigation_timeout_ms = navigation_timeout_ms
+
+    async def open(self, request: BrowserLaunchRequest) -> BrowserEngineSession:
+        profile_directory = request.profile_directory.resolve(strict=True)
+        if not profile_directory.is_dir():
+            raise BrowserContractError()
+        proxy: ProxySettings | None = playwright_proxy_settings(request)
+        manager = async_playwright()
+        try:
+            playwright = await manager.start()
+        except PlaywrightError:
+            raise BrowserRuntimeUnavailable("BROWSER_RUNTIME_UNAVAILABLE") from None
+        executable = Path(playwright.chromium.executable_path)
+        if not executable.is_file():
+            await playwright.stop()
+            raise BrowserRuntimeUnavailable("BROWSER_BINARY_MISSING")
+        try:
+            context = await playwright.chromium.launch_persistent_context(
+                user_data_dir=str(profile_directory),
+                headless=request.headless,
+                proxy=proxy,
+                accept_downloads=False,
+                # The route guard must see every top-level navigation request.
+                service_workers="block",
+            )
+        except PlaywrightError:
+            await playwright.stop()
+            raise BrowserRuntimeUnavailable("BROWSER_START_FAILED") from None
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+        except PlaywrightError:
+            await context.close()
+            await playwright.stop()
+            raise BrowserRuntimeUnavailable("BROWSER_PAGE_CREATION_FAILED") from None
+        return _PlaywrightBrowserSession(
+            playwright,
+            context,
+            page,
+            navigation_timeout_ms=self._navigation_timeout_ms,
+        )
+
+
+class _PlaywrightBrowserSession:
+    def __init__(
+        self,
+        playwright: Playwright,
+        context: BrowserContext,
+        page: Page,
+        *,
+        navigation_timeout_ms: int,
+    ) -> None:
+        self._playwright = playwright
+        self._context = context
+        self._page = page
+        self._browser: Browser | None = context.browser
+        self._navigation_timeout_ms = navigation_timeout_ms
+        self._crashed = False
+        self._closed = False
+        self._allowed_navigation_origins: frozenset[str] = frozenset()
+        self._navigation_guard_installed = False
+        self._remote_state_uncertain = False
+        page.on("crash", self._on_page_crash)
+        context.on("close", self._on_context_close)
+
+    async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
+        self._ensure_alive()
+        normalized_allowed_origins = frozenset(
+            origin
+            for allowed_origin in allowed_origins
+            if (origin := _normalized_browser_origin(allowed_origin)) is not None
+        )
+        if not normalized_allowed_origins:
+            raise UnsupportedUIState()
+        if self._allowed_navigation_origins and (
+            normalized_allowed_origins != self._allowed_navigation_origins
+        ):
+            raise UnsupportedUIState()
+        if _normalized_browser_origin(url) not in normalized_allowed_origins:
+            raise UnsupportedUIState()
+
+        self._allowed_navigation_origins = normalized_allowed_origins
+        self._remote_state_uncertain = False
+
+        try:
+            if not self._navigation_guard_installed:
+                await self._page.route("**/*", self._guard_navigation)
+                self._navigation_guard_installed = True
+            await self._page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=self._navigation_timeout_ms,
+            )
+            await self._raise_navigation_policy_error()
+        except PlaywrightTimeoutError:
+            await self._raise_navigation_policy_error()
+            raise NavigationTimeout() from None
+        except PlaywrightError:
+            self._ensure_alive()
+            await self._raise_navigation_policy_error()
+            raise BrowserRuntimeUnavailable("BROWSER_NAVIGATION_FAILED") from None
+
+    async def _guard_navigation(self, route: Route) -> None:
+        request = route.request
+        try:
+            is_main_navigation = (
+                request.is_navigation_request() and request.frame == self._page.main_frame
+            )
+        except PlaywrightError:
+            is_main_navigation = True
+        if not is_main_navigation:
+            await route.continue_()
+            return
+        if _normalized_browser_origin(request.url) not in self._allowed_navigation_origins:
+            self._remote_state_uncertain = True
+            await route.abort("blockedbyclient")
+            return
+        await route.continue_()
+
+    async def _raise_navigation_policy_error(self) -> None:
+        await self._raise_guard_rejection()
+        if (
+            self._allowed_navigation_origins
+            and self._page.url != "about:blank"
+            and _normalized_browser_origin(self._page.url) not in self._allowed_navigation_origins
+        ):
+            raise RemoteSessionStateUncertain()
+
+    async def _raise_guard_rejection(self) -> None:
+        if self._remote_state_uncertain:
+            raise RemoteSessionStateUncertain()
+
+    async def collect_feed_permalinks(self, *, candidate_bound: int) -> tuple[str, ...]:
+        self._ensure_alive()
+        await self._raise_navigation_policy_error()
+        if (
+            type(candidate_bound) is not int
+            or not 1 <= candidate_bound <= BROWSER_FEED_CANDIDATE_BOUND
+        ):
+            raise BrowserContractError()
+        loop = asyncio.get_running_loop()
+        readiness_timeout_seconds = min(
+            _BROWSER_READ_READINESS_TIMEOUT_SECONDS,
+            self._navigation_timeout_ms / 1000,
+        )
+        deadline = loop.time() + readiness_timeout_seconds
+        script_args = {
+            "allowedOrigin": BROWSER_FEED_ORIGIN,
+            "candidateBound": candidate_bound,
+        }
+        while True:
+            self._ensure_alive()
+            await self._raise_navigation_policy_error()
+            try:
+                payload = await self._page.evaluate(_FEED_SCAN_SCRIPT, script_args)
+            except PlaywrightError:
+                self._ensure_alive()
+                await self._raise_navigation_policy_error()
+                raise BrowserRuntimeUnavailable("BROWSER_FEED_INSPECTION_FAILED") from None
+            await self._raise_navigation_policy_error()
+            permalinks = _feed_permalinks(payload)
+            if permalinks:
+                return permalinks
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return ()
+            await asyncio.sleep(min(_BROWSER_READ_READINESS_POLL_SECONDS, remaining))
+            if loop.time() >= deadline:
+                return ()
+
+    async def verify_thread_target(self, *, target_ref: str, author_username: str) -> None:
+        self._ensure_alive()
+        await self._raise_navigation_policy_error()
+        target_match = re.fullmatch(
+            r"/@([A-Za-z0-9._]{1,30})/post/[A-Za-z0-9_-]{1,120}", target_ref
+        )
+        if target_match is None or target_match.group(1) != author_username:
+            raise BrowserContractError()
+        loop = asyncio.get_running_loop()
+        readiness_timeout_seconds = min(
+            _BROWSER_READ_READINESS_TIMEOUT_SECONDS,
+            self._navigation_timeout_ms / 1000,
+        )
+        deadline = loop.time() + readiness_timeout_seconds
+        script_args = {
+            "allowedOrigin": BROWSER_FEED_ORIGIN,
+            "targetRef": target_ref,
+            "targetAuthor": author_username,
+        }
+        try:
+            payload = await self._page.evaluate(
+                _THREAD_OPEN_SCRIPT,
+                script_args,
+            )
+        except PlaywrightError:
+            self._ensure_alive()
+            raise BrowserRuntimeUnavailable("BROWSER_THREAD_INSPECTION_FAILED") from None
+        outcome = _thread_target_outcome(payload)
+        while outcome in {"missing_permalink", "missing_author"}:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(_BROWSER_READ_READINESS_POLL_SECONDS, remaining))
+            if loop.time() >= deadline:
+                break
+            try:
+                payload = await self._page.evaluate(_THREAD_OPEN_SCRIPT, script_args)
+            except PlaywrightError:
+                self._ensure_alive()
+                raise BrowserRuntimeUnavailable("BROWSER_THREAD_INSPECTION_FAILED") from None
+            outcome = _thread_target_outcome(payload)
+            if outcome == "recognized":
+                return
+        _verify_thread_target_result(payload)
+
+    async def verify_profile_target(self, *, target_ref: str, ancestor_bound: int) -> None:
+        self._ensure_alive()
+        await self._raise_navigation_policy_error()
+        if (
+            not 1 <= ancestor_bound <= 8
+            or re.fullmatch(r"/@[A-Za-z0-9._]{1,30}", target_ref) is None
+        ):
+            raise BrowserContractError()
+        loop = asyncio.get_running_loop()
+        readiness_timeout_seconds = min(
+            _BROWSER_READ_READINESS_TIMEOUT_SECONDS,
+            self._navigation_timeout_ms / 1000,
+        )
+        deadline = loop.time() + readiness_timeout_seconds
+        script_args = {
+            "allowedOrigin": BROWSER_FEED_ORIGIN,
+            "targetRef": target_ref,
+            "ancestorBound": ancestor_bound,
+        }
+        try:
+            payload = await self._page.evaluate(_PROFILE_OPEN_SCRIPT, script_args)
+        except PlaywrightError:
+            self._ensure_alive()
+            raise BrowserRuntimeUnavailable("BROWSER_PROFILE_INSPECTION_FAILED") from None
+
+        while payload != {"outcome": "recognized"}:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(_BROWSER_READ_READINESS_POLL_SECONDS, remaining))
+            if loop.time() >= deadline:
+                break
+            try:
+                payload = await self._page.evaluate(_PROFILE_OPEN_SCRIPT, script_args)
+            except PlaywrightError:
+                self._ensure_alive()
+                raise BrowserRuntimeUnavailable("BROWSER_PROFILE_INSPECTION_FAILED") from None
+            if payload == {"outcome": "recognized"}:
+                return
+        _verify_profile_target_result(payload)
+
+    async def scroll_feed(self) -> None:
+        self._ensure_alive()
+        await self._raise_navigation_policy_error()
+        try:
+            await self._page.evaluate("() => window.scrollBy(0, Math.max(window.innerHeight, 1))")
+        except PlaywrightError:
+            self._ensure_alive()
+            raise BrowserRuntimeUnavailable("BROWSER_FEED_SCROLL_FAILED") from None
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._context.close()
+        except PlaywrightError:
+            pass
+        finally:
+            try:
+                await self._playwright.stop()
+            except PlaywrightError:
+                pass
+
+    def _ensure_alive(self) -> None:
+        if (
+            self._closed
+            or self._crashed
+            or self._page.is_closed()
+            or (self._browser is not None and not self._browser.is_connected())
+        ):
+            raise BrowserProcessCrashed()
+
+    def _on_page_crash(self, _: Page) -> None:
+        self._crashed = True
+
+    def _on_context_close(self, _: BrowserContext) -> None:
+        if not self._closed:
+            self._crashed = True
+
+
+def _feed_permalinks(payload: object) -> tuple[str, ...]:
+    if not isinstance(payload, dict):
+        raise BrowserContractError()
+    data = cast(dict[str, object], payload)
+    if data.get("reason") == "origin_mismatch":
+        raise RemoteSessionStateUncertain()
+    permalink_value = data.get("permalinks")
+    if data.get("ok") is not True or not isinstance(permalink_value, list):
+        raise BrowserContractError()
+    permalinks = cast(list[object], permalink_value)
+    if len(permalinks) > BROWSER_FEED_CANDIDATE_BOUND or not all(
+        isinstance(permalink, str) for permalink in permalinks
+    ):
+        raise BrowserContractError()
+    return tuple(cast(str, permalink) for permalink in permalinks)
+
+
+def _thread_target_outcome(payload: object) -> str:
+    if not isinstance(payload, dict):
+        raise BrowserContractError()
+    data = cast(dict[str, object], payload)
+    if set(data) != {"outcome"}:
+        raise BrowserContractError()
+    outcome = data.get("outcome")
+    if not isinstance(outcome, str) or outcome not in {
+        "recognized",
+        "uncertain",
+        "missing_permalink",
+        "missing_author",
+        "invalid",
+    }:
+        raise BrowserContractError()
+    return outcome
+
+
+def _verify_thread_target_result(payload: object) -> None:
+    outcome = _thread_target_outcome(payload)
+    if outcome == "uncertain":
+        raise RemoteSessionStateUncertain()
+    if outcome == "missing_permalink":
+        raise RemoteSessionStateUncertain()
+    if outcome != "recognized":
+        raise BrowserContractError()
+
+
+def _verify_profile_target_result(payload: object) -> None:
+    if not isinstance(payload, dict):
+        raise BrowserContractError()
+    data = cast(dict[str, object], payload)
+    if set(data) != {"outcome"}:
+        raise BrowserContractError()
+    outcome = data.get("outcome")
+    if outcome == "uncertain":
+        raise RemoteSessionStateUncertain()
+    if outcome != "recognized":
+        raise BrowserContractError()
+
+
+def playwright_proxy_settings(request: BrowserLaunchRequest) -> ProxySettings | None:
+    route = request.network_route
+    credentials = request.proxy_credentials
+    if route.protocol is BrowserNetworkProtocol.DIRECT:
+        if route.host is not None or route.port is not None or credentials is not None:
+            raise BrowserNetworkRouteUnsupported()
+        return None
+    if not route.host or route.port is None:
+        raise BrowserNetworkRouteUnsupported()
+    scheme = {
+        BrowserNetworkProtocol.HTTP: "http",
+        BrowserNetworkProtocol.HTTPS: "https",
+        BrowserNetworkProtocol.SOCKS5: "socks5",
+    }.get(route.protocol)
+    if scheme is None:
+        raise BrowserNetworkRouteUnsupported()
+    if (
+        route.protocol is BrowserNetworkProtocol.SOCKS5
+        and credentials is not None
+        and (credentials.username is not None or credentials.password is not None)
+    ):
+        raise BrowserNetworkRouteUnsupported()
+    server_host = (
+        f"[{route.host}]" if ":" in route.host and not route.host.startswith("[") else route.host
+    )
+    settings: ProxySettings = {"server": f"{scheme}://{server_host}:{route.port}"}
+    if credentials is not None:
+        if credentials.username is not None:
+            settings["username"] = credentials.username
+        if credentials.password is not None:
+            settings["password"] = credentials.password
+    return settings
+
+
+def _normalized_browser_origin(url: str) -> str | None:
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        scheme not in {"http", "https"}
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    hostname = hostname.lower()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    if port is None or (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
+        return f"{scheme}://{hostname}"
+    return f"{scheme}://{hostname}:{port}"

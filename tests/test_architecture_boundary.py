@@ -14,9 +14,13 @@ _FORBIDDEN_IMPORT_PREFIXES = (
     "asyncpg",
     "fastapi",
     "infrastructure.worker_agent",
+    "infrastructure.persistence",
     "sqlalchemy",
     "threads_platform.control_plane",
+    "threads_platform.domain.workers",
     "threads_platform.workers",
+    "workers",
+    "uvicorn",
 )
 
 
@@ -58,6 +62,39 @@ def test_runtime_dependencies_have_no_old_repo_or_distributed_stack() -> None:
     assert not [
         dependency for dependency in dependencies if any(term in dependency for term in forbidden)
     ]
+
+    lock = tomllib.loads((_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    locked_names = {item["name"].lower() for item in lock["package"]}
+    forbidden_locked = {
+        "alembic",
+        "asyncpg",
+        "fastapi",
+        "sqlalchemy",
+        "uvicorn",
+        "psycopg",
+    }
+    assert locked_names.isdisjoint(forbidden_locked)
+
+
+def test_playwright_import_is_confined_to_its_lazy_engine_adapter() -> None:
+    source_root = _ROOT / "src" / "threads_platform"
+    imports: list[Path] = []
+    for path in source_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            module = None
+            if isinstance(node, ast.Import):
+                if any(
+                    alias.name == "playwright" or alias.name.startswith("playwright.")
+                    for alias in node.names
+                ):
+                    module = "playwright"
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module
+            if module == "playwright" or (module is not None and module.startswith("playwright.")):
+                imports.append(path.relative_to(source_root))
+
+    assert set(imports) == {Path("browser/playwright_engine.py")}
 
 
 @pytest.mark.parametrize("command", ["publish", "reply", "quote", "browser", "worker"])
