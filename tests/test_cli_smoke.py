@@ -52,6 +52,40 @@ def test_help_lists_every_account_and_api_read_command(capsys: pytest.CaptureFix
     assert "publish" not in output
 
 
+def test_help_lists_local_browser_commands_without_mutation_commands(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--help"])
+
+    assert exit_info.value.code == 0
+    output = capsys.readouterr().out
+    for command in ("account", "profile", "thread", "feed", "api"):
+        assert command in output
+    for forbidden in ("publish", "reply", "worker"):
+        assert forbidden not in output
+
+
+def test_browser_cli_shapes_match_local_contract() -> None:
+    import threads_platform.standalone.__main__ as cli
+
+    profile = cli._build_parser().parse_args(["profile", "synthetic_account", "synthetic_user"])
+    thread = cli._build_parser().parse_args(
+        ["thread", "synthetic_account", "/@synthetic/post/fake_1"]
+    )
+    feed = cli._build_parser().parse_args(["feed", "synthetic_account", "--limit", "7"])
+    login = cli._build_parser().parse_args(["account", "login", "synthetic_account"])
+
+    assert (profile.alias, profile.username) == ("synthetic_account", "synthetic_user")
+    assert (thread.alias, thread.thread_ref) == (
+        "synthetic_account",
+        "/@synthetic/post/fake_1",
+    )
+    assert (feed.alias, feed.limit) == ("synthetic_account", 7)
+    assert (login.account_command, login.alias) == ("login", "synthetic_account")
+    assert cli._build_parser().parse_args(["feed", "synthetic_account"]).limit == 10
+
+
 def test_account_add_list_and_set_env_keep_only_a_reference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

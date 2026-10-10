@@ -60,3 +60,4 @@ jobs:
           uv run --isolated --no-project
           --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest
           pytest tests/test_api_contract.py::test_wheel_smoke_quota_read
+          tests/test_browser_runtime.py::test_wheel_smoke_browser_read
