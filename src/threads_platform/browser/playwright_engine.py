@@ -433,12 +433,14 @@ class _PlaywrightBrowserSession:
         self._closed = True
         try:
             await self._context.close()
-        except PlaywrightError:
+        except Exception:  # noqa: BLE001, S110
+            # Best-effort teardown must not mask the operation result or leak backend details.
             pass
         finally:
             try:
                 await self._playwright.stop()
-            except PlaywrightError:
+            except Exception:  # noqa: BLE001, S110
+                # Stopping Playwright is best effort even when context teardown failed.
                 pass
 
     def _ensure_alive(self) -> None:

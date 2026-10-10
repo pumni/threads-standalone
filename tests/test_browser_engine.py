@@ -10,6 +10,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 import threads_platform.browser.playwright_engine as engine_module
 from threads_platform.browser.contracts import (
     BrowserContractError,
+    BrowserEngineSession,
     BrowserLaunchRequest,
     BrowserNetworkProtocol,
     BrowserNetworkRoute,
@@ -19,6 +20,9 @@ from threads_platform.browser.contracts import (
     RemoteSessionStateUncertain,
     UnsupportedUIState,
 )
+from threads_platform.locks.filesystem import FilesystemProcessLock
+from threads_platform.standalone.accounts import LocalAccountStore
+from threads_platform.standalone.runtime import LocalRuntime
 
 
 class _FakeRequest:
@@ -94,10 +98,12 @@ class _FakePage:
 
 
 class _FakeContext:
-    def __init__(self, page: _FakePage) -> None:
+    def __init__(self, page: _FakePage, close_error: Exception | None = None) -> None:
         self.pages = [page]
         self.browser = _FakeBrowser()
         self.closed = False
+        self.close_error = close_error
+        self.close_calls = 0
 
     def on(self, event: str, handler: Any) -> None:
         self.close_handler = handler
@@ -106,6 +112,9 @@ class _FakeContext:
         return self.pages[0]
 
     async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
         self.closed = True
 
 
@@ -121,11 +130,16 @@ class _FakeChromium:
 
 
 class _FakePlaywright:
-    def __init__(self, chromium: _FakeChromium) -> None:
+    def __init__(self, chromium: _FakeChromium, stop_error: Exception | None = None) -> None:
         self.chromium = chromium
         self.stopped = False
+        self.stop_error = stop_error
+        self.stop_calls = 0
 
     async def stop(self) -> None:
+        self.stop_calls += 1
+        if self.stop_error is not None:
+            raise self.stop_error
         self.stopped = True
 
 
@@ -149,15 +163,28 @@ def _install_fake_playwright(
     monkeypatch: pytest.MonkeyPatch,
     *,
     payload: object = None,
+    context_close_error: Exception | None = None,
+    playwright_stop_error: Exception | None = None,
 ) -> tuple[_FakePage, _FakeContext, _FakePlaywright, _FakeChromium]:
     executable = tmp_path / "synthetic-chromium"
     executable.write_text("synthetic executable marker", encoding="utf-8")
     page = _FakePage(payload)
-    context = _FakeContext(page)
+    context = _FakeContext(page, context_close_error)
     chromium = _FakeChromium(executable, context)
-    playwright = _FakePlaywright(chromium)
+    playwright = _FakePlaywright(chromium, playwright_stop_error)
     monkeypatch.setattr(engine_module, "async_playwright", lambda: _FakeManager(playwright))
     return page, context, playwright, chromium
+
+
+class _CapturingEngine(engine_module.PlaywrightBrowserEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sessions: list[BrowserEngineSession] = []
+
+    async def open(self, request: BrowserLaunchRequest) -> BrowserEngineSession:
+        session = await super().open(request)
+        self.sessions.append(session)
+        return session
 
 
 def test_persistent_context_opens_headed_profile_and_reads_synthetic_feed(
@@ -191,6 +218,61 @@ def test_persistent_context_opens_headed_profile_and_reads_synthetic_feed(
     assert result == ("/@synthetic/post/fake_1",)
     assert page.goto_calls == [("https://www.threads.com/", "domcontentloaded", 30_000)]
     assert context.closed
+    assert playwright.stopped
+
+
+def test_cleanup_failures_are_suppressed_repeated_close_is_safe_and_login_releases_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _, context, playwright, _ = _install_fake_playwright(
+        tmp_path,
+        monkeypatch,
+        context_close_error=RuntimeError("synthetic private context detail"),
+        playwright_stop_error=RuntimeError("synthetic private Playwright detail"),
+    )
+    accounts = LocalAccountStore(tmp_path)
+    account = accounts.add("synthetic_account")
+    engine = _CapturingEngine()
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+
+    asyncio.run(runtime.login("synthetic_account", wait_for_operator=lambda _: None))
+
+    assert context.close_calls == 1
+    assert playwright.stop_calls == 1
+    output = capsys.readouterr()
+    assert "synthetic private context detail" not in output.out + output.err
+    assert "synthetic private Playwright detail" not in output.out + output.err
+
+    lock = FilesystemProcessLock(tmp_path / "locks" / f"{account.id}.lock")
+    lock.acquire()
+    lock.release()
+
+    asyncio.run(engine.sessions[0].close())
+    assert context.close_calls == 1
+    assert playwright.stop_calls == 1
+
+
+def test_close_propagates_cancellation_after_attempting_playwright_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, context, playwright, _ = _install_fake_playwright(
+        tmp_path,
+        monkeypatch,
+        context_close_error=asyncio.CancelledError("synthetic cancellation"),
+    )
+    profile = tmp_path / "profile"
+    profile.mkdir()
+
+    async def exercise() -> None:
+        session = await engine_module.PlaywrightBrowserEngine().open(_request(profile))
+        with pytest.raises(asyncio.CancelledError, match="synthetic cancellation"):
+            await session.close()
+
+    asyncio.run(exercise())
+    assert context.close_calls == 1
+    assert playwright.stop_calls == 1
     assert playwright.stopped
 
 
