@@ -26,6 +26,9 @@ jobs:
           GITLEAKS_ENABLE_COMMENTS: "false"
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
 
+      - name: Scan complete Git history
+        run: gitleaks detect --source . --redact --exit-code=2 --log-opts=--all
+
   quality:
     name: locked QA (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
