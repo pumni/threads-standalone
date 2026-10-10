@@ -30,6 +30,7 @@ _ALIAS_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _ACCOUNT_KEYS = {"version", "id", "alias"}
 _ACCOUNT_CREDENTIAL_KEYS = _ACCOUNT_KEYS | {"credential_ref"}
 _MAX_CREDENTIAL_REF_LENGTH = 134
+_MAX_ACCOUNT_BYTES = 8_192
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,9 +254,13 @@ class LocalAccountStore:
     def _read_account(self, path: Path) -> LocalAccount:
         self._validate_account_path(path)
         try:
-            document = path.read_text(encoding="utf-8")
-            data: object = json.loads(document)
-        except OSError, UnicodeError, json.JSONDecodeError, RecursionError:
+            with path.open("rb") as stream:
+                contents = stream.read(_MAX_ACCOUNT_BYTES + 1)
+            if len(contents) > _MAX_ACCOUNT_BYTES:
+                raise ValueError
+            document = contents.decode("utf-8")
+            data: object = json.loads(document, object_pairs_hook=self._unique_object)
+        except OSError, UnicodeError, ValueError, RecursionError:
             raise StandaloneAccountError("ACCOUNT_STATE_INVALID") from None
 
         if not isinstance(data, dict):
@@ -293,6 +298,15 @@ class LocalAccountStore:
             alias=alias,
             credential_ref=credential_ref,
         )
+
+    @staticmethod
+    def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
 
     def _atomic_write(self, target: Path, document: str) -> None:
         temporary_path: Path | None = None
