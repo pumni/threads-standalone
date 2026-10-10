@@ -55,9 +55,10 @@ jobs:
           uv run --isolated --no-project
           --with dist/threads_standalone-0.1.0-py3-none-any.whl threads-local --help
 
-      - name: Smoke-test a mocked API read from the installed wheel
+      - name: Smoke-test mocked API read and journaled mutation from the installed wheel
         run: >-
           uv run --isolated --no-project
-          --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest
+          --with dist/threads_standalone-0.1.0-py3-none-any.whl --with pytest --with pytest-asyncio
           pytest tests/test_api_contract.py::test_wheel_smoke_quota_read
+          tests/test_mutation_runtime.py::test_success_has_durable_phase_order_exact_text_request_and_one_publish
           tests/test_browser_runtime.py::test_wheel_smoke_browser_read

@@ -8,8 +8,9 @@ import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from threads_platform.api.contracts import (
     DiscoveryPage,
@@ -29,6 +30,14 @@ from threads_platform.standalone.accounts import (
 )
 from threads_platform.standalone.api import StandaloneApiError, bind_env_credential
 from threads_platform.standalone.app import build_standalone_app
+from threads_platform.standalone.mutations import (
+    CarouselManifest,
+    LocalOperationStore,
+    StandaloneMutationError,
+    load_carousel_manifest,
+    validate_media_post_inputs,
+    validate_reply_moderation_inputs,
+)
 
 
 def _format_scalar(value: int | str | None) -> str:
@@ -188,6 +197,62 @@ async def _run_api_command(args: argparse.Namespace, root: Path, store: LocalAcc
         return "".join(lines)
 
 
+async def _run_post_command(args: argparse.Namespace, root: Path, store: LocalAccountStore) -> str:
+    async with build_standalone_app(root, store) as app:
+        result = await app.mutations.publish_text(args.alias, args.text)
+    return f"published operation={result.operation_id} media={result.media_id}\n"
+
+
+async def _run_reply_command(args: argparse.Namespace, root: Path, store: LocalAccountStore) -> str:
+    async with build_standalone_app(root, store) as app:
+        result = await app.mutations.create_reply(
+            args.alias,
+            args.thread_id,
+            args.text,
+            parent_reply_id=args.parent_reply_id,
+        )
+    return f"replied operation={result.operation_id} reply={result.reply_id}\n"
+
+
+async def _run_moderate_reply_command(
+    alias: str, reply_id: str, action: str, root: Path, store: LocalAccountStore
+) -> str:
+    async with build_standalone_app(root, store) as app:
+        result = await app.mutations.moderate_reply(alias, reply_id, action)
+    return f"moderated operation={result.operation_id} action={result.action}\n"
+
+
+async def _run_media_post_command(
+    args: argparse.Namespace,
+    root: Path,
+    store: LocalAccountStore,
+    *,
+    media_type: Literal["IMAGE", "VIDEO"],
+) -> str:
+    media_url = args.image_url if media_type == "IMAGE" else args.video_url
+    validate_media_post_inputs(media_url, args.text, args.alt_text)
+    async with build_standalone_app(root, store) as app:
+        if media_type == "IMAGE":
+            result = await app.mutations.publish_image(
+                args.alias, args.image_url, args.text, alt_text=args.alt_text
+            )
+        else:
+            result = await app.mutations.publish_video(
+                args.alias, args.video_url, args.text, alt_text=args.alt_text
+            )
+    return (
+        f"published-{media_type.lower()} operation={result.operation_id} media={result.media_id}\n"
+    )
+
+
+async def _run_carousel_post_command(
+    alias: str, manifest: CarouselManifest, root: Path, store: LocalAccountStore
+) -> str:
+    async with build_standalone_app(root, store) as app:
+        result = await app.mutations.publish_carousel(alias, manifest)
+    return f"published-carousel operation={result.operation_id} media={result.media_id}\n"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="threads-local")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -244,6 +309,36 @@ def _build_parser() -> argparse.ArgumentParser:
         page_parser.add_argument("alias")
         page_parser.add_argument("thread_id")
         page_parser.add_argument("--after")
+
+    post_parser = commands.add_parser("post")
+    post_parser.add_argument("alias")
+    post_parser.add_argument("text")
+    reply_parser = commands.add_parser("reply")
+    reply_parser.add_argument("alias")
+    reply_parser.add_argument("thread_id")
+    reply_parser.add_argument("text")
+    reply_parser.add_argument("--parent-reply-id")
+    moderation_parser = commands.add_parser("moderate-reply")
+    moderation_parser.add_argument("alias")
+    moderation_parser.add_argument("reply_id")
+    moderation_parser.add_argument("action")
+    image_parser = commands.add_parser("post-image")
+    image_parser.add_argument("alias")
+    image_parser.add_argument("image_url")
+    image_parser.add_argument("text", nargs="?")
+    image_parser.add_argument("--alt-text")
+    video_parser = commands.add_parser("post-video")
+    video_parser.add_argument("alias")
+    video_parser.add_argument("video_url")
+    video_parser.add_argument("text", nargs="?")
+    video_parser.add_argument("--alt-text")
+    carousel_parser = commands.add_parser("post-carousel")
+    carousel_parser.add_argument("alias")
+    carousel_parser.add_argument("manifest")
+    operation_parser = commands.add_parser("operation")
+    operation_commands = operation_parser.add_subparsers(dest="operation_command", required=True)
+    show_parser = operation_commands.add_parser("show")
+    show_parser.add_argument("operation_id")
     return parser
 
 
@@ -288,6 +383,25 @@ def _run_browser_command(args: argparse.Namespace, root: Path, store: LocalAccou
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        if args.command == "post-carousel":
+            manifest = load_carousel_manifest(Path(args.manifest))
+            root = resolve_standalone_data_root()
+            store = LocalAccountStore(root)
+            sys.stdout.write(
+                asyncio.run(_run_carousel_post_command(args.alias, manifest, root, store))
+            )
+            return 0
+
+        if args.command == "moderate-reply":
+            reply_id, action = validate_reply_moderation_inputs(args.reply_id, args.action)
+            root = resolve_standalone_data_root()
+            store = LocalAccountStore(root)
+            store.get(args.alias)
+            sys.stdout.write(
+                asyncio.run(_run_moderate_reply_command(args.alias, reply_id, action, root, store))
+            )
+            return 0
+
         root = resolve_standalone_data_root()
         store = LocalAccountStore(root)
         if args.command == "account":
@@ -308,6 +422,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command in {"profile", "thread", "feed"}:
             return _run_browser_command(args, root, store)
 
+        if args.command == "operation":
+            try:
+                operation_id = UUID(args.operation_id)
+            except ValueError:
+                raise StandaloneMutationError("OPERATION_NOT_FOUND") from None
+            operation = LocalOperationStore(root).get(operation_id)
+            child_summary = (
+                f" children={len(operation.child_container_ids)}"
+                if operation.kind == "POST_CAROUSEL"
+                else ""
+            )
+            moderation_summary = (
+                f" action={operation.action}" if operation.kind == "MODERATE_REPLY" else ""
+            )
+            sys.stdout.write(
+                f"operation {operation.id} kind={operation.kind} phase={operation.phase} "
+                f"container={operation.container_id or '-'} "
+                f"media={operation.media_id or '-'} "
+                f"outcome={operation.outcome_code or '-'}"
+                f"{child_summary}{moderation_summary}\n"
+            )
+            return 0
+
+        if args.command == "post":
+            sys.stdout.write(asyncio.run(_run_post_command(args, root, store)))
+            return 0
+
+        if args.command == "reply":
+            sys.stdout.write(asyncio.run(_run_reply_command(args, root, store)))
+            return 0
+
+        if args.command == "post-image":
+            sys.stdout.write(
+                asyncio.run(_run_media_post_command(args, root, store, media_type="IMAGE"))
+            )
+            return 0
+
+        if args.command == "post-video":
+            sys.stdout.write(
+                asyncio.run(_run_media_post_command(args, root, store, media_type="VIDEO"))
+            )
+            return 0
+
         sys.stdout.write(asyncio.run(_run_api_command(args, root, store)))
         return 0
     except (
@@ -315,6 +472,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         StandaloneApiError,
         ThreadsCredentialError,
         ThreadsAPIError,
+        StandaloneMutationError,
     ) as error:
         sys.stderr.write(f"ERROR {error.code}\n")
         return 1

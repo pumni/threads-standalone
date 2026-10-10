@@ -98,6 +98,6 @@ def test_playwright_import_is_confined_to_its_lazy_engine_adapter() -> None:
 
 
 @pytest.mark.parametrize("command", ["publish", "reply", "quote", "browser", "worker"])
-def test_cli_does_not_expose_mutation_or_distributed_commands(command: str) -> None:
+def test_api_cli_does_not_expose_mutation_or_distributed_commands(command: str) -> None:
     with pytest.raises(SystemExit):
         _build_parser().parse_args(["api", command, "synthetic_account"])

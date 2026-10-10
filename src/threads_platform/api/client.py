@@ -10,6 +10,8 @@ from threads_platform.api.contracts import (
     DiscoveryPage,
     DiscoverySearchMode,
     DiscoverySearchType,
+    MediaContainer,
+    MediaContainerRequest,
     PublishingQuota,
     RemoteDiscoveryThread,
     RemoteMedia,
@@ -33,6 +35,59 @@ class HttpThreadsAPI:
 
     def __init__(self, client: httpx2.AsyncClient) -> None:
         self._client = client
+
+    async def create_container(
+        self, token: SecretStr, request: MediaContainerRequest
+    ) -> MediaContainer:
+        data: dict[str, str] = {"media_type": request.media_type}
+        optional = {
+            "text": request.text,
+            "image_url": request.image_url,
+            "video_url": request.video_url,
+            "alt_text": request.alt_text,
+            "quote_post_id": request.quote_post_id,
+            "reply_to_id": request.reply_to_id,
+            "reply_control": request.reply_control,
+        }
+        data.update({key: value for key, value in optional.items() if value is not None})
+        if request.children:
+            data["children"] = ",".join(request.children)
+        if request.is_carousel_item:
+            data["is_carousel_item"] = "true"
+        response = await self._request("POST", "me/threads", token, params=data)
+        payload = self._object(response)
+        container_id = payload.get("id")
+        if not isinstance(container_id, str) or not container_id:
+            raise ThreadsContractError()
+        return MediaContainer(container_id=container_id)
+
+    async def get_container(self, token: SecretStr, container_id: str) -> MediaContainer:
+        response = await self._request(
+            "GET",
+            quote(container_id, safe=""),
+            token,
+            params={"fields": "id,status,error_message"},
+        )
+        payload = self._object(response)
+        response_id = payload.get("id")
+        if not isinstance(response_id, str) or not response_id:
+            raise ThreadsContractError()
+        status = payload.get("status")
+        error_message = payload.get("error_message")
+        if status is not None and not isinstance(status, str):
+            raise ThreadsContractError()
+        if error_message is not None and not isinstance(error_message, str):
+            raise ThreadsContractError()
+        return MediaContainer(response_id, status, error_message)
+
+    async def publish_container(self, token: SecretStr, container_id: str) -> str:
+        response = await self._request(
+            "POST", "me/threads_publish", token, params={"creation_id": container_id}
+        )
+        media_id = self._object(response).get("id")
+        if not isinstance(media_id, str) or not media_id:
+            raise ThreadsContractError()
+        return media_id
 
     async def get_media(self, token: SecretStr, media_id: str) -> RemoteMedia:
         response = await self._request(
@@ -230,6 +285,29 @@ class HttpThreadsAPI:
             params["until"] = until.isoformat()
         response = await self._request("GET", "me/mentions", token, params=params)
         return self._discovery_page(response)
+
+    async def manage_reply(self, token: SecretStr, reply_id: str, *, hide: bool) -> None:
+        response = await self._request(
+            "POST",
+            f"{quote(reply_id, safe='')}/manage_reply",
+            token,
+            params={"hide": str(hide).lower()},
+        )
+        self._check_success(response)
+
+    async def manage_pending_reply(self, token: SecretStr, reply_id: str, *, approve: bool) -> None:
+        response = await self._request(
+            "POST",
+            f"{quote(reply_id, safe='')}/manage_pending_reply",
+            token,
+            params={"approve": str(approve).lower()},
+        )
+        self._check_success(response)
+
+    @classmethod
+    def _check_success(cls, response: httpx2.Response) -> None:
+        if cls._object(response).get("success") is not True:
+            raise ThreadsContractError()
 
     async def _reply_page(
         self, token: SecretStr, thread_id: str, edge: str, after: str | None
