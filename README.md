@@ -1,6 +1,8 @@
 # threads-standalone
 
-Private destination bootstrap for the Standalone product split. This repository starts with an independently authored package skeleton and a help-only `threads-local` command.
+Public destination bootstrap for the Standalone product split. This repository was initially created and verified PRIVATE before its first push; the operator changed its visibility to PUBLIC on 2026-10-10 to make GitHub-hosted CI available. The code remains an independently authored package skeleton with a help-only `threads-local` command.
+
+**PUBLIC REPOSITORY WARNING:** Never commit or publish access tokens, browser cookies/profiles, account IDs, Nurture receipts, operation journals, raw Threads IDs/cursors, usernames, draft/post text, permalinks, live HTTP payloads or private evidence. Keep all operator data outside Git and use synthetic examples in tests.
 
 No Threads API, browser, account, token, local state, database, Worker, or Control Plane capability is implemented in this scaffold.
 

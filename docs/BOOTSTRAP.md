@@ -25,4 +25,4 @@ CI also runs a secret scan and the same locked quality/build gates. It requires 
 
 ## Repository controls
 
-The destination must be verified PRIVATE before the first file push. Use an independent Git history and keep the default branch protected by requiring the cheap CI check and secret scan after the coordinator accepts this draft. Do not enable publishing, mutation, PostgreSQL, Worker, or source-monorepo dependencies.
+The destination was verified PRIVATE before its first file push; on 2026-10-10 the operator explicitly changed GitHub visibility to PUBLIC to enable hosted CI. The current PUBLIC status is intentional, but this does not authorize uploading any local account state, profile, token, journal, operator evidence, remote IDs, raw cursor, username, URLs or post/draft content. Maintain an independent Git history and protect the default branch with required CI and secret scan after coordinator acceptance. Do not enable publishing, mutation, PostgreSQL, Worker, or source-monorepo dependencies.
