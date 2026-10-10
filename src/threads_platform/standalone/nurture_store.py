@@ -1,0 +1,2288 @@
+"""Secret-safe local receipts and dedupe state for standalone nurture."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import re
+import stat
+import tempfile
+import unicodedata
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Literal, NoReturn, Self, cast
+from uuid import UUID, uuid4
+
+from threads_platform.locks.filesystem import FilesystemProcessLock
+from threads_platform.locks.process_lock import ProcessAlreadyRunning
+from threads_platform.standalone.nurture import NurturePresetV1
+from threads_platform.standalone.nurture_content import content_fingerprint
+
+NurtureOutcome = Literal["RUNNING", "SUCCESS", "FAILED", "INTERRUPTED", "AMBIGUOUS"]
+NurtureActionState = Literal["NONE", "PENDING", "CONFIRMED", "AMBIGUOUS"]
+NurtureContentPublicationState = Literal["NEW", "RESERVED", "PUBLISHED", "AMBIGUOUS", "REJECTED"]
+
+MAX_NURTURE_TARGETS = 2_000
+MAX_NURTURE_RUN_BYTES = 8_192
+MAX_NURTURE_TARGET_STATE_BYTES = 2_097_152
+MAX_NURTURE_CONTENT_RECORDS = 2_000
+MAX_NURTURE_CONTENT_STATE_BYTES = 2_097_152
+MAX_NURTURE_INSIGHTS_SNAPSHOTS_PER_CONTENT = 512
+MAX_NURTURE_INSIGHTS_SNAPSHOT_BYTES = 4_096
+_MAX_ACTIVE_RUNS_TO_REPAIR = 32
+_MAX_COUNTER = 1_000_000
+_MAX_DECISION_CODES = 32
+_MAX_OPERATION_IDS = 6
+_SAFE_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+_SAFE_STAGE = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
+_PRESET_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_REMOTE_THREAD_ID = re.compile(r"[A-Za-z0-9._:-]{1,255}\Z")
+_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
+_OUTCOMES = frozenset({"RUNNING", "SUCCESS", "FAILED", "INTERRUPTED", "AMBIGUOUS"})
+_ACTION_STATES = frozenset({"NONE", "PENDING", "CONFIRMED", "AMBIGUOUS"})
+_CONTENT_CATEGORIES = frozenset(
+    {
+        "CAREER_TIP",
+        "CV_GUIDANCE",
+        "INTERVIEW_PREP",
+        "RECRUITMENT_MARKET",
+        "EMPLOYER_GUIDANCE",
+        "AUTHORIZED_CANDIDATE_EXAMPLE",
+    }
+)
+_COUNTER_FIELDS = (
+    "discovered_count",
+    "deduped_count",
+    "selected_count",
+    "enriched_count",
+    "replied_count",
+    "published_count",
+    "skipped_count",
+)
+_RUN_KEYS = frozenset(
+    {
+        "version",
+        "id",
+        "account_id",
+        "preset_id",
+        "preset_version",
+        "started_at",
+        "finished_at",
+        "outcome",
+        *_COUNTER_FIELDS,
+        "decision_codes",
+        "operation_ids",
+        "error_code",
+        "failed_stage",
+    }
+)
+_TARGET_STATE_KEYS = frozenset({"version", "account_id", "preset_id", "targets"})
+_CONTENT_STATE_KEYS = frozenset({"version", "account_id", "preset_id", "candidates"})
+_INSIGHTS_SNAPSHOT_KEYS = frozenset(
+    {
+        "version",
+        "snapshot_id",
+        "account_id",
+        "preset_id",
+        "content_fingerprint",
+        "source_fingerprint",
+        "draft_fingerprint",
+        "category",
+        "observed_at",
+        "likes",
+        "replies",
+        "reposts",
+        "quotes",
+        "operation_id",
+    }
+)
+_CONTENT_CANDIDATE_KEYS = frozenset(
+    {
+        "candidate_id",
+        "source_fingerprint",
+        "draft_fingerprint",
+        "category",
+        "first_seen_at",
+        "last_action_at",
+        "publication_state",
+        "last_run_id",
+        "operation_id",
+    }
+)
+_TARGET_KEYS = frozenset(
+    {
+        "fingerprint",
+        "first_seen_at",
+        "last_seen_at",
+        "last_decision_code",
+        "last_action_at",
+        "action_state",
+        "last_run_id",
+        "last_operation_id",
+    }
+)
+
+
+class NurtureStateError(Exception):
+    """A bounded, data-safe error from Nurture's local persistence boundary."""
+
+    code: str
+
+    def __init__(self, code: str) -> None:
+        if code not in {
+            "NURTURE_STATE_INVALID",
+            "NURTURE_VERSION_UNSUPPORTED",
+            "NURTURE_RUN_NOT_FOUND",
+            "NURTURE_BUSY",
+            "NURTURE_TARGET_PENDING",
+            "NURTURE_TARGET_AMBIGUOUS",
+            "NURTURE_TARGET_RESERVED",
+            "NURTURE_STATE_CAP_REACHED",
+            "NURTURE_CONTENT_PROVENANCE_CONFLICT",
+            "NURTURE_CONTENT_DRAFT_REUSE_CONFLICT",
+            "NURTURE_CONTENT_ALREADY_USED",
+            "NURTURE_CONTENT_UNRESOLVED",
+        }:
+            raise ValueError("unsupported Nurture state error code")
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class NurtureRunV1:
+    version: int
+    id: UUID
+    account_id: UUID
+    preset_id: str
+    preset_version: int
+    started_at: datetime
+    finished_at: datetime | None
+    outcome: NurtureOutcome
+    discovered_count: int = 0
+    deduped_count: int = 0
+    selected_count: int = 0
+    enriched_count: int = 0
+    replied_count: int = 0
+    published_count: int = 0
+    skipped_count: int = 0
+    decision_codes: tuple[str, ...] = ()
+    operation_ids: tuple[UUID, ...] = ()
+    error_code: str | None = None
+    failed_stage: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_run(self)
+
+    def __repr__(self) -> str:
+        return (
+            "NurtureRunV1("
+            f"id={self.id}, outcome={self.outcome}, preset_id={self.preset_id!r}, "
+            f"decision_codes={len(self.decision_codes)}, operation_ids={len(self.operation_ids)})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class NurtureTargetV1:
+    fingerprint: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    last_decision_code: str
+    last_action_at: datetime | None
+    action_state: NurtureActionState
+    last_run_id: UUID
+    last_operation_id: UUID | None
+
+    def __post_init__(self) -> None:
+        _validate_target(self)
+
+    def __repr__(self) -> str:
+        return (
+            f"NurtureTargetV1(fingerprint={self.fingerprint[:12]}…, "
+            f"action_state={self.action_state})"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class NurtureTargetStateV1:
+    version: int
+    account_id: UUID
+    preset_id: str
+    targets: tuple[NurtureTargetV1, ...]
+
+    def __post_init__(self) -> None:
+        _validate_target_document(self)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class NurtureContentRecordV1:
+    candidate_id: UUID
+    source_fingerprint: str
+    draft_fingerprint: str
+    category: str
+    first_seen_at: datetime
+    last_action_at: datetime | None
+    publication_state: NurtureContentPublicationState
+    last_run_id: UUID
+    operation_id: UUID | None
+
+    def __post_init__(self) -> None:
+        _validate_content_record(self)
+
+    def __repr__(self) -> str:
+        return (
+            "NurtureContentRecordV1("
+            f"candidate_id={self.candidate_id}, source_fingerprint={self.source_fingerprint}, "
+            f"draft_fingerprint={self.draft_fingerprint}, category={self.category}, "
+            f"publication_state={self.publication_state})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class NurtureContentStateV1:
+    version: int
+    account_id: UUID
+    preset_id: str
+    candidates: tuple[NurtureContentRecordV1, ...]
+
+    def __post_init__(self) -> None:
+        _validate_content_document(self)
+
+    def __repr__(self) -> str:
+        return (
+            "NurtureContentStateV1("
+            f"version={self.version}, account_id={self.account_id}, "
+            f"preset_id={self.preset_id!r}, candidates={len(self.candidates)})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class NurtureInsightsSnapshotV1:
+    version: int
+    snapshot_id: str
+    account_id: UUID
+    preset_id: str
+    content_fingerprint: str
+    source_fingerprint: str
+    draft_fingerprint: str
+    category: str
+    observed_at: datetime
+    likes: int | None
+    replies: int | None
+    reposts: int | None
+    quotes: int | None
+    operation_id: UUID
+
+    def __post_init__(self) -> None:
+        _validate_insights_snapshot(self)
+
+    def __repr__(self) -> str:
+        return (
+            "NurtureInsightsSnapshotV1("
+            f"snapshot_id={self.snapshot_id[:12]}…, category={self.category}, "
+            f"observed_at={self.observed_at.isoformat()})"
+        )
+
+
+class NurtureStore:
+    """Strict filesystem receipts and target state under one Standalone root."""
+
+    def __init__(self, data_root: Path) -> None:
+        self._configured_root = Path(data_root).absolute()
+        try:
+            self._root = self._configured_root.resolve(strict=False)
+        except OSError, RuntimeError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+
+    def acquire_account_lock(self, account_id: UUID) -> NurtureAccountLock:
+        _validate_uuid(account_id, version=4)
+        return NurtureAccountLock(self, account_id)
+
+    def create_run(
+        self,
+        owner: NurtureAccountLock,
+        preset: NurturePresetV1,
+        *,
+        now: datetime | None,
+    ) -> NurtureRunV1:
+        owner.require_held(self)
+        preset = _validated_preset(preset)
+        started_at = _as_utc(datetime.now(UTC) if now is None else now)
+        run = NurtureRunV1(
+            version=1,
+            id=uuid4(),
+            account_id=owner.account_id,
+            preset_id=preset.id,
+            preset_version=preset.version,
+            started_at=started_at,
+            finished_at=None,
+            outcome="RUNNING",
+        )
+        directory = self._run_directory(run.account_id, "active", create=True)
+        assert directory is not None
+        if self._run_receipt_paths(directory):
+            raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
+        self._write_new_run(directory / f"{run.id}.json", run)
+        return run
+
+    def read_run(self, owner: NurtureAccountLock, run_id: UUID) -> NurtureRunV1:
+        owner.require_held(self)
+        account_id = owner.account_id
+        _validate_uuid(account_id, version=4)
+        _validate_uuid(run_id, version=4)
+        path = self._find_run_path(account_id, run_id)
+        if path is None:
+            raise NurtureStateError("NURTURE_RUN_NOT_FOUND")
+        run = self._read_run(path, run_id)
+        if run.account_id != account_id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return run
+
+    def update_run(self, owner: NurtureAccountLock, updated: NurtureRunV1) -> NurtureRunV1:
+        owner.require_held(self)
+        if type(updated) is not NurtureRunV1:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        _validate_run(updated)
+        if updated.account_id != owner.account_id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        current = self.read_run(owner, updated.id)
+        if (
+            current.version != updated.version
+            or current.id != updated.id
+            or current.account_id != updated.account_id
+            or current.preset_id != updated.preset_id
+            or current.preset_version != updated.preset_version
+            or current.started_at != updated.started_at
+            or current.outcome != "RUNNING"
+            or updated.outcome not in _OUTCOMES
+            or (updated.outcome == "RUNNING" and updated.finished_at is not None)
+            or (updated.outcome != "RUNNING" and updated.finished_at is None)
+        ):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        directory = self._run_directory(owner.account_id, "active", create=False)
+        if directory is None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        path = self._run_path(directory, updated.id, must_exist=True)
+        assert path is not None
+        self._write_replace(path, _encode_run(updated), MAX_NURTURE_RUN_BYTES)
+        if updated.outcome != "RUNNING":
+            self._move_run_to_completed(directory, updated)
+        return updated
+
+    def load_target_state(
+        self,
+        owner: NurtureAccountLock,
+        preset: NurturePresetV1,
+    ) -> NurtureTargetStateV1:
+        owner.require_held(self)
+        account_id = owner.account_id
+        preset = _validated_preset(preset)
+        directory = self._state_account_directory(account_id, create=False)
+        if directory is None:
+            return NurtureTargetStateV1(1, account_id, preset.id, ())
+        path = self._target_state_path(directory, preset.id, must_exist=False)
+        if path is None:
+            return NurtureTargetStateV1(1, account_id, preset.id, ())
+        document = self._read_target_document(path, account_id, preset.id)
+        return document
+
+    def save_target_state(
+        self,
+        owner: NurtureAccountLock,
+        document: NurtureTargetStateV1,
+    ) -> None:
+        owner.require_held(self)
+        if type(document) is not NurtureTargetStateV1:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        if owner.account_id != document.account_id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        _validate_target_document(document)
+        directory = self._state_account_directory(document.account_id, create=True)
+        assert directory is not None
+        path = self._target_state_path(directory, document.preset_id, must_exist=False)
+        if path is None:
+            current = NurtureTargetStateV1(1, owner.account_id, document.preset_id, ())
+        else:
+            current = self._read_target_document(path, owner.account_id, document.preset_id)
+        _validate_target_transition(current, document)
+        previous_targets = {target.fingerprint: target for target in current.targets}
+        for target in document.targets:
+            previous = previous_targets.get(target.fingerprint)
+            if previous is None or replace(previous, last_seen_at=target.last_seen_at) != target:
+                run = self.read_run(owner, target.last_run_id)
+                if run.preset_id != document.preset_id or run.outcome != "RUNNING":
+                    raise NurtureStateError("NURTURE_STATE_INVALID")
+        encoded = _encode_target_document(document)
+        if path is None:
+            self._write_new_document(
+                directory / f"{document.preset_id}.json", encoded, MAX_NURTURE_TARGET_STATE_BYTES
+            )
+        else:
+            self._write_replace(path, encoded, MAX_NURTURE_TARGET_STATE_BYTES)
+
+    def load_content_state(
+        self,
+        owner: NurtureAccountLock,
+        preset: NurturePresetV1,
+    ) -> NurtureContentStateV1:
+        owner.require_held(self)
+        preset = _validated_preset(preset)
+        directory = self._content_account_directory(owner.account_id, create=False)
+        if directory is None:
+            return NurtureContentStateV1(1, owner.account_id, preset.id, ())
+        path = self._content_state_path(directory, preset.id, must_exist=False)
+        if path is None:
+            return NurtureContentStateV1(1, owner.account_id, preset.id, ())
+        document = self._read_content_document(path, owner.account_id, preset.id)
+        return document
+
+    def save_content_state(
+        self,
+        owner: NurtureAccountLock,
+        document: NurtureContentStateV1,
+    ) -> None:
+        owner.require_held(self)
+        if type(document) is not NurtureContentStateV1:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        if owner.account_id != document.account_id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        _validate_content_document(document)
+        directory = self._content_account_directory(document.account_id, create=True)
+        assert directory is not None
+        path = self._content_state_path(directory, document.preset_id, must_exist=False)
+        if path is None:
+            current = NurtureContentStateV1(1, owner.account_id, document.preset_id, ())
+        else:
+            current = self._read_content_document(path, owner.account_id, document.preset_id)
+        _validate_content_transition(current, document)
+        previous = {
+            (item.source_fingerprint, item.draft_fingerprint): item for item in current.candidates
+        }
+        for item in document.candidates:
+            old = previous.get((item.source_fingerprint, item.draft_fingerprint))
+            if old is None or old != item:
+                run = self.read_run(owner, item.last_run_id)
+                if run.preset_id != document.preset_id or run.outcome != "RUNNING":
+                    raise NurtureStateError("NURTURE_STATE_INVALID")
+        encoded = _encode_content_document(document)
+        if path is None:
+            self._write_new_document(
+                directory / f"{document.preset_id}.json",
+                encoded,
+                MAX_NURTURE_CONTENT_STATE_BYTES,
+            )
+        else:
+            self._write_replace(path, encoded, MAX_NURTURE_CONTENT_STATE_BYTES)
+
+    def load_insights_snapshots(
+        self,
+        owner: NurtureAccountLock,
+        preset: NurturePresetV1,
+        content_fp: str,
+    ) -> tuple[NurtureInsightsSnapshotV1, ...]:
+        owner.require_held(self)
+        validated_preset = _validated_preset(preset)
+        _validate_fingerprint(content_fp)
+        directory = self._insights_content_directory(
+            owner.account_id, validated_preset.id, content_fp, create=False
+        )
+        if directory is None:
+            return ()
+        snapshots: list[NurtureInsightsSnapshotV1] = []
+        for path in self._insights_snapshot_paths(directory):
+            snapshot_id = path.stem
+            snapshot = self._read_insights_snapshot(path, snapshot_id)
+            if (
+                snapshot.account_id != owner.account_id
+                or snapshot.preset_id != validated_preset.id
+                or snapshot.content_fingerprint != content_fp
+            ):
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            snapshots.append(snapshot)
+        return tuple(sorted(snapshots, key=lambda item: (item.observed_at, item.snapshot_id)))
+
+    def append_insights_snapshot(
+        self,
+        owner: NurtureAccountLock,
+        preset: NurturePresetV1,
+        snapshot: NurtureInsightsSnapshotV1,
+    ) -> NurtureInsightsSnapshotV1:
+        owner.require_held(self)
+        validated_preset = _validated_preset(preset)
+        _validate_insights_snapshot(snapshot)
+        if snapshot.account_id != owner.account_id or snapshot.preset_id != validated_preset.id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        state = self.load_content_state(owner, validated_preset)
+        matches = [
+            candidate
+            for candidate in state.candidates
+            if candidate.source_fingerprint == snapshot.source_fingerprint
+            and candidate.draft_fingerprint == snapshot.draft_fingerprint
+        ]
+        if (
+            len(matches) != 1
+            or matches[0].publication_state != "PUBLISHED"
+            or matches[0].category != snapshot.category
+            or matches[0].operation_id != snapshot.operation_id
+            or content_fingerprint(snapshot.source_fingerprint, snapshot.draft_fingerprint)
+            != snapshot.content_fingerprint
+        ):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        directory = self._insights_content_directory(
+            snapshot.account_id, snapshot.preset_id, snapshot.content_fingerprint, create=True
+        )
+        assert directory is not None
+        path = self._insights_snapshot_path(directory, snapshot.snapshot_id, must_exist=False)
+        if path is not None:
+            current = self._read_insights_snapshot(path, snapshot.snapshot_id)
+            if current != snapshot:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            return current
+        paths = self._insights_snapshot_paths(directory)
+        if len(paths) >= MAX_NURTURE_INSIGHTS_SNAPSHOTS_PER_CONTENT:
+            raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
+        self._write_new_document(
+            directory / f"{snapshot.snapshot_id}.json",
+            _encode_insights_snapshot(snapshot),
+            MAX_NURTURE_INSIGHTS_SNAPSHOT_BYTES,
+        )
+        return snapshot
+
+    def repair_stale_runs(self, owner: NurtureAccountLock) -> None:
+        owner.require_held(self)
+        directory = self._run_directory(owner.account_id, "active", create=False)
+        if directory is None:
+            return
+        json_paths = self._run_receipt_paths(directory)
+
+        active_runs: list[tuple[Path, NurtureRunV1]] = []
+        for _path, run_id in json_paths:
+            run_path = self._run_path(directory, run_id, must_exist=True)
+            assert run_path is not None
+            run = self._read_run(run_path, run_id)
+            if run.account_id != owner.account_id:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            active_runs.append((run_path, run))
+        for path, run in active_runs:
+            if run.outcome == "RUNNING":
+                run = replace(
+                    run,
+                    finished_at=run.started_at,
+                    outcome="INTERRUPTED",
+                    error_code="INTERRUPTED",
+                    failed_stage="recovery",
+                )
+                self._write_replace(path, _encode_run(run), MAX_NURTURE_RUN_BYTES)
+            self._move_run_to_completed(path.parent, run)
+
+    @staticmethod
+    def _run_receipt_paths(directory: Path) -> list[tuple[Path, UUID]]:
+        try:
+            paths = sorted(directory.iterdir(), key=lambda path: path.name)
+        except OSError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        json_paths: list[tuple[Path, UUID]] = []
+        for path in paths:
+            if path.suffix != ".json":
+                continue
+            try:
+                run_id = _parse_uuid(path.stem, version=4)
+            except NurtureStateError:
+                raise NurtureStateError("NURTURE_STATE_INVALID") from None
+            json_paths.append((path, run_id))
+        if len(json_paths) > _MAX_ACTIVE_RUNS_TO_REPAIR:
+            raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
+        return json_paths
+
+    def _find_run_path(self, account_id: UUID, run_id: UUID) -> Path | None:
+        for stage in ("active", "completed"):
+            directory = self._run_directory(account_id, stage, create=False)
+            if directory is None:
+                continue
+            path = self._run_path(directory, run_id, must_exist=False)
+            if path is not None:
+                return path
+        return None
+
+    def _move_run_to_completed(self, active_directory: Path, run: NurtureRunV1) -> None:
+        completed = self._run_directory(run.account_id, "completed", create=True)
+        assert completed is not None
+        source = self._run_path(active_directory, run.id, must_exist=True)
+        assert source is not None
+        target = self._run_path(completed, run.id, must_exist=False)
+        if target is not None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        try:
+            os.replace(source, completed / f"{run.id}.json")
+        except OSError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        self._run_path(completed, run.id, must_exist=True)
+
+    def lock_directory(self) -> Path:
+        directory = self._subdirectory("locks", create=True)
+        assert directory is not None
+        return directory
+
+    def validate_lock_file(self, path: Path, parent: Path) -> None:
+        self._regular_file_path(path, parent, must_exist=True)
+
+    def _run_directory(self, account_id: UUID, stage: str, *, create: bool) -> Path | None:
+        if stage not in {"active", "completed"}:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        runs = self._subdirectory("runs", create=create)
+        if runs is None:
+            return None
+        account_directory = self._ensure_directory(runs / str(account_id), runs, create=create)
+        if account_directory is None:
+            return None
+        return self._ensure_directory(
+            account_directory / stage,
+            account_directory,
+            create=create,
+        )
+
+    def _state_account_directory(self, account_id: UUID, *, create: bool) -> Path | None:
+        state = self._subdirectory("state", create=create)
+        if state is None:
+            return None
+        return self._ensure_directory(state / str(account_id), state, create=create)
+
+    def _content_account_directory(self, account_id: UUID, *, create: bool) -> Path | None:
+        content = self._subdirectory("content", create=create)
+        if content is None:
+            return None
+        return self._ensure_directory(content / str(account_id), content, create=create)
+
+    def _insights_content_directory(
+        self,
+        account_id: UUID,
+        preset_id: str,
+        content_fp: str,
+        *,
+        create: bool,
+    ) -> Path | None:
+        if _PRESET_ID.fullmatch(preset_id) is None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        _validate_fingerprint(content_fp)
+        insights = self._subdirectory("insights", create=create)
+        if insights is None:
+            return None
+        account = self._ensure_directory(insights / str(account_id), insights, create=create)
+        if account is None:
+            return None
+        preset = self._ensure_directory(account / preset_id, account, create=create)
+        if preset is None:
+            return None
+        return self._ensure_directory(preset / content_fp, preset, create=create)
+
+    def _insights_snapshot_paths(self, directory: Path) -> list[Path]:
+        try:
+            paths = sorted(directory.iterdir(), key=lambda path: path.name)
+        except OSError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        if len(paths) > MAX_NURTURE_INSIGHTS_SNAPSHOTS_PER_CONTENT + 16:
+            raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
+        snapshots: list[Path] = []
+        for path in paths:
+            try:
+                metadata = path.lstat()
+            except OSError:
+                raise NurtureStateError("NURTURE_STATE_INVALID") from None
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            if path.suffix != ".json":
+                continue
+            if _FINGERPRINT.fullmatch(path.stem) is None:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            self._regular_file_path(path, directory, must_exist=True)
+            snapshots.append(path)
+        if len(snapshots) > MAX_NURTURE_INSIGHTS_SNAPSHOTS_PER_CONTENT:
+            raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
+        return snapshots
+
+    def _insights_snapshot_path(
+        self,
+        directory: Path,
+        snapshot_id: str,
+        *,
+        must_exist: bool,
+    ) -> Path | None:
+        if _FINGERPRINT.fullmatch(snapshot_id) is None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return self._regular_file_path(directory / f"{snapshot_id}.json", directory, must_exist)
+
+    def _subdirectory(self, name: str, *, create: bool) -> Path | None:
+        root = self._validate_root()
+        nurture = self._ensure_directory(root / "nurture", root, create=create)
+        if nurture is None:
+            return None
+        return self._ensure_directory(nurture / name, nurture, create=create)
+
+    def _ensure_directory(self, path: Path, parent: Path, *, create: bool) -> Path | None:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            if not create:
+                return None
+            try:
+                path.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        except OSError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        try:
+            metadata = path.lstat()
+            resolved = path.resolve(strict=True)
+        except OSError, RuntimeError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or resolved != path
+            or path.parent != parent
+            or not resolved.is_relative_to(self._root)
+        ):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return path
+
+    def _validate_root(self) -> Path:
+        try:
+            metadata = self._root.lstat()
+            resolved = self._root.resolve(strict=True)
+        except OSError, RuntimeError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        if (
+            self._configured_root != self._root
+            or stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or resolved != self._root
+        ):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return self._root
+
+    def _run_path(self, directory: Path, run_id: UUID, *, must_exist: bool) -> Path | None:
+        return self._regular_file_path(directory / f"{run_id}.json", directory, must_exist)
+
+    def _target_state_path(
+        self,
+        directory: Path,
+        preset_id: str,
+        *,
+        must_exist: bool,
+    ) -> Path | None:
+        if _PRESET_ID.fullmatch(preset_id) is None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return self._regular_file_path(directory / f"{preset_id}.json", directory, must_exist)
+
+    def _content_state_path(
+        self,
+        directory: Path,
+        preset_id: str,
+        *,
+        must_exist: bool,
+    ) -> Path | None:
+        if _PRESET_ID.fullmatch(preset_id) is None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return self._regular_file_path(directory / f"{preset_id}.json", directory, must_exist)
+
+    def _regular_file_path(
+        self,
+        path: Path,
+        parent: Path,
+        must_exist: bool,
+    ) -> Path | None:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            if must_exist:
+                raise NurtureStateError("NURTURE_STATE_INVALID") from None
+            return None
+        except OSError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError, RuntimeError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or resolved != path
+            or path.parent != parent
+            or not resolved.is_relative_to(self._root)
+        ):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return path
+
+    def _read_bytes(self, path: Path, parent: Path, maximum: int) -> bytes:
+        self._regular_file_path(path, parent, must_exist=True)
+        try:
+            with path.open("rb") as stream:
+                metadata = os.fstat(stream.fileno())
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum:
+                    raise ValueError
+                raw = stream.read(maximum + 1)
+            if len(raw) > maximum:
+                raise ValueError
+            return raw
+        except OSError, ValueError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+
+    def _read_run(self, path: Path, run_id: UUID) -> NurtureRunV1:
+        raw = self._read_bytes(path, path.parent, MAX_NURTURE_RUN_BYTES)
+        try:
+            value = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_unique_object,
+                parse_constant=_reject_constant,
+            )
+        except UnicodeError, json.JSONDecodeError, RecursionError, ValueError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        run = _decode_run(value)
+        if run.id != run_id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return run
+
+    def _read_target_document(
+        self,
+        path: Path,
+        account_id: UUID,
+        preset_id: str,
+    ) -> NurtureTargetStateV1:
+        raw = self._read_bytes(path, path.parent, MAX_NURTURE_TARGET_STATE_BYTES)
+        try:
+            value = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_unique_object,
+                parse_constant=_reject_constant,
+            )
+        except UnicodeError, json.JSONDecodeError, RecursionError, ValueError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        document = _decode_target_document(value)
+        if document.account_id != account_id or document.preset_id != preset_id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return document
+
+    def _read_content_document(
+        self,
+        path: Path,
+        account_id: UUID,
+        preset_id: str,
+    ) -> NurtureContentStateV1:
+        raw = self._read_bytes(path, path.parent, MAX_NURTURE_CONTENT_STATE_BYTES)
+        try:
+            value = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_unique_object,
+                parse_constant=_reject_constant,
+            )
+        except UnicodeError, json.JSONDecodeError, RecursionError, ValueError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        document = _decode_content_document(value)
+        if document.account_id != account_id or document.preset_id != preset_id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return document
+
+    def _read_insights_snapshot(self, path: Path, expected_id: str) -> NurtureInsightsSnapshotV1:
+        raw = self._read_bytes(path, path.parent, MAX_NURTURE_INSIGHTS_SNAPSHOT_BYTES)
+        try:
+            value = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_unique_object,
+                parse_constant=_reject_constant,
+            )
+        except UnicodeError, json.JSONDecodeError, RecursionError, ValueError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        snapshot = _decode_insights_snapshot(value)
+        if snapshot.snapshot_id != expected_id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return snapshot
+
+    def _write_new_run(self, target: Path, run: NurtureRunV1) -> None:
+        self._write_new_document(target, _encode_run(run), MAX_NURTURE_RUN_BYTES)
+
+    def _write_new_document(self, target: Path, document: str, maximum: int) -> None:
+        if len(document.encode("utf-8")) > maximum:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        temporary_path: Path | None = None
+        descriptor: int | None = None
+        try:
+            if self._regular_file_path(target, target.parent, must_exist=False) is not None:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+            )
+            temporary_path = Path(temporary_name)
+            stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+            descriptor = None
+            with stream:
+                stream.write(document)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary_path, target)
+            except FileExistsError:
+                raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        except NurtureStateError:
+            raise
+        except OSError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        finally:
+            _cleanup_temporary(temporary_path, descriptor)
+
+    def _write_replace(self, target: Path, document: str, maximum: int) -> None:
+        if len(document.encode("utf-8")) > maximum:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        temporary_path: Path | None = None
+        descriptor: int | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+            )
+            temporary_path = Path(temporary_name)
+            stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+            descriptor = None
+            with stream:
+                stream.write(document)
+                stream.flush()
+                os.fsync(stream.fileno())
+            self._regular_file_path(target, target.parent, must_exist=True)
+            os.replace(temporary_path, target)
+            self._regular_file_path(target, target.parent, must_exist=True)
+        except NurtureStateError:
+            raise
+        except OSError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        finally:
+            _cleanup_temporary(temporary_path, descriptor)
+
+
+class NurtureAccountLock:
+    """Separate per-account Nurture owner; never aliases capability locks."""
+
+    def __init__(self, store: NurtureStore, account_id: UUID) -> None:
+        _validate_uuid(account_id, version=4)
+        self._store = store
+        self._account_id = account_id
+        self._lock: FilesystemProcessLock | None = None
+
+    @property
+    def account_id(self) -> UUID:
+        return self._account_id
+
+    @property
+    def held(self) -> bool:
+        return self._lock is not None and self._lock.held
+
+    def acquire(self) -> Self:
+        if self.held:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        _validate_uuid(self.account_id, version=4)
+        directory = self._store.lock_directory()
+        path = directory / f"{self.account_id}.lock"
+        self._prepare_lock_file(path, directory)
+        lock = FilesystemProcessLock(path)
+        try:
+            lock.acquire()
+        except ProcessAlreadyRunning:
+            raise NurtureStateError("NURTURE_BUSY") from None
+        except OSError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        try:
+            self._store.validate_lock_file(path, directory)
+            self._lock = lock
+            self._store.repair_stale_runs(self)
+        except BaseException:
+            self._lock = None
+            _release_lock(lock)
+            raise
+        return self
+
+    def release(self) -> None:
+        lock = self._lock
+        if lock is None:
+            return
+        self._lock = None
+        _release_lock(lock)
+
+    def __enter__(self) -> Self:
+        return self.acquire()
+
+    def __exit__(self, *_: object) -> None:
+        self.release()
+
+    async def __aenter__(self) -> Self:
+        return self.acquire()
+
+    async def __aexit__(self, *_: object) -> None:
+        self.release()
+
+    def start_run(
+        self,
+        preset: NurturePresetV1,
+        *,
+        now: datetime | None = None,
+    ) -> NurtureRunScope:
+        self.require_held()
+        return NurtureRunScope(self, self._store.create_run(self, preset, now=now))
+
+    def get_run(self, run_id: UUID) -> NurtureRunV1:
+        self.require_held()
+        return self._store.read_run(self, run_id)
+
+    def update_run(self, updated: NurtureRunV1) -> NurtureRunV1:
+        return self._store.update_run(self, updated)
+
+    def observe_target(
+        self,
+        preset: NurturePresetV1,
+        fingerprint: str,
+        run_id: UUID,
+        decision_code: str,
+        *,
+        now: datetime | None = None,
+    ) -> NurtureTargetV1:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        _validate_run_link(self, validated_preset, run_id)
+        _validate_fingerprint(fingerprint)
+        _validate_code(decision_code)
+        observed_at = _as_utc(datetime.now(UTC) if now is None else now)
+        document = self._store.load_target_state(self, validated_preset)
+        current = _find_target(document.targets, fingerprint)
+        if current is None:
+            target = NurtureTargetV1(
+                fingerprint,
+                observed_at,
+                observed_at,
+                decision_code,
+                None,
+                "NONE",
+                run_id,
+                None,
+            )
+        else:
+            if current.action_state in {"PENDING", "AMBIGUOUS"}:
+                target = replace(current, last_seen_at=max(current.last_seen_at, observed_at))
+            else:
+                target = replace(
+                    current,
+                    last_seen_at=max(current.last_seen_at, observed_at),
+                    last_decision_code=decision_code,
+                    last_run_id=run_id,
+                )
+        self._store.save_target_state(
+            self,
+            _replace_target(document, target, protect=fingerprint),
+        )
+        return target
+
+    def reserve_target(
+        self,
+        preset: NurturePresetV1,
+        fingerprint: str,
+        run_id: UUID,
+        decision_code: str,
+        *,
+        now: datetime | None = None,
+    ) -> NurtureTargetV1:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        _validate_run_link(self, validated_preset, run_id)
+        _validate_fingerprint(fingerprint)
+        _validate_code(decision_code)
+        action_at = _as_utc(datetime.now(UTC) if now is None else now)
+        document = self._store.load_target_state(self, validated_preset)
+        current = _find_target(document.targets, fingerprint)
+        if current is not None:
+            if current.action_state == "PENDING":
+                raise NurtureStateError("NURTURE_TARGET_PENDING")
+            if current.action_state == "AMBIGUOUS":
+                raise NurtureStateError("NURTURE_TARGET_AMBIGUOUS")
+            if current.action_state == "CONFIRMED":
+                raise NurtureStateError("NURTURE_TARGET_RESERVED")
+            target = replace(
+                current,
+                last_seen_at=max(current.last_seen_at, action_at),
+                last_decision_code=decision_code,
+                last_action_at=max(current.first_seen_at, action_at),
+                action_state="PENDING",
+                last_run_id=run_id,
+            )
+        else:
+            target = NurtureTargetV1(
+                fingerprint,
+                action_at,
+                action_at,
+                decision_code,
+                action_at,
+                "PENDING",
+                run_id,
+                None,
+            )
+        self._store.save_target_state(
+            self,
+            _replace_target(document, target, protect=fingerprint),
+        )
+        return target
+
+    def complete_target_action(
+        self,
+        preset: NurturePresetV1,
+        fingerprint: str,
+        run_id: UUID,
+        action_state: Literal["CONFIRMED", "AMBIGUOUS"],
+        operation_id: UUID | None,
+        *,
+        now: datetime | None = None,
+    ) -> NurtureTargetV1:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        _validate_run_link(self, validated_preset, run_id)
+        _validate_fingerprint(fingerprint)
+        if type(action_state) is not str or action_state not in {"CONFIRMED", "AMBIGUOUS"}:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        if operation_id is not None:
+            _validate_uuid(operation_id, version=4)
+        if action_state in {"CONFIRMED", "AMBIGUOUS"} and operation_id is None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        action_at = _as_utc(datetime.now(UTC) if now is None else now)
+        document = self._store.load_target_state(self, validated_preset)
+        current = _find_target(document.targets, fingerprint)
+        if current is None or current.action_state != "PENDING" or current.last_run_id != run_id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        target = replace(
+            current,
+            last_action_at=max(current.first_seen_at, action_at),
+            action_state=action_state,
+            last_run_id=run_id,
+            last_operation_id=operation_id,
+        )
+        self._store.save_target_state(self, _replace_target(document, target))
+        return target
+
+    def get_targets(self, preset: NurturePresetV1) -> tuple[NurtureTargetV1, ...]:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        return self._store.load_target_state(self, validated_preset).targets
+
+    def get_content_state(self, preset: NurturePresetV1) -> NurtureContentStateV1:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        return self._store.load_content_state(self, validated_preset)
+
+    def get_insights_snapshots(
+        self, preset: NurturePresetV1, content_fp: str
+    ) -> tuple[NurtureInsightsSnapshotV1, ...]:
+        self.require_held()
+        return self._store.load_insights_snapshots(self, preset, content_fp)
+
+    def append_insights_snapshot(
+        self, preset: NurturePresetV1, snapshot: NurtureInsightsSnapshotV1
+    ) -> NurtureInsightsSnapshotV1:
+        self.require_held()
+        return self._store.append_insights_snapshot(self, preset, snapshot)
+
+    def register_content_candidate(
+        self,
+        preset: NurturePresetV1,
+        candidate_id: UUID,
+        source_fingerprint: str,
+        draft_fingerprint: str,
+        category: str,
+        run_id: UUID,
+        *,
+        now: datetime,
+    ) -> NurtureContentRecordV1:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        _validate_run_link(self, validated_preset, run_id)
+        _validate_uuid(candidate_id, version=4)
+        _validate_fingerprint(source_fingerprint)
+        _validate_fingerprint(draft_fingerprint)
+        if type(category) is not str or category not in _CONTENT_CATEGORIES:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        first_seen_at = _as_utc(now)
+        document = self._store.load_content_state(self, validated_preset)
+        source_matches = [
+            item for item in document.candidates if item.source_fingerprint == source_fingerprint
+        ]
+        draft_matches = [
+            item for item in document.candidates if item.draft_fingerprint == draft_fingerprint
+        ]
+        if len(source_matches) > 1 or len(draft_matches) > 1:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        source_match = source_matches[0] if source_matches else None
+        draft_match = draft_matches[0] if draft_matches else None
+        if source_match is not None or draft_match is not None:
+            if source_match is not None and source_match is not draft_match:
+                if source_match.publication_state != "NEW":
+                    _raise_content_used(source_match.publication_state)
+                raise NurtureStateError("NURTURE_CONTENT_PROVENANCE_CONFLICT")
+            if draft_match is not None and draft_match is not source_match:
+                if draft_match.publication_state != "NEW":
+                    _raise_content_used(draft_match.publication_state)
+                raise NurtureStateError("NURTURE_CONTENT_DRAFT_REUSE_CONFLICT")
+            assert source_match is not None and draft_match is source_match
+            if source_match.publication_state != "NEW":
+                _raise_content_used(source_match.publication_state)
+            if source_match.category != category:
+                raise NurtureStateError("NURTURE_CONTENT_PROVENANCE_CONFLICT")
+            updated = replace(source_match, last_run_id=run_id)
+            if updated != source_match:
+                document = _replace_content_candidate(document, updated)
+                self._store.save_content_state(self, document)
+            return updated
+
+        if len(document.candidates) >= MAX_NURTURE_CONTENT_RECORDS:
+            raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
+        record = NurtureContentRecordV1(
+            candidate_id=candidate_id,
+            source_fingerprint=source_fingerprint,
+            draft_fingerprint=draft_fingerprint,
+            category=category,
+            first_seen_at=first_seen_at,
+            last_action_at=None,
+            publication_state="NEW",
+            last_run_id=run_id,
+            operation_id=None,
+        )
+        self._store.save_content_state(
+            self,
+            replace(document, candidates=(*document.candidates, record)),
+        )
+        return record
+
+    def reserve_content_candidate(
+        self,
+        preset: NurturePresetV1,
+        source_fingerprint: str,
+        draft_fingerprint: str,
+        run_id: UUID,
+    ) -> NurtureContentRecordV1:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        _validate_run_link(self, validated_preset, run_id)
+        _validate_fingerprint(source_fingerprint)
+        _validate_fingerprint(draft_fingerprint)
+        document = self._store.load_content_state(self, validated_preset)
+        current = _find_content_candidate(
+            document.candidates, source_fingerprint, draft_fingerprint
+        )
+        if current is None or current.publication_state != "NEW" or current.last_run_id != run_id:
+            raise NurtureStateError("NURTURE_CONTENT_UNRESOLVED")
+        reserved = replace(
+            current,
+            publication_state="RESERVED",
+            last_run_id=run_id,
+        )
+        self._store.save_content_state(self, _replace_content_candidate(document, reserved))
+        return reserved
+
+    def complete_content_candidate(
+        self,
+        preset: NurturePresetV1,
+        source_fingerprint: str,
+        draft_fingerprint: str,
+        run_id: UUID,
+        publication_state: Literal["PUBLISHED", "AMBIGUOUS"],
+        operation_id: UUID,
+        *,
+        now: datetime,
+    ) -> NurtureContentRecordV1:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        _validate_run_link(self, validated_preset, run_id)
+        _validate_fingerprint(source_fingerprint)
+        _validate_fingerprint(draft_fingerprint)
+        if type(publication_state) is not str or publication_state not in {
+            "PUBLISHED",
+            "AMBIGUOUS",
+        }:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        _validate_uuid(operation_id, version=4)
+        action_at = _as_utc(now)
+        document = self._store.load_content_state(self, validated_preset)
+        current = _find_content_candidate(
+            document.candidates, source_fingerprint, draft_fingerprint
+        )
+        if (
+            current is None
+            or current.publication_state != "RESERVED"
+            or current.last_run_id != run_id
+        ):
+            raise NurtureStateError("NURTURE_CONTENT_UNRESOLVED")
+        completed = replace(
+            current,
+            last_action_at=max(current.first_seen_at, action_at),
+            publication_state=publication_state,
+            last_run_id=run_id,
+            operation_id=operation_id,
+        )
+        self._store.save_content_state(self, _replace_content_candidate(document, completed))
+        return completed
+
+    def _prepare_lock_file(self, path: Path, parent: Path) -> None:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise NurtureStateError("NURTURE_STATE_INVALID") from None
+            else:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        except OSError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        self._store.validate_lock_file(path, parent)
+
+    def require_held(self, store: NurtureStore | None = None) -> None:
+        _validate_uuid(self.account_id, version=4)
+        if not self.held or (store is not None and self._store is not store):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+class NurtureRunScope:
+    """A receipt boundary that persists outcomes and propagates interruptions."""
+
+    def __init__(self, owner: NurtureAccountLock, run: NurtureRunV1) -> None:
+        self._owner = owner
+        self._run = run
+
+    @property
+    def receipt(self) -> NurtureRunV1:
+        return self._run
+
+    def update(self, **changes: object) -> NurtureRunV1:
+        if self._run.outcome != "RUNNING":
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        try:
+            updated = replace(self._run, **changes)
+        except TypeError, ValueError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        self._run = self._owner.update_run(updated)
+        return self._run
+
+    def add_decision(self, code: str) -> NurtureRunV1:
+        _validate_code(code)
+        if len(self._run.decision_codes) >= _MAX_DECISION_CODES:
+            raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
+        return self.update(decision_codes=(*self._run.decision_codes, code))
+
+    def link_operation(self, operation_id: UUID) -> NurtureRunV1:
+        _validate_uuid(operation_id, version=4)
+        if operation_id in self._run.operation_ids:
+            return self._run
+        if len(self._run.operation_ids) >= _MAX_OPERATION_IDS:
+            raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
+        return self.update(operation_ids=(*self._run.operation_ids, operation_id))
+
+    def finish(
+        self,
+        outcome: Literal["SUCCESS", "FAILED", "INTERRUPTED", "AMBIGUOUS"],
+        *,
+        now: datetime | None = None,
+        error_code: str | None = None,
+        failed_stage: str | None = None,
+    ) -> NurtureRunV1:
+        if type(outcome) is not str or outcome not in {
+            "SUCCESS",
+            "FAILED",
+            "INTERRUPTED",
+            "AMBIGUOUS",
+        }:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        finished_at = max(
+            self._run.started_at,
+            _as_utc(datetime.now(UTC) if now is None else now),
+        )
+        self._run = self._owner.update_run(
+            replace(
+                self._run,
+                finished_at=finished_at,
+                outcome=outcome,
+                error_code=error_code,
+                failed_stage=failed_stage,
+            )
+        )
+        return self._run
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, *_: object) -> bool:
+        self._close_for_exit(exc_type)
+        return False
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, exc_type: type[BaseException] | None, *_: object) -> bool:
+        self._close_for_exit(exc_type)
+        return False
+
+    def _close_for_exit(self, exc_type: type[BaseException] | None) -> None:
+        if self._run.outcome != "RUNNING":
+            return
+        if exc_type is None:
+            self.finish("SUCCESS")
+        elif issubclass(exc_type, (KeyboardInterrupt, asyncio.CancelledError)):
+            self.finish("INTERRUPTED", error_code="INTERRUPTED", failed_stage="execution")
+        elif issubclass(exc_type, Exception):
+            self.finish("FAILED", error_code="RUN_FAILED", failed_stage="execution")
+
+
+def fingerprint_remote_thread(remote_thread_id: str) -> str:
+    """Return a stable SHA-256 fingerprint without persisting the remote identity."""
+
+    if type(remote_thread_id) is not str:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    normalized = unicodedata.normalize("NFC", remote_thread_id.strip())
+    if _REMOTE_THREAD_ID.fullmatch(normalized) is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    identity = json.dumps(
+        {"platform": "threads", "thread_id": normalized},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
+
+
+def fingerprint_remote_reply(remote_reply_id: str) -> str:
+    """Return a namespaced SHA-256 fingerprint for a normalized reply identity."""
+
+    if type(remote_reply_id) is not str:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    normalized = unicodedata.normalize("NFC", remote_reply_id.strip())
+    if _REMOTE_THREAD_ID.fullmatch(normalized) is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    return hashlib.sha256(f"reply:{normalized}".encode()).hexdigest()
+
+
+def _validate_run(run: NurtureRunV1) -> None:
+    if type(run) is not NurtureRunV1:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    if (
+        type(run.version) is not int
+        or run.version != 1
+        or type(run.id) is not UUID
+        or run.id.version != 4
+        or type(run.account_id) is not UUID
+        or run.account_id.version != 4
+        or type(run.preset_id) is not str
+        or _PRESET_ID.fullmatch(run.preset_id) is None
+        or type(run.preset_version) is not int
+        or run.preset_version != 1
+        or type(run.outcome) is not str
+        or run.outcome not in _OUTCOMES
+        or type(run.decision_codes) is not tuple
+        or len(run.decision_codes) > _MAX_DECISION_CODES
+        or type(run.operation_ids) is not tuple
+        or len(run.operation_ids) > _MAX_OPERATION_IDS
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    _validate_datetime(run.started_at)
+    if run.finished_at is not None:
+        _validate_datetime(run.finished_at)
+        if _as_utc(run.finished_at) < _as_utc(run.started_at):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+    for field_name in _COUNTER_FIELDS:
+        count = getattr(run, field_name)
+        if type(count) is not int or not 0 <= count <= _MAX_COUNTER:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+    if (
+        run.selected_count not in {0, 1}
+        or run.replied_count not in {0, 1}
+        or run.published_count not in {0, 1}
+        or run.replied_count + run.published_count > 1
+        or run.selected_count > run.deduped_count
+        or run.skipped_count != run.deduped_count - run.selected_count
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    for code in run.decision_codes:
+        _validate_code(code)
+    for operation_id in run.operation_ids:
+        _validate_uuid(operation_id, version=4)
+    if len(set(run.operation_ids)) != len(run.operation_ids):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    if run.error_code is not None:
+        _validate_code(run.error_code)
+    if run.failed_stage is not None and (
+        type(run.failed_stage) is not str or _SAFE_STAGE.fullmatch(run.failed_stage) is None
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    if run.outcome == "RUNNING":
+        if (
+            run.finished_at is not None
+            or run.error_code is not None
+            or run.failed_stage is not None
+        ):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+    else:
+        if run.finished_at is None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        if run.outcome == "SUCCESS" and (
+            run.error_code is not None or run.failed_stage is not None
+        ):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        if run.outcome in {"FAILED", "INTERRUPTED", "AMBIGUOUS"} and (
+            run.error_code is None or run.failed_stage is None
+        ):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        if run.outcome == "INTERRUPTED" and run.error_code != "INTERRUPTED":
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _validate_target(target: NurtureTargetV1) -> None:
+    if type(target) is not NurtureTargetV1:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    _validate_fingerprint(target.fingerprint)
+    _validate_datetime(target.first_seen_at)
+    _validate_datetime(target.last_seen_at)
+    if _as_utc(target.last_seen_at) < _as_utc(target.first_seen_at):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    _validate_code(target.last_decision_code)
+    if target.last_action_at is not None:
+        _validate_datetime(target.last_action_at)
+    if (
+        type(target.action_state) is not str
+        or target.action_state not in _ACTION_STATES
+        or type(target.last_run_id) is not UUID
+        or target.last_run_id.version != 4
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    if target.last_operation_id is not None:
+        _validate_uuid(target.last_operation_id, version=4)
+    if target.action_state == "NONE":
+        if target.last_action_at is not None or target.last_operation_id is not None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+    elif target.last_action_at is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    if target.action_state == "PENDING" and target.last_operation_id is not None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    if target.action_state in {"CONFIRMED", "AMBIGUOUS"} and target.last_operation_id is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _encode_run(run: NurtureRunV1) -> str:
+    _validate_run(run)
+    document: dict[str, object] = {
+        "version": run.version,
+        "id": str(run.id),
+        "account_id": str(run.account_id),
+        "preset_id": run.preset_id,
+        "preset_version": run.preset_version,
+        "started_at": _timestamp_text(run.started_at),
+        "finished_at": None if run.finished_at is None else _timestamp_text(run.finished_at),
+        "outcome": run.outcome,
+        **{name: getattr(run, name) for name in _COUNTER_FIELDS},
+        "decision_codes": list(run.decision_codes),
+        "operation_ids": [str(operation_id) for operation_id in run.operation_ids],
+        "error_code": run.error_code,
+        "failed_stage": run.failed_stage,
+    }
+    return json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+
+
+def _decode_run(value: object) -> NurtureRunV1:
+    if type(value) is not dict:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    document = cast(dict[str, object], value)
+    if frozenset(document) != _RUN_KEYS:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    version = document["version"]
+    if type(version) is int and version != 1:
+        raise NurtureStateError("NURTURE_VERSION_UNSUPPORTED")
+    if type(version) is not int:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    raw_decisions = document["decision_codes"]
+    raw_operations = document["operation_ids"]
+    if type(raw_decisions) is not list or type(raw_operations) is not list:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    decisions = cast(list[object], raw_decisions)
+    operations = cast(list[object], raw_operations)
+    if any(type(code) is not str for code in decisions):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    operation_ids = tuple(_parse_uuid(raw, version=4) for raw in operations)
+    outcome = document["outcome"]
+    if type(outcome) is not str or outcome not in _OUTCOMES:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    return NurtureRunV1(
+        version=version,
+        id=_parse_uuid(document["id"], version=4),
+        account_id=_parse_uuid(document["account_id"], version=4),
+        preset_id=_required_string(document["preset_id"]),
+        preset_version=_required_int(document["preset_version"]),
+        started_at=_parse_timestamp(document["started_at"]),
+        finished_at=_nullable_timestamp(document["finished_at"]),
+        outcome=cast(NurtureOutcome, outcome),
+        **{name: _required_int(document[name]) for name in _COUNTER_FIELDS},
+        decision_codes=tuple(cast(list[str], decisions)),
+        operation_ids=operation_ids,
+        error_code=_nullable_code(document["error_code"]),
+        failed_stage=_nullable_stage(document["failed_stage"]),
+    )
+
+
+def _encode_target_document(document: NurtureTargetStateV1) -> str:
+    _validate_target_document(document)
+    value = {
+        "version": document.version,
+        "account_id": str(document.account_id),
+        "preset_id": document.preset_id,
+        "targets": [
+            {
+                "fingerprint": target.fingerprint,
+                "first_seen_at": _timestamp_text(target.first_seen_at),
+                "last_seen_at": _timestamp_text(target.last_seen_at),
+                "last_decision_code": target.last_decision_code,
+                "last_action_at": (
+                    None
+                    if target.last_action_at is None
+                    else _timestamp_text(target.last_action_at)
+                ),
+                "action_state": target.action_state,
+                "last_run_id": str(target.last_run_id),
+                "last_operation_id": (
+                    None if target.last_operation_id is None else str(target.last_operation_id)
+                ),
+            }
+            for target in sorted(document.targets, key=lambda item: item.fingerprint)
+        ],
+    }
+    return json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+
+
+def _decode_target_document(value: object) -> NurtureTargetStateV1:
+    if type(value) is not dict:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    document = cast(dict[str, object], value)
+    if frozenset(document) != _TARGET_STATE_KEYS:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    version = document["version"]
+    if type(version) is int and version != 1:
+        raise NurtureStateError("NURTURE_VERSION_UNSUPPORTED")
+    if type(version) is not int:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    raw_targets = document["targets"]
+    if type(raw_targets) is not list:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    targets: list[NurtureTargetV1] = []
+    for raw_target in cast(list[object], raw_targets):
+        if type(raw_target) is not dict:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        target_data = cast(dict[str, object], raw_target)
+        if frozenset(target_data) != _TARGET_KEYS:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        state = target_data["action_state"]
+        if type(state) is not str or state not in _ACTION_STATES:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        targets.append(
+            NurtureTargetV1(
+                fingerprint=_required_string(target_data["fingerprint"]),
+                first_seen_at=_parse_timestamp(target_data["first_seen_at"]),
+                last_seen_at=_parse_timestamp(target_data["last_seen_at"]),
+                last_decision_code=_required_code(target_data["last_decision_code"]),
+                last_action_at=_nullable_timestamp(target_data["last_action_at"]),
+                action_state=cast(NurtureActionState, state),
+                last_run_id=_parse_uuid(target_data["last_run_id"], version=4),
+                last_operation_id=_nullable_uuid(target_data["last_operation_id"], version=4),
+            )
+        )
+    result = NurtureTargetStateV1(
+        version,
+        _parse_uuid(document["account_id"], version=4),
+        _required_string(document["preset_id"]),
+        tuple(targets),
+    )
+    _validate_target_document(result)
+    return result
+
+
+def _validate_target_document(document: NurtureTargetStateV1) -> None:
+    if type(document) is not NurtureTargetStateV1:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    if (
+        type(document.version) is not int
+        or document.version != 1
+        or type(document.account_id) is not UUID
+        or document.account_id.version != 4
+        or type(document.preset_id) is not str
+        or _PRESET_ID.fullmatch(document.preset_id) is None
+        or type(document.targets) is not tuple
+        or len(document.targets) > MAX_NURTURE_TARGETS
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    fingerprints: set[str] = set()
+    for target in document.targets:
+        _validate_target(target)
+        if target.fingerprint in fingerprints:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        fingerprints.add(target.fingerprint)
+
+
+def _validate_content_record(record: NurtureContentRecordV1) -> None:
+    if type(record) is not NurtureContentRecordV1:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    _validate_uuid(record.candidate_id, version=4)
+    _validate_fingerprint(record.source_fingerprint)
+    _validate_fingerprint(record.draft_fingerprint)
+    if type(record.category) is not str or record.category not in _CONTENT_CATEGORIES:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    _validate_datetime(record.first_seen_at)
+    if record.last_action_at is not None:
+        _validate_datetime(record.last_action_at)
+    if (
+        type(record.publication_state) is not str
+        or record.publication_state not in {"NEW", "RESERVED", "PUBLISHED", "AMBIGUOUS", "REJECTED"}
+        or type(record.last_run_id) is not UUID
+        or record.last_run_id.version != 4
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    if record.operation_id is not None:
+        _validate_uuid(record.operation_id, version=4)
+    if record.publication_state in {"NEW", "RESERVED", "REJECTED"}:
+        if record.last_action_at is not None or record.operation_id is not None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return
+    if record.last_action_at is None or record.operation_id is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    if _as_utc(record.last_action_at) < _as_utc(record.first_seen_at):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _validate_content_document(document: NurtureContentStateV1) -> None:
+    if (
+        type(document) is not NurtureContentStateV1
+        or type(document.version) is not int
+        or document.version != 1
+        or type(document.account_id) is not UUID
+        or document.account_id.version != 4
+        or type(document.preset_id) is not str
+        or _PRESET_ID.fullmatch(document.preset_id) is None
+        or type(document.candidates) is not tuple
+        or len(document.candidates) > MAX_NURTURE_CONTENT_RECORDS
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    sources: set[str] = set()
+    drafts: set[str] = set()
+    for record in document.candidates:
+        _validate_content_record(record)
+        if record.source_fingerprint in sources or record.draft_fingerprint in drafts:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        sources.add(record.source_fingerprint)
+        drafts.add(record.draft_fingerprint)
+
+
+def _validate_content_transition(
+    current: NurtureContentStateV1,
+    updated: NurtureContentStateV1,
+) -> None:
+    if (
+        current.account_id != updated.account_id
+        or current.preset_id != updated.preset_id
+        or updated.version != 1
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    old_items = {
+        (item.source_fingerprint, item.draft_fingerprint): item for item in current.candidates
+    }
+    new_items = {
+        (item.source_fingerprint, item.draft_fingerprint): item for item in updated.candidates
+    }
+    for key, old in old_items.items():
+        new = new_items.get(key)
+        if new is None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        if (
+            new.candidate_id != old.candidate_id
+            or new.source_fingerprint != old.source_fingerprint
+            or new.draft_fingerprint != old.draft_fingerprint
+            or new.category != old.category
+            or new.first_seen_at != old.first_seen_at
+        ):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        if old.publication_state == "NEW":
+            if new.publication_state not in {"NEW", "RESERVED", "REJECTED"}:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            if new.publication_state != "NEW" and new.last_run_id != old.last_run_id:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+        elif old.publication_state == "RESERVED":
+            if new.publication_state not in {"RESERVED", "PUBLISHED", "AMBIGUOUS"}:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            if new.publication_state == "RESERVED" and new != old:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            if new.publication_state in {"PUBLISHED", "AMBIGUOUS"} and (
+                new.last_run_id != old.last_run_id
+            ):
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+        elif new != old:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+    for key, item in new_items.items():
+        if key not in old_items and item.publication_state != "NEW":
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _encode_content_document(document: NurtureContentStateV1) -> str:
+    _validate_content_document(document)
+    value = {
+        "version": document.version,
+        "account_id": str(document.account_id),
+        "preset_id": document.preset_id,
+        "candidates": [
+            {
+                "candidate_id": str(item.candidate_id),
+                "source_fingerprint": item.source_fingerprint,
+                "draft_fingerprint": item.draft_fingerprint,
+                "category": item.category,
+                "first_seen_at": _timestamp_text(item.first_seen_at),
+                "last_action_at": (
+                    None if item.last_action_at is None else _timestamp_text(item.last_action_at)
+                ),
+                "publication_state": item.publication_state,
+                "last_run_id": str(item.last_run_id),
+                "operation_id": None if item.operation_id is None else str(item.operation_id),
+            }
+            for item in sorted(
+                document.candidates,
+                key=lambda candidate: (candidate.source_fingerprint, candidate.draft_fingerprint),
+            )
+        ],
+    }
+    return json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+
+
+def _decode_content_document(value: object) -> NurtureContentStateV1:
+    if type(value) is not dict:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    document = cast(dict[str, object], value)
+    if frozenset(document) != _CONTENT_STATE_KEYS:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    version = document["version"]
+    if type(version) is int and version != 1:
+        raise NurtureStateError("NURTURE_VERSION_UNSUPPORTED")
+    if type(version) is not int:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    raw_candidates = document["candidates"]
+    if type(raw_candidates) is not list:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    candidates: list[NurtureContentRecordV1] = []
+    for raw_candidate in cast(list[object], raw_candidates):
+        if type(raw_candidate) is not dict:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        item = cast(dict[str, object], raw_candidate)
+        if frozenset(item) != _CONTENT_CANDIDATE_KEYS:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        state = item["publication_state"]
+        if type(state) is not str or state not in {
+            "NEW",
+            "RESERVED",
+            "PUBLISHED",
+            "AMBIGUOUS",
+            "REJECTED",
+        }:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        candidates.append(
+            NurtureContentRecordV1(
+                candidate_id=_parse_uuid(item["candidate_id"], version=4),
+                source_fingerprint=_required_string(item["source_fingerprint"]),
+                draft_fingerprint=_required_string(item["draft_fingerprint"]),
+                category=_required_string(item["category"]),
+                first_seen_at=_parse_timestamp(item["first_seen_at"]),
+                last_action_at=_nullable_timestamp(item["last_action_at"]),
+                publication_state=cast(NurtureContentPublicationState, state),
+                last_run_id=_parse_uuid(item["last_run_id"], version=4),
+                operation_id=_nullable_uuid(item["operation_id"], version=4),
+            )
+        )
+    result = NurtureContentStateV1(
+        version=version,
+        account_id=_parse_uuid(document["account_id"], version=4),
+        preset_id=_required_string(document["preset_id"]),
+        candidates=tuple(candidates),
+    )
+    _validate_content_document(result)
+    return result
+
+
+def _insights_snapshot_id(content_fp: str, observed_at: datetime) -> str:
+    identity = f"{content_fp}\n{_timestamp_text(_as_utc(observed_at))}".encode("ascii")
+    return hashlib.sha256(b"threads-nurture-insights-snapshot:v1\x00" + identity).hexdigest()
+
+
+def _validate_insights_snapshot(snapshot: NurtureInsightsSnapshotV1) -> None:
+    if (
+        type(snapshot) is not NurtureInsightsSnapshotV1
+        or type(snapshot.version) is not int
+        or snapshot.version != 1
+        or type(snapshot.snapshot_id) is not str
+        or _FINGERPRINT.fullmatch(snapshot.snapshot_id) is None
+        or type(snapshot.account_id) is not UUID
+        or snapshot.account_id.version != 4
+        or type(snapshot.preset_id) is not str
+        or _PRESET_ID.fullmatch(snapshot.preset_id) is None
+        or type(snapshot.content_fingerprint) is not str
+        or _FINGERPRINT.fullmatch(snapshot.content_fingerprint) is None
+        or type(snapshot.source_fingerprint) is not str
+        or _FINGERPRINT.fullmatch(snapshot.source_fingerprint) is None
+        or type(snapshot.draft_fingerprint) is not str
+        or _FINGERPRINT.fullmatch(snapshot.draft_fingerprint) is None
+        or type(snapshot.category) is not str
+        or snapshot.category not in _CONTENT_CATEGORIES
+        or type(snapshot.observed_at) is not datetime
+        or type(snapshot.operation_id) is not UUID
+        or snapshot.operation_id.version != 4
+        or snapshot.snapshot_id
+        != _insights_snapshot_id(snapshot.content_fingerprint, snapshot.observed_at)
+        or content_fingerprint(snapshot.source_fingerprint, snapshot.draft_fingerprint)
+        != snapshot.content_fingerprint
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    _validate_datetime(snapshot.observed_at)
+    for metric in (snapshot.likes, snapshot.replies, snapshot.reposts, snapshot.quotes):
+        if metric is not None and (type(metric) is not int or metric < 0):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _encode_insights_snapshot(snapshot: NurtureInsightsSnapshotV1) -> str:
+    _validate_insights_snapshot(snapshot)
+    value: dict[str, object] = {
+        "version": snapshot.version,
+        "snapshot_id": snapshot.snapshot_id,
+        "account_id": str(snapshot.account_id),
+        "preset_id": snapshot.preset_id,
+        "content_fingerprint": snapshot.content_fingerprint,
+        "source_fingerprint": snapshot.source_fingerprint,
+        "draft_fingerprint": snapshot.draft_fingerprint,
+        "category": snapshot.category,
+        "observed_at": _timestamp_text(snapshot.observed_at),
+        "likes": snapshot.likes,
+        "replies": snapshot.replies,
+        "reposts": snapshot.reposts,
+        "quotes": snapshot.quotes,
+        "operation_id": str(snapshot.operation_id),
+    }
+    return json.dumps(value, sort_keys=True, indent=2, ensure_ascii=True) + "\n"
+
+
+def _decode_insights_snapshot(value: object) -> NurtureInsightsSnapshotV1:
+    if type(value) is not dict:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    document = cast(dict[str, object], value)
+    if frozenset(document) != _INSIGHTS_SNAPSHOT_KEYS:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    version = document["version"]
+    if type(version) is int and version != 1:
+        raise NurtureStateError("NURTURE_VERSION_UNSUPPORTED")
+    if type(version) is not int:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    metrics: list[int | None] = []
+    for name in ("likes", "replies", "reposts", "quotes"):
+        metric = document[name]
+        if metric is not None and (type(metric) is not int or metric < 0):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        metrics.append(metric)
+    snapshot = NurtureInsightsSnapshotV1(
+        version=version,
+        snapshot_id=_required_string(document["snapshot_id"]),
+        account_id=_parse_uuid(document["account_id"], version=4),
+        preset_id=_required_string(document["preset_id"]),
+        content_fingerprint=_required_string(document["content_fingerprint"]),
+        source_fingerprint=_required_string(document["source_fingerprint"]),
+        draft_fingerprint=_required_string(document["draft_fingerprint"]),
+        category=_required_string(document["category"]),
+        observed_at=_parse_timestamp(document["observed_at"]),
+        likes=metrics[0],
+        replies=metrics[1],
+        reposts=metrics[2],
+        quotes=metrics[3],
+        operation_id=_parse_uuid(document["operation_id"], version=4),
+    )
+    _validate_insights_snapshot(snapshot)
+    return snapshot
+
+
+def _find_content_candidate(
+    candidates: tuple[NurtureContentRecordV1, ...],
+    source_fingerprint: str,
+    draft_fingerprint: str,
+) -> NurtureContentRecordV1 | None:
+    return next(
+        (
+            item
+            for item in candidates
+            if item.source_fingerprint == source_fingerprint
+            and item.draft_fingerprint == draft_fingerprint
+        ),
+        None,
+    )
+
+
+def _replace_content_candidate(
+    document: NurtureContentStateV1,
+    candidate: NurtureContentRecordV1,
+) -> NurtureContentStateV1:
+    candidates = tuple(
+        candidate
+        if item.source_fingerprint == candidate.source_fingerprint
+        and item.draft_fingerprint == candidate.draft_fingerprint
+        else item
+        for item in document.candidates
+    )
+    return replace(document, candidates=candidates)
+
+
+def _raise_content_used(state: NurtureContentPublicationState) -> NoReturn:
+    if state in {"RESERVED", "AMBIGUOUS"}:
+        raise NurtureStateError("NURTURE_CONTENT_UNRESOLVED")
+    raise NurtureStateError("NURTURE_CONTENT_ALREADY_USED")
+
+
+def _validate_target_transition(
+    current: NurtureTargetStateV1,
+    updated: NurtureTargetStateV1,
+) -> None:
+    if (
+        current.account_id != updated.account_id
+        or current.preset_id != updated.preset_id
+        or updated.version != 1
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    previous = {target.fingerprint: target for target in current.targets}
+    next_targets = {target.fingerprint: target for target in updated.targets}
+    for fingerprint, old in previous.items():
+        new = next_targets.get(fingerprint)
+        if old.action_state in {"PENDING", "AMBIGUOUS"}:
+            if new is None:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            if old.action_state == "AMBIGUOUS":
+                if (
+                    new.action_state != "AMBIGUOUS"
+                    or new.first_seen_at != old.first_seen_at
+                    or new.last_decision_code != old.last_decision_code
+                    or new.last_action_at != old.last_action_at
+                    or new.last_run_id != old.last_run_id
+                    or new.last_operation_id != old.last_operation_id
+                ):
+                    raise NurtureStateError("NURTURE_STATE_INVALID")
+            elif new.action_state == "PENDING":
+                if (
+                    new.first_seen_at != old.first_seen_at
+                    or new.last_decision_code != old.last_decision_code
+                    or new.last_action_at != old.last_action_at
+                    or new.last_run_id != old.last_run_id
+                    or new.last_operation_id != old.last_operation_id
+                ):
+                    raise NurtureStateError("NURTURE_STATE_INVALID")
+            elif new.action_state in {"CONFIRMED", "AMBIGUOUS"}:
+                if (
+                    new.first_seen_at != old.first_seen_at
+                    or new.last_decision_code != old.last_decision_code
+                    or new.last_run_id != old.last_run_id
+                ):
+                    raise NurtureStateError("NURTURE_STATE_INVALID")
+            else:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+        elif old.action_state == "NONE":
+            if new is not None and new.action_state not in {"NONE", "PENDING"}:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            if new is not None and new.first_seen_at != old.first_seen_at:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+        elif new is not None:
+            if (
+                new.action_state != "CONFIRMED"
+                or new.first_seen_at != old.first_seen_at
+                or new.last_action_at != old.last_action_at
+                or new.last_operation_id != old.last_operation_id
+            ):
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+
+    for fingerprint, new in next_targets.items():
+        if fingerprint not in previous and new.action_state not in {"NONE", "PENDING"}:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _replace_target(
+    document: NurtureTargetStateV1,
+    target: NurtureTargetV1,
+    *,
+    protect: str | None = None,
+) -> NurtureTargetStateV1:
+    targets = {item.fingerprint: item for item in document.targets}
+    targets[target.fingerprint] = target
+    if len(targets) > MAX_NURTURE_TARGETS:
+        removable = sorted(
+            (
+                item
+                for item in targets.values()
+                if item.action_state in {"NONE", "CONFIRMED"} and item.fingerprint != protect
+            ),
+            key=lambda item: (_as_utc(item.last_seen_at), item.fingerprint),
+        )
+        excess = len(targets) - MAX_NURTURE_TARGETS
+        if len(removable) < excess:
+            raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
+        for item in removable[:excess]:
+            del targets[item.fingerprint]
+    ordered = tuple(sorted(targets.values(), key=lambda item: item.fingerprint))
+    return NurtureTargetStateV1(document.version, document.account_id, document.preset_id, ordered)
+
+
+def _find_target(targets: tuple[NurtureTargetV1, ...], fingerprint: str) -> NurtureTargetV1 | None:
+    for target in targets:
+        if target.fingerprint == fingerprint:
+            return target
+    return None
+
+
+def _validate_run_link(
+    owner: NurtureAccountLock,
+    preset: NurturePresetV1,
+    run_id: UUID,
+) -> None:
+    run = owner.get_run(run_id)
+    if run.preset_id != preset.id or run.outcome != "RUNNING":
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _validated_preset(preset: NurturePresetV1) -> NurturePresetV1:
+    if type(preset) is not NurturePresetV1:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    try:
+        return replace(preset)
+    except AttributeError, TypeError, ValueError:
+        raise NurtureStateError("NURTURE_STATE_INVALID") from None
+
+
+def _parse_uuid(value: object, *, version: int) -> UUID:
+    if type(value) is not str:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    try:
+        result = UUID(value)
+    except ValueError, AttributeError:
+        raise NurtureStateError("NURTURE_STATE_INVALID") from None
+    if str(result) != value or result.version != version:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    return result
+
+
+def _validate_uuid(value: object, *, version: int) -> None:
+    if type(value) is not UUID or value.version != version:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _required_string(value: object) -> str:
+    if type(value) is not str:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    return value
+
+
+def _required_int(value: object) -> int:
+    if type(value) is not int:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    return value
+
+
+def _required_code(value: object) -> str:
+    code = _required_string(value)
+    _validate_code(code)
+    return code
+
+
+def _nullable_code(value: object) -> str | None:
+    return None if value is None else _required_code(value)
+
+
+def _nullable_stage(value: object) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str or _SAFE_STAGE.fullmatch(value) is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    return value
+
+
+def _nullable_uuid(value: object, *, version: int) -> UUID | None:
+    return None if value is None else _parse_uuid(value, version=version)
+
+
+def _nullable_timestamp(value: object) -> datetime | None:
+    return None if value is None else _parse_timestamp(value)
+
+
+def _validate_code(value: object) -> None:
+    if type(value) is not str or _SAFE_CODE.fullmatch(value) is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _validate_fingerprint(value: object) -> None:
+    if type(value) is not str or _FINGERPRINT.fullmatch(value) is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _validate_datetime(value: object) -> None:
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _as_utc(value: datetime) -> datetime:
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    return value.astimezone(UTC)
+
+
+def _timestamp_text(value: datetime) -> str:
+    return _as_utc(value).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _parse_timestamp(value: object) -> datetime:
+    if type(value) is not str or not value.endswith("Z"):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    try:
+        result = datetime.fromisoformat(value[:-1]).replace(tzinfo=UTC)
+    except ValueError:
+        raise NurtureStateError("NURTURE_STATE_INVALID") from None
+    if _timestamp_text(result) != value:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    return result
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_constant(_: str) -> None:
+    raise ValueError("non-JSON constant")
+
+
+def _cleanup_temporary(path: Path | None, descriptor: int | None) -> None:
+    if descriptor is not None:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    if path is not None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _release_lock(lock: FilesystemProcessLock) -> None:
+    try:
+        lock.release()
+    except OSError:
+        pass
