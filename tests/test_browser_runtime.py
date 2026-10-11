@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import threads_platform.standalone.runtime as runtime_module
-from threads_platform.browser.capabilities import BrowserFeedResultV1
+from threads_platform.browser.capabilities import BrowserFeedResultV1, BrowserTargetOpenResultV1
 from threads_platform.browser.contracts import (
     BrowserAdapterError,
     BrowserEngineSession,
@@ -162,7 +162,7 @@ def test_interactive_thread_holds_account_lock_until_operator_ends_session(
     prompts: list[str] = []
     lock_path = tmp_path / "locks" / f"{account.id}.lock"
 
-    def end_session(prompt: str) -> None:
+    async def end_session(prompt: str) -> None:
         session = engine.sessions[0]
         assert not session.closed
         assert "target=/@synthetic/post/fake_1" in prompt
@@ -205,6 +205,70 @@ def test_interactive_thread_holds_account_lock_until_operator_ends_session(
     probe.release()
 
 
+def test_interactive_thread_keeps_browser_loop_responsive_before_operator_enters(
+    tmp_path: Path,
+) -> None:
+    accounts = _add_account(tmp_path)
+    account = accounts.get("synthetic_account")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+    engine = _FakeEngine()
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+    operator_wait_started = asyncio.Event()
+    keys: list[str] = []
+    enter_pressed = asyncio.Event()
+    browser_callback_progressed = asyncio.Event()
+
+    def read_key() -> str:
+        key = keys.pop(0)
+        if key in {"\r", "\n"}:
+            enter_pressed.set()
+        return key
+
+    async def wait_for_enter(prompt: str) -> None:
+        assert "identity=UNKNOWN_IDENTITY" in prompt
+        operator_wait_started.set()
+        await runtime_module._wait_for_windows_console_enter(lambda: bool(keys), read_key)
+
+    async def simulated_playwright_callback() -> None:
+        await operator_wait_started.wait()
+        await asyncio.sleep(0)
+        await engine.sessions[0].verify_thread_target(
+            target_ref="/@synthetic/post/fake_1",
+            author_username="synthetic",
+        )
+        assert not enter_pressed.is_set()
+        assert not engine.sessions[0].closed
+        browser_callback_progressed.set()
+
+    async def exercise_handoff() -> BrowserTargetOpenResultV1:
+        handoff = asyncio.create_task(
+            runtime.open_thread_interactive(
+                "synthetic_account",
+                "/@synthetic/post/fake_1",
+                wait_for_operator=wait_for_enter,
+            )
+        )
+        browser_work = asyncio.create_task(simulated_playwright_callback())
+        try:
+            await asyncio.wait_for(browser_callback_progressed.wait(), timeout=1)
+            assert not enter_pressed.is_set()
+        finally:
+            keys.append("\r")
+        result = await handoff
+        await browser_work
+        return result
+
+    result = asyncio.run(exercise_handoff())
+
+    assert result.recognized
+    assert browser_callback_progressed.is_set()
+    assert enter_pressed.is_set()
+    assert engine.sessions[0].closed
+    probe = FilesystemProcessLock(tmp_path / "locks" / f"{account.id}.lock")
+    probe.acquire()
+    probe.release()
+
+
 def test_interactive_thread_keeps_synthetic_alias_profiles_and_sessions_isolated(
     tmp_path: Path,
 ) -> None:
@@ -218,18 +282,21 @@ def test_interactive_thread_keeps_synthetic_alias_profiles_and_sessions_isolated
     engine = _FakeEngine()
     runtime = LocalRuntime(tmp_path, accounts, engine)
 
+    async def end_session(_: str) -> None:
+        return None
+
     asyncio.run(
         runtime.open_thread_interactive(
             "first_account",
             "/@synthetic/post/fake_1",
-            wait_for_operator=lambda _: None,
+            wait_for_operator=end_session,
         )
     )
     asyncio.run(
         runtime.open_thread_interactive(
             "second_account",
             "/@synthetic/post/fake_1",
-            wait_for_operator=lambda _: None,
+            wait_for_operator=end_session,
         )
     )
 
@@ -264,12 +331,15 @@ def test_interactive_thread_fails_closed_before_handoff_on_unverified_target(
     runtime = LocalRuntime(tmp_path, accounts, engine)
     prompts: list[str] = []
 
+    async def record_prompt(prompt: str) -> None:
+        prompts.append(prompt)
+
     with pytest.raises(StandaloneRuntimeError) as caught:
         asyncio.run(
             runtime.open_thread_interactive(
                 "synthetic_account",
                 "/@synthetic/post/fake_1",
-                wait_for_operator=prompts.append,
+                wait_for_operator=record_prompt,
             )
         )
 
@@ -296,6 +366,10 @@ def test_interactive_thread_timeout_closes_session_and_releases_account_lock(
     engine = _FakeEngine(_SlowSession)
     runtime = LocalRuntime(tmp_path, accounts, engine)
     prompts: list[str] = []
+
+    async def record_prompt(prompt: str) -> None:
+        prompts.append(prompt)
+
     monkeypatch.setattr(runtime_module, "_BROWSER_READ_TIMEOUT_SECONDS", 0.005)
 
     with pytest.raises(StandaloneRuntimeError) as caught:
@@ -303,7 +377,7 @@ def test_interactive_thread_timeout_closes_session_and_releases_account_lock(
             runtime.open_thread_interactive(
                 "synthetic_account",
                 "/@synthetic/post/fake_1",
-                wait_for_operator=prompts.append,
+                wait_for_operator=record_prompt,
             )
         )
 
@@ -324,7 +398,7 @@ def test_interactive_thread_cancellation_closes_session_and_releases_account_loc
     engine = _FakeEngine()
     runtime = LocalRuntime(tmp_path, accounts, engine)
 
-    def cancel_session(_: str) -> None:
+    async def cancel_session(_: str) -> None:
         raise KeyboardInterrupt
 
     with pytest.raises(KeyboardInterrupt):
@@ -342,6 +416,51 @@ def test_interactive_thread_cancellation_closes_session_and_releases_account_loc
     probe.release()
 
 
+def test_interactive_thread_eof_closes_session_and_releases_account_lock(
+    tmp_path: Path,
+) -> None:
+    accounts = _add_account(tmp_path)
+    account = accounts.get("synthetic_account")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+    engine = _FakeEngine()
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+
+    async def eof_session(_: str) -> None:
+        raise EOFError
+
+    with pytest.raises(StandaloneRuntimeError) as caught:
+        asyncio.run(
+            runtime.open_thread_interactive(
+                "synthetic_account",
+                "/@synthetic/post/fake_1",
+                wait_for_operator=eof_session,
+            )
+        )
+
+    assert caught.value.code == "OPERATOR_HANDOFF_ABORTED"
+    assert engine.sessions[0].closed
+    probe = FilesystemProcessLock(tmp_path / "locks" / f"{account.id}.lock")
+    probe.acquire()
+    probe.release()
+
+
+@pytest.mark.parametrize(
+    ("key", "expected_exception"),
+    [("\x1a", EOFError), ("\x03", KeyboardInterrupt)],
+)
+def test_windows_console_wait_preserves_eof_and_ctrl_c(
+    key: str,
+    expected_exception: type[BaseException],
+) -> None:
+    with pytest.raises(expected_exception):
+        asyncio.run(
+            runtime_module._wait_for_windows_console_enter(
+                lambda: True,
+                lambda: key,
+            )
+        )
+
+
 def test_interactive_thread_reports_browser_crash_after_operator_handoff(
     tmp_path: Path,
 ) -> None:
@@ -351,7 +470,7 @@ def test_interactive_thread_reports_browser_crash_after_operator_handoff(
     engine = _FakeEngine()
     runtime = LocalRuntime(tmp_path, accounts, engine)
 
-    def crash_session(_: str) -> None:
+    async def crash_session(_: str) -> None:
         engine.sessions[0].browser_error = BrowserAdapterError("BROWSER_PROCESS_CRASHED")
 
     with pytest.raises(StandaloneRuntimeError) as caught:
@@ -554,11 +673,14 @@ def test_browser_cli_interactive_thread_is_explicit_and_reports_unknown_identity
         alias: str,
         thread_ref: str,
     ) -> object:
+        async def record_prompt(prompt: str) -> None:
+            prompts.append(prompt)
+
         return await original_open_thread_interactive(
             runtime,
             alias,
             thread_ref,
-            wait_for_operator=prompts.append,
+            wait_for_operator=record_prompt,
         )
 
     monkeypatch.setattr(LocalRuntime, "open_thread_interactive", open_thread_interactive)

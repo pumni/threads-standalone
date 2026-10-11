@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
-from collections.abc import Callable
+import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Literal, cast
 
@@ -45,6 +47,63 @@ _SAFE_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 _BROWSER_READ_TIMEOUT_SECONDS = 30
 _THREADS_WEB_ORIGINS = frozenset({BROWSER_FEED_ORIGIN})
 _DEFAULT_OPERATOR_WAITER = cast(Callable[[str], None], input)
+
+
+async def _wait_for_windows_console_enter(
+    key_available: Callable[[], bool],
+    read_key: Callable[[], str],
+) -> None:
+    while True:
+        if key_available():
+            key = read_key()
+            if key in {"\r", "\n"}:
+                return
+            if key == "\x1a":
+                raise EOFError
+            if key == "\x03":
+                raise KeyboardInterrupt
+        await asyncio.sleep(0.05)
+
+
+async def _wait_for_interactive_operator(prompt: str) -> None:
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    if not sys.stdin.isatty():
+        raise EOFError
+
+    if os.name == "nt":
+        import msvcrt
+
+        await _wait_for_windows_console_enter(msvcrt.kbhit, msvcrt.getwch)
+    else:
+        loop = asyncio.get_running_loop()
+        input_ready: asyncio.Future[None] = loop.create_future()
+        input_fd = sys.stdin.fileno()
+
+        def read_console_input() -> None:
+            if input_ready.done():
+                return
+            try:
+                character = os.read(input_fd, 1)
+            except OSError:
+                input_ready.set_exception(EOFError())
+                return
+            if character in {b"", b"\x04"}:
+                input_ready.set_exception(EOFError())
+            elif character in {b"\r", b"\n"}:
+                input_ready.set_result(None)
+
+        loop.add_reader(input_fd, read_console_input)
+        try:
+            await input_ready
+        finally:
+            loop.remove_reader(input_fd)
+
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+_DEFAULT_INTERACTIVE_OPERATOR_WAITER = _wait_for_interactive_operator
 
 
 class StandaloneRuntimeError(Exception):
@@ -139,7 +198,9 @@ class LocalRuntime:
         alias: str,
         thread_ref: str,
         *,
-        wait_for_operator: Callable[[str], None] = _DEFAULT_OPERATOR_WAITER,
+        wait_for_operator: Callable[[str], Awaitable[None]] = (
+            _DEFAULT_INTERACTIVE_OPERATOR_WAITER
+        ),
     ) -> BrowserTargetOpenResultV1:
         parsed_target = parse_thread_ref(thread_ref)
         if parsed_target is None:
@@ -251,7 +312,7 @@ class LocalRuntime:
         *,
         target_kind: Literal["PROFILE", "THREAD"],
         author_username: str | None = None,
-        wait_for_operator: Callable[[str], None] | None = None,
+        wait_for_operator: Callable[[str], Awaitable[None]] | None = None,
     ) -> BrowserTargetOpenResultV1:
         lock: FilesystemProcessLock | None = None
         session: BrowserEngineSession | None = None
@@ -318,7 +379,7 @@ class LocalRuntime:
                     "yourself. Press Enter here to end and close this browser session: "
                 )
                 try:
-                    wait_for_operator(prompt)
+                    await wait_for_operator(prompt)
                 except EOFError:
                     raise StandaloneRuntimeError("OPERATOR_HANDOFF_ABORTED") from None
                 except Exception:  # noqa: BLE001 - keep interactive input errors bounded
