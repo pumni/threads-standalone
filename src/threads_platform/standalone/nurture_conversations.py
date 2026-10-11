@@ -75,6 +75,7 @@ class NurtureInboundCandidate:
     root_thread_id: str = field(repr=False)
     reply_id: str = field(repr=False)
     replied_to_id: str | None = field(repr=False)
+    text: str | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         return (
@@ -203,6 +204,7 @@ async def collect_nurture_inbound(
                 root_thread_id=own_thread_id,
                 reply_id=reply.reply_id,
                 replied_to_id=reply.replied_to_id,
+                text=reply.text,
             )
             # The first proven occurrence keeps its timestamp; repeated hits never
             # improve a candidate's relative priority.

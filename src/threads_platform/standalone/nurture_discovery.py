@@ -27,6 +27,7 @@ from threads_platform.standalone.nurture_store import (
 _MAX_REMOTE_TEXT_CHARS = 10_000
 _MAX_SOURCE_ORDER = 32
 _MAX_SOURCE_CALLS = 33
+_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _REMOTE_ID = re.compile(r"[A-Za-z0-9._:-]{1,255}\Z")
 _SAFE_ERROR_CODES = frozenset(
     {
@@ -260,11 +261,14 @@ async def discover_nurture_candidates(
     preset: NurturePresetV1,
     target_state: NurtureTargetStateV1,
     now: datetime,
+    *,
+    exact_target_fingerprint: str | None = None,
 ) -> NurtureDiscoveryResult:
     """Collect one bounded page per planned source, then apply the pure policy."""
 
     validated_preset = _validated_preset(preset)
     _validated_target_snapshot(target_state, validated_preset)
+    _validate_exact_target_fingerprint(exact_target_fingerprint)
     captured_now = _as_utc(now)
     source_plan = _source_plan(validated_preset)
     observations: list[NurtureDiscoveryObservation] = []
@@ -324,6 +328,7 @@ async def discover_nurture_candidates(
         target_state,
         captured_now,
         source_call_counts=call_counts,
+        exact_target_fingerprint=exact_target_fingerprint,
     )
 
 
@@ -334,12 +339,14 @@ def rank_nurture_discovery(
     now: datetime,
     *,
     source_call_counts: NurtureSourceCallCounts | None = None,
+    exact_target_fingerprint: str | None = None,
 ) -> NurtureDiscoveryResult:
     """Pure dedupe/ranking; the first occurrence owns provenance and candidate fields."""
 
     validated_preset = _validated_preset(preset)
     targets = _validated_target_snapshot(target_state, validated_preset)
     captured_now = _as_utc(now)
+    _validate_exact_target_fingerprint(exact_target_fingerprint)
     if type(observations) is not tuple or len(observations) > (
         validated_preset.max_total_discovery_candidates
     ):
@@ -458,7 +465,13 @@ def rank_nurture_discovery(
         )
 
     eligible.sort(key=lambda candidate: _candidate_sort_key(candidate, captured_now))
-    selected = tuple(eligible[: validated_preset.max_selected_candidates])
+    selected = (
+        tuple(eligible[: validated_preset.max_selected_candidates])
+        if exact_target_fingerprint is None
+        else tuple(
+            candidate for candidate in eligible if candidate.fingerprint == exact_target_fingerprint
+        )
+    )
     bounded_reasons = tuple(code for code in _REASON_ORDER if code in all_reasons)
     return NurtureDiscoveryResult(
         source_call_counts=call_counts,
@@ -468,6 +481,11 @@ def rank_nurture_discovery(
         selected_candidates=selected,
         reason_codes=bounded_reasons,
     )
+
+
+def _validate_exact_target_fingerprint(value: str | None) -> None:
+    if value is not None and (type(value) is not str or _FINGERPRINT.fullmatch(value) is None):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
 
 
 async def _call_source(
