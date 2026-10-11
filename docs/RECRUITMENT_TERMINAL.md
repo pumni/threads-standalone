@@ -395,3 +395,58 @@ CI and is skipped only in the independent installed-wheel suite. No real AI call
 operator root, credential, approval, post, reply, quote, follow, or DM is exercised. Content rights
 and provenance issue #2 and real installation/live UAT issue #18 remain open; RS-06 issue #25 remains
 HOLD. AO-04A does not add AI-assisted production drafting or unattended publishing.
+
+## AO-04B synthetic human reply editor
+
+The source-only fake editor can be opened in a private foreground terminal for either synthetic
+candidate:
+
+```powershell
+uv run --locked python scripts/demo_recruitment_ai_draft.py --interactive --select 1
+uv run --locked python scripts/demo_recruitment_ai_draft.py --interactive --select 2
+```
+
+It reuses the AO-04A fake API, ranked shortlist, `HumanReplyPreview`, and deterministic fake
+generator. The selected synthetic context and current fake or edited reply are shown together in a
+labelled preview. Press `E` to enter one bounded line (1–500 characters), `K` to keep the current
+text in this process session, or `D` to discard it. Edits can be repeated up to five times. Blank
+input, EOF, Ctrl+C, invalid actions, overlong input, or invalid reply text fail closed to discard.
+Invalid private text is not echoed by the application or included in an error.
+
+`--interactive` requires stdin, stdout, and stderr to be TTYs and rejects CI/test environments
+before the demo creates its synthetic account root or constructs its fake API. The editor does not
+accept reply text through arguments or environment variables. For noninteractive CI, the source-only
+script has a fixed-input fake path:
+
+```powershell
+uv run --locked python scripts/demo_recruitment_ai_draft.py --scripted --select 1
+uv run --locked python scripts/demo_recruitment_ai_draft.py --scripted --select 2
+```
+
+The scripted path uses only hard-coded synthetic edits. It is a demo/test facility, does not bypass
+any production CLI TTY guard, and adds no `--shortlist`, `--review`, or `--apply-*` mode.
+
+The final display uses separate fields: `EDITORIAL_DISPOSITION=KEPT_FOR_SESSION|DISCARDED`,
+`APPROVAL_STATUS=NOT_APPROVED_FOR_SENDING`, `DELIVERY_STATUS=NOT_SENT`,
+`DRAFT_PERSISTED=NO`, and `remote_mutations=0`. Keeping means only an in-memory editorial choice;
+it is not consent, an approval token, a saved draft, or a send action. The editor preserves the
+original candidate object and fingerprint and does not convert the fake proposal into
+`NurtureDraft(source="OPERATOR_FILE")`. Edited text, candidate content, selection, and disposition
+are not written to receipts, state, journal, or durable files. The demo may briefly create its
+synthetic account and existing shortlist lock in a new temporary root; that root is removed at exit.
+
+| AO-04B acceptance | Synthetic evidence |
+| --- | --- |
+| Exact candidate identity/fingerprint survives repeated edits; target replacement fails | `tests/test_recruitment_reply_proposal.py::test_editor_edits_preserve_exact_candidate_and_fingerprint` |
+| Only existing eligible proposals can enter the editor; cooldown/pending/confirmed/ambiguous/excluded still stop | `test_non_eligible_candidate_states_cannot_generate_proposal`; `HumanReplyEditorialSession.begin` requires a valid bound `HumanReplyPreview` |
+| Empty, blank, padded, overlong, control, bidi, and invalid type edits fail without trim or echo | `test_invalid_edited_reply_is_rejected_without_trimming_or_echoing` |
+| Keep/discard are ephemeral editorial outcomes, never approval or delivery | `test_editor_keep_and_discard_are_not_approval_or_delivery`; `test_editor_scripted_input_keep_discard_cancel_and_invalid_are_safe` |
+| TTY/CI rejection happens before demo setup; bounded input, EOF, invalid action, and Ctrl+C discard | `test_interactive_demo_refuses_redirected_and_ci_before_setup`; `test_editor_scripted_input_keep_discard_cancel_and_invalid_are_safe` |
+| A/B scripted demo shows only the selected context and matching edited reply, with no persisted draft or mutation | `test_demo_source_script_runs_one_command_with_fake_generator_only`; source-checkout Windows/Ubuntu CI |
+| Existing production modes, proposal privacy, and independent wheel import remain intact | `test_production_cli_keeps_existing_modes_and_has_no_ai_or_apply_proposal_mode`; `test_repr_and_failures_hide_context_reply_and_target_fingerprint`; installed-wheel CI |
+
+The editor contract is part of the installed package and is verified from `site-packages`. The demo
+script remains source-only; its subprocess, input-loop, persistence, and TTY tests are skipped only
+in the independent installed-wheel suite. No real AI/provider, Threads/Meta API, account,
+credentials, or remote mutation is used. Rights/provenance issue #2 and live install/UAT issue #18
+remain OPEN; RS-06 issue #25 remains HOLD.
