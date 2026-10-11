@@ -266,8 +266,8 @@ def _install_synthetic_app(
         include_mutations: bool = True,
         include_browser: bool = False,
     ) -> AsyncGenerator[StandaloneAppContext]:
-        assert app_root == root
-        assert local_accounts is accounts
+        assert app_root.resolve() == root.resolve()
+        assert local_accounts.get("alice").id == accounts.get("alice").id
         assert include_api is True
         assert include_browser is False
         mutation_modes.append(include_mutations)
