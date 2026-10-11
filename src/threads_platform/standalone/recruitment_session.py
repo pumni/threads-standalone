@@ -9,8 +9,10 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -53,6 +55,8 @@ from threads_platform.standalone.nurture_runner import (
     NurtureRunner,
     NurtureRunnerError,
     NurtureRunResult,
+    NurtureShortlistCandidate,
+    NurtureShortlistResult,
 )
 from threads_platform.standalone.nurture_store import NurtureRunV1, NurtureStore
 from threads_platform.standalone.recruitment_watch import (
@@ -67,6 +71,8 @@ from threads_platform.standalone.recruitment_watch import (
 )
 
 _SAFE_ERROR = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+_SHORTLIST_LIMIT = 5
+_SHORTLIST_PREVIEW_CHARS = 500
 
 
 class RecruitmentSessionMode(StrEnum):
@@ -244,6 +250,48 @@ class RecruitmentSession:
             inbound_owner_username=inbound_owner_username,
             inbound_thread_cap=inbound_thread_cap,
         )
+
+    async def shortlist(
+        self,
+        account_alias: str,
+        *,
+        inbound_owner_username: str | None = None,
+        inbound_thread_cap: int | None = None,
+        limit: int = _SHORTLIST_LIMIT,
+        now: datetime | None = None,
+    ) -> NurtureShortlistResult:
+        """Discover a bounded, ephemeral shortlist without creating a run receipt."""
+
+        account, preset = self._validated_local_state(account_alias)
+        inbound_config = _bound_inbound_config(
+            account,
+            preset,
+            inbound_owner_username,
+            inbound_thread_cap,
+        )
+        try:
+            async with build_standalone_app(
+                self._root,
+                self._accounts,
+                include_api=True,
+                include_mutations=False,
+                include_browser=False,
+            ) as app:
+                if app.mutations is not None:
+                    raise RecruitmentSessionError("SESSION_MUTATION_RUNTIME_UNAVAILABLE")
+                return await NurtureRunner(app.api, NurtureStore(self._root)).shortlist(
+                    account,
+                    preset,
+                    inbound_config=inbound_config,
+                    now=now,
+                    limit=limit,
+                )
+        except RecruitmentSessionError:
+            raise
+        except (NurtureRunnerError, StandaloneAccountError, NurturePresetError) as error:
+            raise RecruitmentSessionError(_error_code(error)) from None
+        except Exception:  # noqa: BLE001 — never expose runtime or response details.
+            raise RecruitmentSessionError("SESSION_FAILED") from None
 
     async def watch_observe(
         self,
@@ -556,6 +604,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Periodically observe in this foreground process; read-only.",
     )
+    mode.add_argument(
+        "--shortlist",
+        action="store_true",
+        help="Privately review one fresh, bounded recruitment shortlist.",
+    )
     mode.add_argument("--review", action="store_true")
     mode.add_argument("--apply-reply-file")
     mode.add_argument("--apply-post-file")
@@ -613,6 +666,96 @@ def _private_terminal_available(*, require_input: bool) -> bool:
     if ci_enabled or not sys.stderr.isatty():
         return False
     return not require_input or sys.stdin.isatty()
+
+
+def _private_shortlist_terminal_available() -> bool:
+    ci_enabled = any(
+        os.environ.get(name, "").strip().casefold() in {"1", "true", "yes"}
+        for name in ("CI", "GITHUB_ACTIONS")
+    )
+    return not ci_enabled and sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()
+
+
+def _shortlist_summary(result: NurtureShortlistResult) -> str:
+    lines = [
+        "RECRUITMENT SHORTLIST — PRIVATE LOCAL REVIEW",
+        f"Inbound: {result.inbound_status.value}",
+    ]
+    if not result.candidates:
+        lines.append("No bounded candidates found.")
+        return "\n".join(lines) + "\n"
+    for index, candidate in enumerate(result.candidates, start=1):
+        source = str(candidate.source)
+        score = "—" if candidate.score is None else str(candidate.score)
+        reasons = ", ".join(candidate.reason_codes) or "none"
+        lines.extend(
+            (
+                f"{index}. [{source}] Score {score}",
+                f"   Reason: {reasons}",
+                f"   Status: {candidate.status} — {candidate.action_hint}",
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _safe_terminal_content(text: str | None, truncated: bool) -> str:
+    if text is None:
+        return "<unavailable>"
+    bounded = text[:_SHORTLIST_PREVIEW_CHARS]
+    visible = "".join(
+        char
+        if unicodedata.category(char) not in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+        else f"\\u{ord(char):04x}"
+        for char in bounded
+    )
+    suffix = " … [truncated]" if truncated or len(text) > _SHORTLIST_PREVIEW_CHARS else ""
+    return json.dumps(visible, ensure_ascii=False) + suffix
+
+
+def _shortlist_preview_text(candidate: NurtureShortlistCandidate) -> str:
+    source = str(candidate.source)
+    reasons = ", ".join(candidate.reason_codes) or "none"
+    score = "—" if candidate.score is None else str(candidate.score)
+    return (
+        "PRIVATE CANDIDATE PREVIEW — ephemeral, not approval\n"
+        f"Source: {source}\n"
+        f"Score: {score}\n"
+        f"Reason: {reasons}\n"
+        f"Status: {candidate.status}\n"
+        f"Suggested next step: {candidate.action_hint}\n"
+        f"Content: {_safe_terminal_content(candidate.text, candidate.text_truncated)}\n"
+        "No reply draft or remote action is available in this mode.\n"
+    )
+
+
+def _private_shortlist_review(result: NurtureShortlistResult) -> int:
+    if not _private_shortlist_terminal_available():
+        raise RecruitmentSessionError("PRIVATE_REVIEW_TERMINAL_REQUIRED")
+    sys.stderr.write(_shortlist_summary(result))
+    if not result.candidates:
+        sys.stderr.write("No reply draft or remote action was created.\n")
+        sys.stderr.flush()
+        return 0
+    sys.stderr.write("Select candidate to preview (Enter to exit): ")
+    sys.stderr.flush()
+    selection = sys.stdin.readline(16)
+    if not selection or not selection.strip():
+        sys.stderr.write("Review ended without a preview.\n")
+        sys.stderr.flush()
+        return 0
+    if not re.fullmatch(r"[1-9][0-9]?", selection.strip()):
+        sys.stderr.write("Invalid selection; review ended safely.\n")
+        sys.stderr.flush()
+        return 0
+    index = int(selection.strip())
+    if not 1 <= index <= len(result.candidates):
+        sys.stderr.write("Selection outside the shortlist; review ended safely.\n")
+        sys.stderr.flush()
+        return 0
+    candidate = result.candidates[index - 1]
+    sys.stderr.write("\n" + _shortlist_preview_text(candidate))
+    sys.stderr.flush()
+    return 0
 
 
 def _private_review_text(
@@ -783,7 +926,16 @@ def _parse_watch_cycles_arg(raw: str) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    mode_count = sum((args.validate, args.preflight, args.observe, args.watch_observe, args.review))
+    mode_count = sum(
+        (
+            args.validate,
+            args.preflight,
+            args.observe,
+            args.watch_observe,
+            args.shortlist,
+            args.review,
+        )
+    )
     if (
         args.review_reply_file is not None or args.review_post_file is not None
     ) and not args.review:
@@ -799,6 +951,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     applying = args.apply_reply_file is not None or args.apply_post_file is not None
     if (args.review or applying) and not _private_terminal_available(require_input=applying):
+        sys.stderr.write("ERROR PRIVATE_REVIEW_TERMINAL_REQUIRED\n")
+        return 1
+    if args.shortlist and not _private_shortlist_terminal_available():
         sys.stderr.write("ERROR PRIVATE_REVIEW_TERMINAL_REQUIRED\n")
         return 1
 
@@ -841,6 +996,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     inbound_thread_cap=inbound_cap,
                 )
             )
+        elif args.shortlist:
+            shortlist_result = asyncio.run(
+                session.shortlist(
+                    args.account,
+                    inbound_owner_username=inbound_owner,
+                    inbound_thread_cap=inbound_cap,
+                    limit=_SHORTLIST_LIMIT,
+                )
+            )
+            return _private_shortlist_review(shortlist_result)
         elif args.review:
             draft = None
             candidate = None

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from uuid import UUID
@@ -172,6 +172,25 @@ class NurtureCandidate:
         )
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class NurtureCandidateAssessment:
+    """Ephemeral ranking output including suppressed observations for private review."""
+
+    candidate: NurtureCandidate = field(repr=False)
+    fingerprint: str = field(repr=False)
+    source_class: NurtureDiscoverySource
+    rejection_reason: str | None
+    reason_codes: tuple[str, ...]
+
+    def __repr__(self) -> str:
+        return (
+            "NurtureCandidateAssessment("
+            f"source_class={self.source_class.value}, score={self.candidate.score}, "
+            f"rejection_reason={self.rejection_reason or '-'}, "
+            f"reason_codes={self.reason_codes!r})"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class NurtureSourceCallCounts:
     mentions: int = 0
@@ -197,6 +216,7 @@ class NurtureDiscoveryResult:
     rejected_count: int
     selected_candidates: tuple[NurtureCandidate, ...]
     reason_codes: tuple[str, ...]
+    candidate_assessments: tuple[NurtureCandidateAssessment, ...] = ()
 
     @property
     def selected_count(self) -> int:
@@ -208,6 +228,7 @@ class NurtureDiscoveryResult:
             f"source_call_counts={self.source_call_counts!r}, "
             f"discovered_count={self.discovered_count}, deduped_count={self.deduped_count}, "
             f"rejected_count={self.rejected_count}, selected_count={self.selected_count}, "
+            f"assessed_count={len(self.candidate_assessments)}, "
             f"reason_codes={self.reason_codes!r})"
         )
 
@@ -263,6 +284,7 @@ async def discover_nurture_candidates(
     now: datetime,
     *,
     exact_target_fingerprint: str | None = None,
+    include_assessments: bool = False,
 ) -> NurtureDiscoveryResult:
     """Collect one bounded page per planned source, then apply the pure policy."""
 
@@ -329,6 +351,7 @@ async def discover_nurture_candidates(
         captured_now,
         source_call_counts=call_counts,
         exact_target_fingerprint=exact_target_fingerprint,
+        include_assessments=include_assessments,
     )
 
 
@@ -340,6 +363,7 @@ def rank_nurture_discovery(
     *,
     source_call_counts: NurtureSourceCallCounts | None = None,
     exact_target_fingerprint: str | None = None,
+    include_assessments: bool = False,
 ) -> NurtureDiscoveryResult:
     """Pure dedupe/ranking; the first occurrence owns provenance and candidate fields."""
 
@@ -347,6 +371,8 @@ def rank_nurture_discovery(
     targets = _validated_target_snapshot(target_state, validated_preset)
     captured_now = _as_utc(now)
     _validate_exact_target_fingerprint(exact_target_fingerprint)
+    if type(include_assessments) is not bool:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
     if type(observations) is not tuple or len(observations) > (
         validated_preset.max_total_discovery_candidates
     ):
@@ -376,13 +402,13 @@ def rank_nurture_discovery(
     targets_by_fingerprint = {target.fingerprint: target for target in targets}
     rejected_count = 0
     eligible: list[NurtureCandidate] = []
+    assessments: list[NurtureCandidateAssessment] = []
     all_reasons: set[str] = set()
 
     for fingerprint, observation in unique:
         thread = observation.thread
         source_class = observation.source_class
         source_reason = _SOURCE_REASON[source_class]
-        reasons = [source_reason]
         all_reasons.add(source_reason)
 
         normalized_text = _normalize_text(thread.text)
@@ -392,10 +418,27 @@ def rank_nurture_discovery(
         if excluded:
             rejected_count += 1
             all_reasons.add("EXCLUDED_TERM")
+            if include_assessments:
+                candidate = _assessment_candidate(
+                    fingerprint,
+                    observation,
+                    validated_preset,
+                    captured_now,
+                    (source_reason, "EXCLUDED_TERM"),
+                )
+                assessments.append(
+                    NurtureCandidateAssessment(
+                        candidate,
+                        fingerprint,
+                        source_class,
+                        "EXCLUDED_TERM",
+                        candidate.reason_codes,
+                    )
+                )
             continue
 
         target = targets_by_fingerprint.get(fingerprint)
-        eligibility_reason = _target_suppression_reason(
+        eligibility_reason = nurture_target_suppression_reason(
             target,
             validated_preset.seen_cooldown_seconds,
             captured_now,
@@ -403,66 +446,55 @@ def rank_nurture_discovery(
         if eligibility_reason is not None and eligibility_reason != "COOLDOWN_ELAPSED":
             rejected_count += 1
             all_reasons.add(eligibility_reason)
+            if include_assessments:
+                candidate = _assessment_candidate(
+                    fingerprint,
+                    observation,
+                    validated_preset,
+                    captured_now,
+                    (source_reason, eligibility_reason),
+                )
+                assessments.append(
+                    NurtureCandidateAssessment(
+                        candidate,
+                        fingerprint,
+                        source_class,
+                        eligibility_reason,
+                        candidate.reason_codes,
+                    )
+                )
             continue
-        if eligibility_reason is not None:
-            reasons.append(eligibility_reason)
-            all_reasons.add(eligibility_reason)
-
-        include_match = normalized_text is not None and _matches_any(
-            normalized_text, validated_preset.include_terms
-        )
-        include_points = (
-            _include_score(normalized_text, validated_preset.include_terms)
-            if normalized_text is not None
-            else 0
-        )
-        if include_match:
-            reasons.append("INCLUDE_TERM_MATCH")
-            all_reasons.add("INCLUDE_TERM_MATCH")
-
-        question_signal = normalized_text is not None and "?" in normalized_text
-        if question_signal:
-            reasons.append("QUESTION_MARK")
-            all_reasons.add("QUESTION_MARK")
-
-        recency_bucket = _recency_bucket(thread.timestamp, captured_now)
-        recency_score, recency_reason = _recency_signal(recency_bucket)
-        if recency_reason is not None:
-            reasons.append(recency_reason)
-            all_reasons.add(recency_reason)
-
-        no_reply_signal = thread.has_replies is False
-        if no_reply_signal:
-            reasons.append("NO_REPLY_SIGNAL")
-            all_reasons.add("NO_REPLY_SIGNAL")
-
-        score = (
-            _SOURCE_SCORE[source_class]
-            + include_points
-            + (_QUESTION_MARK_SCORE if question_signal else 0)
-            + recency_score
-            + (_NO_REPLY_SIGNAL_SCORE if no_reply_signal else 0)
-        )
-        eligible.append(
-            NurtureCandidate(
-                remote_thread_id=thread.remote_thread_id,
-                source_class=source_class,
-                source_index=observation.source_index,
-                source_order=observation.source_order,
-                username=thread.username,
-                text=thread.text,
-                permalink=thread.permalink,
-                timestamp=(None if thread.timestamp is None else thread.timestamp.astimezone(UTC)),
-                has_replies=thread.has_replies,
-                is_quote_post=thread.is_quote_post,
-                fingerprint=fingerprint,
-                include_term_match=include_match,
-                question_signal=question_signal,
-                recency_bucket=recency_bucket,
-                score=score,
-                reason_codes=tuple(reasons),
+        base_reasons = (
+            (source_reason,)
+            if eligibility_reason is None
+            else (
+                source_reason,
+                eligibility_reason,
             )
         )
+        candidate = _assessment_candidate(
+            fingerprint,
+            observation,
+            validated_preset,
+            captured_now,
+            base_reasons,
+        )
+        eligible.append(candidate)
+        if include_assessments:
+            assessments.append(
+                NurtureCandidateAssessment(
+                    candidate,
+                    fingerprint,
+                    source_class,
+                    None,
+                    candidate.reason_codes,
+                )
+            )
+        for code in candidate.reason_codes:
+            if code not in {source_reason, "COOLDOWN_ELAPSED"}:
+                all_reasons.add(code)
+        if eligibility_reason is not None:
+            all_reasons.add(eligibility_reason)
 
     eligible.sort(key=lambda candidate: _candidate_sort_key(candidate, captured_now))
     selected = (
@@ -473,6 +505,7 @@ def rank_nurture_discovery(
         )
     )
     bounded_reasons = tuple(code for code in _REASON_ORDER if code in all_reasons)
+    assessments.sort(key=lambda item: _candidate_sort_key(item.candidate, captured_now))
     return NurtureDiscoveryResult(
         source_call_counts=call_counts,
         discovered_count=len(observations),
@@ -480,6 +513,63 @@ def rank_nurture_discovery(
         rejected_count=rejected_count,
         selected_candidates=selected,
         reason_codes=bounded_reasons,
+        candidate_assessments=tuple(assessments),
+    )
+
+
+def _assessment_candidate(
+    fingerprint: str,
+    observation: NurtureDiscoveryObservation,
+    preset: NurturePresetV1,
+    now: datetime,
+    base_reasons: tuple[str, ...],
+) -> NurtureCandidate:
+    """Build the shared score/rank record for eligible or review-only observations."""
+
+    thread = observation.thread
+    normalized_text = _normalize_text(thread.text)
+    include_match = normalized_text is not None and _matches_any(
+        normalized_text, preset.include_terms
+    )
+    include_points = (
+        _include_score(normalized_text, preset.include_terms) if normalized_text is not None else 0
+    )
+    question_signal = normalized_text is not None and "?" in normalized_text
+    recency_bucket = _recency_bucket(thread.timestamp, now)
+    recency_score, recency_reason = _recency_signal(recency_bucket)
+    no_reply_signal = thread.has_replies is False
+    reasons = list(base_reasons)
+    if include_match:
+        reasons.append("INCLUDE_TERM_MATCH")
+    if question_signal:
+        reasons.append("QUESTION_MARK")
+    if recency_reason is not None:
+        reasons.append(recency_reason)
+    if no_reply_signal:
+        reasons.append("NO_REPLY_SIGNAL")
+    return NurtureCandidate(
+        remote_thread_id=thread.remote_thread_id,
+        source_class=observation.source_class,
+        source_index=observation.source_index,
+        source_order=observation.source_order,
+        username=thread.username,
+        text=thread.text,
+        permalink=thread.permalink,
+        timestamp=None if thread.timestamp is None else thread.timestamp.astimezone(UTC),
+        has_replies=thread.has_replies,
+        is_quote_post=thread.is_quote_post,
+        fingerprint=fingerprint,
+        include_term_match=include_match,
+        question_signal=question_signal,
+        recency_bucket=recency_bucket,
+        score=(
+            _SOURCE_SCORE[observation.source_class]
+            + include_points
+            + (_QUESTION_MARK_SCORE if question_signal else 0)
+            + recency_score
+            + (_NO_REPLY_SIGNAL_SCORE if no_reply_signal else 0)
+        ),
+        reason_codes=tuple(reasons),
     )
 
 
@@ -613,7 +703,7 @@ def _validated_target_snapshot(
     return tuple(targets)
 
 
-def _target_suppression_reason(
+def nurture_target_suppression_reason(
     target: NurtureTargetV1 | None,
     cooldown_seconds: int,
     now: datetime,

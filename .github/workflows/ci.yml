@@ -68,6 +68,9 @@ jobs:
       - name: Full synthetic test suite
         run: uv run --locked pytest
 
+      - name: One-command synthetic recruitment shortlist demo
+        run: uv run --locked python scripts/demo_recruitment_shortlist.py
+
       - name: Build wheel and source distribution
         run: uv build
 
