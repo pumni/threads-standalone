@@ -748,6 +748,11 @@ class NurtureRunner:
             NurtureInboundStatus.NOT_CONFIGURED,
         }:
             raise NurtureRunnerError(inbound.status.value)
+        if quote_draft is not None and any(
+            candidate.fingerprint == quote_draft.target_fingerprint
+            for candidate in inbound.candidates
+        ):
+            raise NurtureRunnerError("NURTURE_QUOTE_TARGET_MISMATCH")
         if draft is not None:
             inbound_bound = next(
                 (
