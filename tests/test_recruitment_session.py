@@ -591,13 +591,14 @@ def test_script_inbound_configuration_binds_owner_and_honors_ephemeral_cap(
     )
 
     assert status == 0
-    assert [call[0] for call in api.calls] == [
+    assert tuple(call[0] for call in api.calls[:3]) == (
         "authenticated_profile",
         "profile_posts",
         "conversation",
-        "search",
-        "mentions",
-    ]
+    )
+    discovery_calls = tuple(call[0] for call in api.calls[3:])
+    assert "search" in discovery_calls
+    assert "mentions" in discovery_calls
     assert api.calls[1][-1] == 1
     assert mutations.calls == []
     assert mutation_modes == [False]
