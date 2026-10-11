@@ -7,7 +7,7 @@ import math
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from threads_platform.standalone.nurture_discovery import NurtureDiscoverySource
 from threads_platform.standalone.nurture_runner import (
@@ -37,6 +37,9 @@ class ReplyProposalError(ValueError):
             "GENERATOR_FAILED",
             "INVALID_PROPOSAL_OUTPUT",
             "TARGET_BINDING_MISMATCH",
+            "INVALID_EDITOR_SESSION",
+            "EDITOR_SESSION_CLOSED",
+            "INVALID_EDITED_REPLY",
         }:
             raise ValueError("invalid reply proposal error code")
         self.code = code
@@ -171,6 +174,101 @@ class HumanReplyPreview:
         return "HumanReplyPreview(candidate=<bound>, proposal=<redacted>)"
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class HumanReplyEditorialSession:
+    """Ephemeral edits tied to the exact proposal target; never an approval."""
+
+    preview: HumanReplyPreview = field(repr=False)
+    target_fingerprint: str = field(repr=False)
+    current_reply: str | None = field(repr=False)
+    editorial_disposition: Literal["EDITING", "KEPT_FOR_SESSION", "DISCARDED"] = "EDITING"
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.preview) is not HumanReplyPreview
+            or self.preview.candidate.status != "ELIGIBLE"
+            or self.preview.candidate.action_hint != "REVIEW_CANDIDATE"
+            or type(self.target_fingerprint) is not str
+            or self.target_fingerprint != self.preview.candidate.fingerprint
+            or self.target_fingerprint != self.preview.proposal.target_fingerprint
+            or not self.preview.proposal.is_bound_to(self.preview.candidate)
+            or type(self.editorial_disposition) is not str
+            or self.editorial_disposition not in {"EDITING", "KEPT_FOR_SESSION", "DISCARDED"}
+        ):
+            raise ReplyProposalError("INVALID_EDITOR_SESSION")
+        if self.editorial_disposition == "DISCARDED":
+            if self.current_reply is not None:
+                raise ReplyProposalError("INVALID_EDITOR_SESSION")
+        else:
+            _validate_reply(self.current_reply, error_code="INVALID_EDITED_REPLY")
+
+    @classmethod
+    def begin(cls, preview: HumanReplyPreview) -> HumanReplyEditorialSession:
+        if type(preview) is not HumanReplyPreview:
+            raise ReplyProposalError("INVALID_EDITOR_SESSION")
+        return cls(preview, preview.proposal.target_fingerprint, preview.proposal.suggested_reply)
+
+    @property
+    def candidate(self) -> NurtureShortlistCandidate:
+        return self.preview.candidate
+
+    @property
+    def approval_status(self) -> Literal["NOT_APPROVED_FOR_SENDING"]:
+        return "NOT_APPROVED_FOR_SENDING"
+
+    @property
+    def delivery_status(self) -> Literal["NOT_SENT"]:
+        return "NOT_SENT"
+
+    def is_bound_to(self, candidate: NurtureShortlistCandidate) -> bool:
+        return (
+            type(candidate) is NurtureShortlistCandidate
+            and self.preview.candidate is candidate
+            and self.target_fingerprint == candidate.fingerprint
+            and self.preview.proposal.is_bound_to(candidate)
+        )
+
+    def edit(self, value: object) -> HumanReplyEditorialSession:
+        self._require_editing()
+        _validate_reply(value, error_code="INVALID_EDITED_REPLY")
+        return HumanReplyEditorialSession(
+            self.preview,
+            self.target_fingerprint,
+            cast(str, value),
+            "EDITING",
+        )
+
+    def keep_for_session(self) -> HumanReplyEditorialSession:
+        self._require_editing()
+        return HumanReplyEditorialSession(
+            self.preview,
+            self.target_fingerprint,
+            self.current_reply,
+            "KEPT_FOR_SESSION",
+        )
+
+    def discard(self) -> HumanReplyEditorialSession:
+        self._require_editing()
+        return HumanReplyEditorialSession(
+            self.preview,
+            self.target_fingerprint,
+            None,
+            "DISCARDED",
+        )
+
+    def _require_editing(self) -> None:
+        if self.editorial_disposition != "EDITING":
+            raise ReplyProposalError("EDITOR_SESSION_CLOSED")
+
+    def __repr__(self) -> str:
+        return (
+            "HumanReplyEditorialSession("
+            "candidate=<bound>, target_fingerprint=<redacted>, "
+            f"editorial_disposition={self.editorial_disposition}, current_reply=<redacted>, "
+            "approval_status=NOT_APPROVED_FOR_SENDING, delivery_status=NOT_SENT)"
+        )
+
+
 async def create_human_reply_preview(
     shortlist: NurtureShortlistResult,
     selection: int,
@@ -225,7 +323,13 @@ async def create_human_reply_preview(
     return HumanReplyPreview(candidate, proposal)
 
 
-def _validate_reply(value: object) -> None:
+def _validate_reply(
+    value: object,
+    *,
+    error_code: Literal["INVALID_PROPOSAL_OUTPUT", "INVALID_EDITED_REPLY"] = (
+        "INVALID_PROPOSAL_OUTPUT"
+    ),
+) -> None:
     if (
         type(value) is not str
         or not value
@@ -236,4 +340,4 @@ def _validate_reply(value: object) -> None:
             unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for character in value
         )
     ):
-        raise ReplyProposalError("INVALID_PROPOSAL_OUTPUT")
+        raise ReplyProposalError(error_code)
