@@ -115,3 +115,65 @@ wheel console command.
 All evidence listed above is synthetic. No hosted result is claimed in this document; the Draft PR
 records exact-head Windows/Linux locked QA, full tests, installed-wheel tests, and full-history
 Gitleaks after the run completes.
+
+## AO-01 foreground Auto Observe
+
+`--watch-observe` is an additive, foreground-only mode. It is mutually exclusive with validate,
+preflight, one-shot observe, review, and apply. The script calls one `asyncio.run`; that coroutine
+reuses the same typed `RecruitmentSession.observe` path for each cycle. It does not spawn a CLI
+process, construct a browser or mutation runtime, request review/consent, synthesize drafts, or
+perform remote writes.
+
+Before the first cycle, the watcher performs the existing read-only token identity and quota
+preflight. A missing/expired credential, denied read, unknown/exhausted quota, invalid root/state,
+timeout, or any failed cycle stops the watcher; there is no retry loop. Each preflight and observe
+phase has a 5-minute timeout. The default interval is 30 minutes between cycle starts, and accepted
+values are 15–1,440 minutes. `--max-cycles 1..1000` gives deterministic shutdown; omitting it keeps
+the explicitly invoked foreground process running until Ctrl+C or a fail-closed stop. There is no
+short-interval CLI override.
+
+```powershell
+# Syntax example only; this synthetic checkpoint does not authorize real-account polling.
+uv run --locked python scripts/run_recruitment.py --account $accountAlias --watch-observe
+uv run --locked python scripts/run_recruitment.py --account $accountAlias --watch-observe --interval-minutes 30 --max-cycles 3
+```
+
+The watcher prints only a bounded UTC timestamp, cycle number, receipt outcome/decision codes,
+bounded counts, inbound capability status, and safe STOP code. `INBOUND_NOT_CONFIGURED` means the
+inbound path was not requested; `INBOUND_READY` means the configured identity/profile/conversation
+reads passed. An inbound error stops with `inbound=UNAVAILABLE`; it is never reported as zero
+replies. No raw text, remote ID, username, URL, credential reference, or response body is printed.
+The command creates no log file. Each completed Nurture cycle still writes its normal existing v1
+receipt and dedupe state; these retain the existing store behavior and are not watch-specific logs.
+
+For one watcher per account, the process acquires
+`nurture/locks/<account-uuid>.watch.lock`, then each `observe` cycle uses the existing
+`nurture/locks/<account-uuid>.lock`. Watch lock files remain after release and are never unlinked;
+the OS releases the held process lock on exit. Separate account UUIDs have separate watcher locks.
+The observe path does not take an operation-journal lock because it creates no mutation runtime.
+If a process stops during a cycle, the existing Nurture receipt records `INTERRUPTED` (or is
+repaired as interrupted on the next run). Restart is a fresh read and uses the existing v1 cooldown
+state; it cannot replay a remote action because the watcher has no remote mutation path. Ctrl+C and
+task cancellation report `INTERRUPTED` and return exit code 130.
+
+Stop the watcher before using a separate private review command. Watch discovery is not durable
+approval; review must fetch and verify the current target again. Existing `--validate`, `--preflight`,
+one-shot `--observe`, private `--review`/`--apply-*`, Workflow, and read-only Recurrence semantics
+remain unchanged. This synthetic implementation is not a real-account deployment or a 24/7
+availability claim; issues #18 (operator installation/live UAT) and #2 (rights/provenance) remain
+open.
+
+Synthetic AO-01 evidence is in `tests/test_recruitment_watch.py` and the real-script cases in
+`tests/test_recruitment_e2e.py`. The source entry script remains outside the wheel; wheel smoke
+tests import the watch helper from the independently installed `threads_platform` package under
+`site-packages`.
+
+| AO-01 acceptance | Synthetic evidence |
+| --- | --- |
+| CLI help, mutually exclusive modes, interval limits/default, and finite cycles | `tests/test_recruitment_e2e.py::test_real_script_watch_help_and_mode_exclusivity`; `tests/test_recruitment_watch.py::test_watch_interval_and_cycle_bounds` |
+| Three cycles run through one event loop with expected reads, v1 receipts, cooldown dedupe, and no mutation runtime | `tests/test_recruitment_e2e.py::test_real_script_watch_runs_three_read_only_cycles_in_one_event_loop` |
+| Inbound absent/configured/foreign identity and profile/conversation failures | `tests/test_recruitment_e2e.py::test_real_script_watch_runs_three_read_only_cycles_in_one_event_loop`; `test_real_script_watch_reports_verified_inbound_capability_without_content`; `test_real_script_watch_checks_inbound_binding_and_stops_without_fallback`; `test_real_script_watch_fails_closed_on_read_errors` |
+| Missing/expired/denied credentials, quota STOP, and discovery rate limit stop without retry | `tests/test_recruitment_e2e.py::test_real_script_watch_stops_on_preflight_authentication_failure`; `test_real_script_watch_stops_on_expired_credential_before_api_calls`; `test_real_script_watch_quota_stop_prevents_first_cycle`; `test_real_script_watch_fails_closed_on_read_errors`; `tests/test_recruitment_watch.py::test_preflight_stop_and_read_failure_never_retry` |
+| Phase timeout and cancellation during read/between cycles; restart and per-account lock behavior | `tests/test_recruitment_watch.py::test_watch_phase_timeout_stops_without_fast_retry`; `test_cancel_between_cycles_reports_interruption_and_does_not_start_next_cycle`; `test_watch_lock_is_per_account_and_restart_keeps_lock_file`; `test_cancelled_read_releases_account_guard_and_other_account_progresses`; `tests/test_recruitment_e2e.py::test_watch_cancellation_persists_interrupted_receipt_and_allows_restart` |
+| Missing root, malformed v1 state, synthetic path rejection/full disk, and privacy | `tests/test_recruitment_e2e.py::test_real_script_watch_missing_root_stops_without_creating_it`; `test_real_script_watch_malformed_v1_state_fails_closed`; `test_real_script_watch_synthetic_full_disk_failure_stops_safely`; `tests/test_recruitment_watch.py::test_watch_lock_path_error_fails_closed_without_cleanup`; `test_real_script_watch_runs_three_read_only_cycles_in_one_event_loop` |
+| The helper imports from an installed wheel while the entry script remains source-only | `tests/test_recruitment_watch.py::test_watch_module_comes_from_installed_wheel_in_wheel_smoke`; `tests/test_recruitment_e2e.py::test_real_script_validate_is_zero_write_and_proves_wheel_import_provenance`; Windows/Ubuntu installed-wheel CI. |

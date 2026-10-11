@@ -9,7 +9,7 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -55,6 +55,16 @@ from threads_platform.standalone.nurture_runner import (
     NurtureRunResult,
 )
 from threads_platform.standalone.nurture_store import NurtureRunV1, NurtureStore
+from threads_platform.standalone.recruitment_watch import (
+    DEFAULT_WATCH_INTERVAL_MINUTES,
+    WatchCycle,
+    WatchPreflight,
+    WatchRunResult,
+    WatchTiming,
+    parse_watch_interval_minutes,
+    parse_watch_max_cycles,
+    run_foreground_watch,
+)
 
 _SAFE_ERROR = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 
@@ -233,6 +243,74 @@ class RecruitmentSession:
             RecruitmentSessionMode.OBSERVE,
             inbound_owner_username=inbound_owner_username,
             inbound_thread_cap=inbound_thread_cap,
+        )
+
+    async def watch_observe(
+        self,
+        account_alias: str,
+        *,
+        interval_minutes: int = DEFAULT_WATCH_INTERVAL_MINUTES,
+        max_cycles: int | None = None,
+        inbound_owner_username: str | None = None,
+        inbound_thread_cap: int | None = None,
+        timing: WatchTiming | None = None,
+        reporter: Callable[[str], None] | None = None,
+    ) -> WatchRunResult:
+        """Run an explicitly selected, foreground-only read-only observation loop."""
+
+        account, preset = self._validated_local_state(account_alias)
+        _bound_inbound_config(
+            account,
+            preset,
+            inbound_owner_username,
+            inbound_thread_cap,
+        )
+
+        def verify_account_binding() -> None:
+            current_account, _ = self._validated_local_state(account_alias)
+            if current_account.id != account.id:
+                raise RecruitmentSessionError("WATCH_ACCOUNT_CHANGED")
+
+        async def preflight() -> WatchPreflight:
+            verify_account_binding()
+            result = await self.preflight(account_alias)
+            return WatchPreflight(
+                result.status,
+                result.credential_status,
+                result.publishing_quota_status,
+                result.reply_quota_status,
+            )
+
+        async def observe() -> WatchCycle:
+            verify_account_binding()
+            result = await self.observe(
+                account_alias,
+                inbound_owner_username=inbound_owner_username,
+                inbound_thread_cap=inbound_thread_cap,
+            )
+            receipt = result.receipt
+            if receipt is None:
+                raise RecruitmentSessionError("WATCH_RESULT_INVALID")
+            return WatchCycle(
+                status=result.status,
+                outcome=receipt.outcome,
+                inbound_status=result.inbound_status or "INBOUND_READ_FAILED",
+                discovered_count=receipt.discovered_count,
+                deduped_count=receipt.deduped_count,
+                selected_count=receipt.selected_count,
+                skipped_count=receipt.skipped_count,
+                decision_codes=receipt.decision_codes,
+            )
+
+        return await run_foreground_watch(
+            store=NurtureStore(self._root),
+            account_id=account.id,
+            interval_minutes=interval_minutes,
+            max_cycles=max_cycles,
+            preflight=preflight,
+            observe=observe,
+            timing=timing,
+            reporter=reporter,
         )
 
     async def review(
@@ -459,10 +537,25 @@ def _quota_status(quota: object, *, reply: bool) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="run_recruitment")
     parser.add_argument("--account", required=True)
+    parser.add_argument(
+        "--interval-minutes",
+        type=_parse_watch_interval_arg,
+        help="Watch interval between cycle starts (default: 30; allowed: 15–1440).",
+    )
+    parser.add_argument(
+        "--max-cycles",
+        type=_parse_watch_cycles_arg,
+        help="Stop after this many cycles (1–1000); omit to keep the foreground watch running.",
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--validate", action="store_true")
     mode.add_argument("--preflight", action="store_true")
     mode.add_argument("--observe", action="store_true")
+    mode.add_argument(
+        "--watch-observe",
+        action="store_true",
+        help="Periodically observe in this foreground process; read-only.",
+    )
     mode.add_argument("--review", action="store_true")
     mode.add_argument("--apply-reply-file")
     mode.add_argument("--apply-post-file")
@@ -674,9 +767,23 @@ def _inbound_thread_cap(raw: str | None) -> int | None:
     return cap
 
 
+def _parse_watch_interval_arg(raw: str) -> int:
+    try:
+        return parse_watch_interval_minutes(raw)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _parse_watch_cycles_arg(raw: str) -> int:
+    try:
+        return parse_watch_max_cycles(raw)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    mode_count = sum((args.validate, args.preflight, args.observe, args.review))
+    mode_count = sum((args.validate, args.preflight, args.observe, args.watch_observe, args.review))
     if (
         args.review_reply_file is not None or args.review_post_file is not None
     ) and not args.review:
@@ -684,6 +791,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     if mode_count == 0 and args.apply_reply_file is None and args.apply_post_file is None:
         sys.stderr.write("ERROR SESSION_MODE_REQUIRED\n")
+        return 1
+    if not args.watch_observe and (
+        args.interval_minutes is not None or args.max_cycles is not None
+    ):
+        sys.stderr.write("ERROR WATCH_OPTIONS_REQUIRE_WATCH_MODE\n")
         return 1
     applying = args.apply_reply_file is not None or args.apply_post_file is not None
     if (args.review or applying) and not _private_terminal_available(require_input=applying):
@@ -695,6 +807,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         session = RecruitmentSession(root)
         inbound_owner = args.inbound_owner_username
         inbound_cap = _inbound_thread_cap(args.inbound_thread_cap)
+        result: RecruitmentSessionResult | None = None
+        watch_result: WatchRunResult | None = None
         if args.validate:
             result = session.validate(
                 args.account,
@@ -709,6 +823,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = asyncio.run(
                 session.observe(
                     args.account,
+                    inbound_owner_username=inbound_owner,
+                    inbound_thread_cap=inbound_cap,
+                )
+            )
+        elif args.watch_observe:
+            watch_result = asyncio.run(
+                session.watch_observe(
+                    args.account,
+                    interval_minutes=(
+                        DEFAULT_WATCH_INTERVAL_MINUTES
+                        if args.interval_minutes is None
+                        else args.interval_minutes
+                    ),
+                    max_cycles=args.max_cycles,
                     inbound_owner_username=inbound_owner,
                     inbound_thread_cap=inbound_cap,
                 )
@@ -756,6 +884,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
     except RecruitmentSessionError as error:
+        if args.watch_observe:
+            sys.stdout.write(f"watch shutdown status=STOP cycles=0 reason={error.code}\n")
+            return 1
         sys.stderr.write(f"ERROR {error.code}\n")
         return 1
     except (
@@ -764,6 +895,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         NurtureDraftError,
         NurtureContentError,
     ) as error:
+        if args.watch_observe:
+            sys.stdout.write(f"watch shutdown status=STOP cycles=0 reason={_error_code(error)}\n")
+            return 1
         sys.stderr.write(f"ERROR {_error_code(error)}\n")
         return 1
     except KeyboardInterrupt:
@@ -771,6 +905,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:  # noqa: BLE001 — never echo paths, remote data, or secret details.
         sys.stderr.write("ERROR SESSION_FAILED\n")
         return 1
+    if args.watch_observe:
+        assert watch_result is not None
+        if watch_result.status == "STOP":
+            return 1
+        if watch_result.status == "INTERRUPTED":
+            return 130
+        return 0
+    assert result is not None
     sys.stdout.write(_format_result(result))
     return 1 if result.mode is RecruitmentSessionMode.PREFLIGHT and result.status == "STOP" else 0
 
