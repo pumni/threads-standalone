@@ -38,6 +38,8 @@ threads-local recurrence run SYNTHETIC_RECURRENCE_UUID
 threads-local recurrence disable SYNTHETIC_RECURRENCE_UUID
 ```
 
+Recruitment sessions provide foreground `validate`, `observe`, private `review`, and single-effect `apply` phases. See [Recruitment session phases](docs/RECRUITMENT_SESSION.md) for their read/write boundaries and the ephemeral inbound owner options.
+
 Post, reply, media, carousel, and moderation commands can cause remote side effects when an operator runs them with real credentials. Each mutation uses the local v1 operation journal and account process lock; an ambiguous result is recorded for review and is never retried automatically. Quote publishing is available through the runtime contract and is not exposed as a direct CLI command. See [MUTATION_PARITY.md](docs/MUTATION_PARITY.md) for the journal and failure behavior.
 
 Nurture observe is read-only and API-only: it constructs neither the browser runtime nor a mutation runtime. It records bounded receipts and fingerprints under the local data root. A Nurture reply, text post or quote requires `--apply` and a valid operator-authored draft/candidate bound to the selected target or preset. The runner durably reserves state before at most one SPLIT-04 journaled mutation and does not retry an ambiguous or published target. With no actionable draft, the command may return a recommendation, but performs no mutation. Insights refresh is explicit, read-only, and limited to content verified through a `PUBLISHED` operation journal entry. See [NURTURE_PARITY.md](docs/NURTURE_PARITY.md) for schemas, fingerprints, test mapping and the historical evidence boundary.
