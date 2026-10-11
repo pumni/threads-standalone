@@ -177,3 +177,92 @@ tests import the watch helper from the independently installed `threads_platform
 | Phase timeout and cancellation during read/between cycles; restart and per-account lock behavior | `tests/test_recruitment_watch.py::test_watch_phase_timeout_stops_without_fast_retry`; `test_cancel_between_cycles_reports_interruption_and_does_not_start_next_cycle`; `test_watch_lock_is_per_account_and_restart_keeps_lock_file`; `test_cancelled_read_releases_account_guard_and_other_account_progresses`; `tests/test_recruitment_e2e.py::test_watch_cancellation_persists_interrupted_receipt_and_allows_restart` |
 | Missing root, malformed v1 state, synthetic path rejection/full disk, and privacy | `tests/test_recruitment_e2e.py::test_real_script_watch_missing_root_stops_without_creating_it`; `test_real_script_watch_malformed_v1_state_fails_closed`; `test_real_script_watch_synthetic_full_disk_failure_stops_safely`; `tests/test_recruitment_watch.py::test_watch_lock_path_error_fails_closed_without_cleanup`; `test_real_script_watch_runs_three_read_only_cycles_in_one_event_loop` |
 | The helper imports from an installed wheel while the entry script remains source-only | `tests/test_recruitment_watch.py::test_watch_module_comes_from_installed_wheel_in_wheel_smoke`; `tests/test_recruitment_e2e.py::test_real_script_validate_is_zero_write_and_proves_wheel_import_provenance`; Windows/Ubuntu installed-wheel CI. |
+
+## AO-02 stability and synthetic demo
+
+Run the source-only synthetic demo with one command from the repository root:
+
+```powershell
+uv run --locked python scripts/demo_recruitment_watch.py --cycles 3
+```
+
+`--cycles` defaults to 3 and accepts 1–1,000. The demo creates one fresh temporary root, adds an
+account with no credential reference, and replaces the RecruitmentSession app factory for the
+duration of the run with a fake identity/quota/search API. The fake factory accepts only API reads;
+it rejects mutation or browser runtimes, and the fake runtime has no mutation methods. The temporary
+root is resolved to its canonical path for NurtureStore validation and is removed on exit. The demo
+does not inspect `THREADS_LOCAL_DATA_ROOT`, read a token from the environment, or support a live
+backend switch. If the fake factory were bypassed, the credentialless account fails before a live
+API request can be authenticated.
+
+The fake clock advances by the production minimum interval of 15 minutes without waiting. This does
+not lower or change the minimum interval accepted by `scripts/run_recruitment.py --watch-observe`.
+The synthetic identity, the repeated candidate, and its text are never printed or stored in the v1
+receipt/state; only bounded counts and decision codes appear. `credential=verified` in the preflight
+line means the fake identity responded, while the demo start/safety lines declare that no credential
+was configured.
+
+Example from `--cycles 3` (receipt UUIDs and temporary root are intentionally omitted):
+
+```text
+demo start backend=FAKE identity=FAKE cycles=3 credential_source=NONE data_root=TEMPORARY interval_minutes=15 sleeper=FAKE
+watch preflight status=OBSERVED credential=verified post_quota=available reply_quota=available
+watch cycle=1 at=2026-10-11T00:00:00+00:00 status=SUCCESS outcome=SUCCESS discovered=1 deduped=1 selected=1 skipped=0 decisions=OBSERVE_ONLY inbound=INBOUND_NOT_CONFIGURED
+watch cycle=2 at=2026-10-11T00:15:00+00:00 status=SUCCESS outcome=SUCCESS discovered=1 deduped=1 selected=0 skipped=1 decisions=NO_ACTION inbound=INBOUND_NOT_CONFIGURED
+watch cycle=3 at=2026-10-11T00:30:00+00:00 status=SUCCESS outcome=SUCCESS discovered=1 deduped=1 selected=0 skipped=1 decisions=NO_ACTION inbound=INBOUND_NOT_CONFIGURED
+watch shutdown status=COMPLETED cycles=3
+demo storage cycles=3 receipts=3 receipt_bytes=1707 target_state_bytes=530 fake_wait_seconds=1800
+demo safety mutation_runtime=DISABLED remote_mutations=0 credentials=NONE
+```
+
+`discovered` is the candidate count before deduplication; `deduped` is the current run's unique
+candidate count. In the example, the previously seen candidate remains visible in the counts but is
+not selected again during its cooldown. The demo runs the same `RecruitmentSession.watch_observe`,
+`RecruitmentSession.observe`, `NurtureRunner`, and `NurtureStore` receipt/state path as the
+foreground watcher.
+
+The watcher holds one account-scoped process lock for the whole foreground run, and Nurture keeps
+its per-cycle account lock. A timeout, failed read, unsafe state, invalid output, or preflight STOP
+ends the watcher without a retry loop. Ctrl+C and task cancellation during a read or fake/real sleep
+release the watcher lock; a cancelled Nurture run has its existing v1 `INTERRUPTED` receipt and can
+be restarted. The demo is finite and does not install a daemon or scheduler.
+
+Stability evidence samples `tracemalloc` retained bytes at 3, 10, 100, and 1,000 coordinator cycles.
+The process loop keeps a scalar cycle count and the current observation; it does not retain prior
+cycle payloads. Separate end-to-end synthetic runs at 3, 10, and 100 cycles report completed
+receipt count/bytes and target-state bytes. Nurture persists one v1 receipt per cycle, so receipt
+files and their total bytes grow linearly; AO-02 does not prune or change v1 retention semantics.
+The repeated target state stays one record in these measurements. These measurements characterize
+the synthetic run and do not claim an RSS bound or long-term disk-retention policy.
+
+| Synthetic cycles | Completed receipts | Receipt bytes | Target-state bytes |
+| ---: | ---: | ---: | ---: |
+| 3 | 3 | 1,707 | 530 |
+| 10 | 10 | 5,683 | 530 |
+| 100 | 100 | 56,803 | 530 |
+
+`scripts/demo_recruitment_watch.py` and `scripts/run_recruitment.py` are source repository scripts,
+not wheel entry points. `threads_platform.standalone.recruitment_watch` and the session/Nurture code
+are in the installed wheel; installed-wheel CI verifies their `site-packages` import provenance.
+This demonstration does not verify real credentials, API behavior, operator filesystem permissions,
+or real Threads uptime. Issues #2 and #18 remain open, and RS-06 (#25) remains HOLD. Production
+`--validate`, `--preflight`, `--observe`, `--review`, and `--apply-*` modes, v1 state, Workflow's
+terminal mutation rule, and READ-only Recurrence are unchanged.
+
+| AO-02 stability scenario | Synthetic evidence |
+| --- | --- |
+| 1. Three, ten, one hundred, and many watch cycles use fake time | `tests/test_recruitment_watch_stability.py::test_demo_reports_receipt_and_target_state_growth_by_cycle_count`; `test_watch_coordinator_retained_tracemalloc_stays_bounded_for_1000_cycles` |
+| 2. Repeated candidates obey dedupe/cooldown | The one-command demo test; `tests/test_recruitment_e2e.py::test_real_script_watch_runs_three_read_only_cycles_in_one_event_loop` |
+| 3. No cycle payload accumulation; receipt/state bytes are measured by cycle count | `tests/test_recruitment_watch_stability.py::test_watch_coordinator_retained_tracemalloc_stays_bounded_for_1000_cycles`; `test_demo_reports_receipt_and_target_state_growth_by_cycle_count` |
+| 4. Rate limit, timeout, expired credential, and unverified quota fail closed without busy-loop | `tests/test_recruitment_watch_stability.py::test_read_failures_stop_once_without_busy_loop`; `tests/test_recruitment_watch.py::test_watch_phase_timeout_stops_without_fast_retry`; E2E expired-credential and quota-STOP cases |
+| 5. Disconnect/read failure during a later cycle stops without retry | `tests/test_recruitment_watch_stability.py::test_read_failure_on_later_cycle_stops_without_retry_or_catch_up`; `tests/test_recruitment_e2e.py::test_real_script_watch_fails_closed_on_read_errors` |
+| 6. Ctrl+C during sleep and cancellation during observe | `tests/test_recruitment_watch_stability.py::test_ctrl_c_or_cancellation_stops_and_releases_watch_lock`; `tests/test_recruitment_watch.py::test_cancel_between_cycles_reports_interruption_and_does_not_start_next_cycle`; `test_cancelled_read_releases_account_guard_and_other_account_progresses` |
+| 7. Restart after interrupted receipt preserves old state and does not replay writes | `tests/test_recruitment_e2e.py::test_watch_cancellation_persists_interrupted_receipt_and_allows_restart`; `tests/test_recruitment_session.py::test_cancelled_observe_persists_interruption_and_can_restart` |
+| 8. Concurrent same-account watchers allow only one owner | `tests/test_recruitment_watch.py::test_watch_lock_is_per_account_and_restart_keeps_lock_file`; `test_cancelled_read_releases_account_guard_and_other_account_progresses` |
+| 9. Different accounts progress independently | `tests/test_recruitment_watch.py::test_cancelled_read_releases_account_guard_and_other_account_progresses`; `tests/test_recruitment_session.py::test_account_lock_contention_isolated_to_that_account` |
+| 10. Corrupt, missing, symlink/reparse, permission, and full-disk cases stop safely using temporary-root/injected failures | `tests/test_recruitment_e2e.py::test_real_script_watch_missing_root_stops_without_creating_it`; `test_real_script_watch_malformed_v1_state_fails_closed`; `test_real_script_watch_synthetic_full_disk_failure_stops_safely`; `tests/test_cross_platform_state.py::test_account_state_symlink_to_outside_root_fails_closed`; `tests/test_recruitment_watch.py::test_watch_lock_path_error_fails_closed_without_cleanup` |
+| 11. Preflight STOP prevents the first observation | `tests/test_recruitment_watch.py::test_preflight_stop_and_read_failure_never_retry`; `tests/test_recruitment_e2e.py::test_real_script_watch_quota_stop_prevents_first_cycle` |
+| 12. No mutation runtime, POST, AI draft, or synthetic approval in the demo | `tests/test_recruitment_watch_stability.py::test_demo_is_a_one_command_synthetic_read_only_run`; `tests/test_recruitment_e2e.py::test_real_script_watch_runs_three_read_only_cycles_in_one_event_loop` |
+| 13. Token, identity, target, content, response, and path do not leak to terminal output | The one-command demo test; `tests/test_recruitment_e2e.py::test_real_script_watch_runs_three_read_only_cycles_in_one_event_loop`; `tests/test_recruitment_watch.py::test_watch_lock_path_error_fails_closed_without_cleanup` |
+| 14. Existing production CLI modes remain mutually exclusive and unchanged | `tests/test_recruitment_e2e.py::test_real_script_watch_help_and_mode_exclusivity`; `tests/test_recruitment_session.py::test_cli_requires_exactly_one_session_or_apply_mode` |
+| 15. v1 schema, Workflow terminal mutation rule, READ-only Recurrence, and source/wheel provenance remain intact | Full synthetic CI suite; `tests/test_recruitment_watch.py::test_watch_module_comes_from_installed_wheel_in_wheel_smoke`; `tests/test_recruitment_e2e.py::test_real_script_validate_is_zero_write_and_proves_wheel_import_provenance`; Windows/Ubuntu installed-wheel tests. |
