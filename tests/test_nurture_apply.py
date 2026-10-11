@@ -1227,7 +1227,7 @@ async def test_quote_binding_revalidates_exact_discovery_target_and_never_conver
             )
         assert caught.value.code == "NURTURE_QUOTE_TARGET_MISMATCH"
         assert mutations.quote_calls == []
-        assert not any(call[0] == "mentions" for call in api.calls)
+        assert any(call[0] == "mentions" for call in api.calls)
         assert not any(call[0] == "search" for call in api.calls)
     else:
         result = await _run_quote_apply(
