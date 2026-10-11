@@ -480,3 +480,55 @@ only hard-coded synthetic data.
 | Advisory has bounded safe codes and hides candidate, reply, and fingerprint in repr | `test_synthetic_quality_advisory_updates_without_claiming_quality_or_approval`; installed-wheel suite |
 | Warning appears before the keep action; keeping remains session-only and nonbinding | `test_editor_quality_warning_precedes_nonblocking_flagged_keep`; `test_demo_source_script_runs_one_command_with_fake_generator_only` |
 | Existing TTY, editor, proposal, production CLI, persistence, and mutation boundaries remain intact | `tests/test_recruitment_reply_proposal.py`; source-checkout Windows/Ubuntu CI |
+
+## AO-05A synthetic foreground journey
+
+Run the complete synthetic journey in one process with:
+
+```powershell
+uv run --locked python scripts/demo_recruitment_journey.py --scripted
+```
+
+The interactive variant is available only in a private foreground PowerShell terminal:
+
+```powershell
+uv run --locked python scripts/demo_recruitment_journey.py --interactive
+```
+
+The interactive command rejects CI, pytest, and streams without a TTY before creating the
+temporary account root or fake API. It performs one existing foreground watch cycle with a fake
+clock and no real wait, then calls the existing fresh shortlist policy against the same fake API,
+account, temporary root, and Nurture v1 state. The watched synthetic candidate W is shown as
+`COOLDOWN / OBSERVE_ONLY` and cannot enter proposal generation. New synthetic candidate F is
+selected only when the fresh policy returns `ELIGIBLE / REVIEW_CANDIDATE`. The demo carries the
+same candidate object and fingerprint through `create_human_reply_preview` and the existing
+`HumanReplyEditorialSession` and quality advisory.
+
+In interactive mode choose the displayed candidate number, then use `E` to edit, `K` to keep in
+the current process session, or `D` to discard. A blank selection, invalid selection, EOF, Ctrl+C,
+invalid action, or rejected edit stops safely. The scripted path uses only fixed synthetic input;
+it edits a deliberately low-information answer, displays the updated advisory, and keeps the
+answer in memory until the process exits.
+
+Watch may write its existing synthetic run receipt, Nurture v1 target state, and lock files inside
+the temporary demo root. The fresh shortlist may create its existing account lock there. The demo
+reports receipt/state byte counts without printing paths. Candidate text, proposals, edited replies,
+quality advisories, and editorial disposition are never persisted. All paths end with
+`NOT_APPROVED_FOR_SENDING`, `NOT_SENT`, `DRAFT_PERSISTED=NO`, and `remote_mutations=0`. Keeping the
+answer is not consent, an approval token, or a send action.
+
+| AO-05A acceptance | Synthetic evidence |
+| --- | --- |
+| Fake watch completes without credential or wall-clock waiting and writes the existing receipt/state | `tests/test_recruitment_journey.py::test_watch_cooldown_blocks_w_and_fresh_candidate_stays_exactly_bound`; one-command source demo |
+| Fresh shortlist suppresses watched W via existing cooldown and offers F only when eligible | `test_watch_cooldown_blocks_w_and_fresh_candidate_stays_exactly_bound`; `test_no_eligible_candidate_never_calls_fake_generator` |
+| Target replacement, fingerprint change, and ineligible selection are rejected before proposal | `test_displayed_fingerprint_detects_replaced_or_changed_target`; watched-candidate proposal rejection in `test_watch_cooldown_blocks_w_and_fresh_candidate_stays_exactly_bound` |
+| Preflight, watch read, and fresh shortlist failures stop without later proposal work | `test_watch_preflight_or_fresh_shortlist_failure_stops_safely` |
+| Edit, quality advisory, keep, discard, cancel, invalid selection, and no persistence/mutation | `test_interactive_keep_discard_and_quality_advisory_are_session_only`; `test_ctrl_c_and_invalid_selection_never_create_proposal`; source demo persistence guard |
+| Interactive CI, GITHUB_ACTIONS, pytest, and redirected-stream rejection precedes setup | `test_interactive_guard_rejects_unsafe_context_before_root_account_or_api` |
+| AO-01 through AO-04C production and package contracts remain covered | Existing recruitment session, watch stability, shortlist, and reply proposal suites; hosted full Windows/Ubuntu suite |
+
+The journey demo is source-only and is not part of the installed wheel. Its interactive output is
+for the private terminal only; scripted output contains hard-coded synthetic data and is intended
+for CI. It adds no production CLI mode, ranking/cooldown policy, schema, journal, approval token,
+AI call, remote mutation, scheduler, or daemon. Threads/Meta behavior and live-account UAT remain
+unverified.
