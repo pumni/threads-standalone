@@ -17,11 +17,16 @@ from threads_platform.standalone.mutations import (
     PublishedTextResult,
     StandaloneMutationError,
 )
-from threads_platform.standalone.nurture import NurturePresetV1, nurture_quote_allowed
+from threads_platform.standalone.nurture import (
+    AccountNurtureInboundConfig,
+    NurturePresetV1,
+    nurture_quote_allowed,
+)
 from threads_platform.standalone.nurture_content import ContentCandidateV1
 from threads_platform.standalone.nurture_conversations import (
     NurtureConversationError,
     NurtureInboundCandidate,
+    NurtureInboundStatus,
     collect_nurture_inbound,
 )
 from threads_platform.standalone.nurture_discovery import (
@@ -62,6 +67,7 @@ _SAFE_RUNNER_CODES = frozenset(
         "INVALID_SEARCH_TYPE",
         "INVALID_THREAD_ID",
         "INVALID_USERNAME",
+        "INBOUND_CONFIGURATION_INVALID",
         "LOCAL_OPERATION_UNAVAILABLE",
         "NURTURE_BUSY",
         "NURTURE_DRAFT_TARGET_MISMATCH",
@@ -118,13 +124,15 @@ class NurtureRunResult:
     receipt: NurtureRunV1
     target_fingerprint: str | None
     content_candidate_id: UUID | None = None
+    inbound_status: NurtureInboundStatus = NurtureInboundStatus.NOT_CONFIGURED
 
     def __repr__(self) -> str:
         return (
             "NurtureRunResult("
             f"run_id={self.receipt.id}, outcome={self.receipt.outcome}, "
             f"target_fingerprint={self.target_fingerprint or '-'}, "
-            f"content_candidate_id={self.content_candidate_id or '-'})"
+            f"content_candidate_id={self.content_candidate_id or '-'}, "
+            f"inbound_status={self.inbound_status.value})"
         )
 
 
@@ -134,6 +142,7 @@ class _NurtureSelection:
     target_by_fingerprint: dict[str, NurtureTargetV1]
     discovered_count: int
     deduped_count: int
+    inbound_status: NurtureInboundStatus
 
 
 class NurtureRunnerError(Exception):
@@ -186,6 +195,7 @@ class NurtureRunner:
         quote_draft: NurtureQuoteDraft | None = None,
         content_candidate: ContentCandidateV1 | None = None,
         mutations: LocalThreadsMutationRuntime | None = None,
+        inbound_config: AccountNurtureInboundConfig | None = None,
     ) -> NurtureRunV1:
         return (
             await self.run_with_selection(
@@ -197,6 +207,7 @@ class NurtureRunner:
                 quote_draft=quote_draft,
                 content_candidate=content_candidate,
                 mutations=mutations,
+                inbound_config=inbound_config,
             )
         ).receipt
 
@@ -211,11 +222,14 @@ class NurtureRunner:
         quote_draft: NurtureQuoteDraft | None = None,
         content_candidate: ContentCandidateV1 | None = None,
         mutations: LocalThreadsMutationRuntime | None = None,
+        inbound_config: AccountNurtureInboundConfig | None = None,
     ) -> NurtureRunResult:
         if type(account) is not LocalAccount or type(account.id) is not UUID:
             raise NurtureRunnerError("RUN_FAILED")
         if type(preset) is not NurturePresetV1:
             raise NurtureRunnerError("PRESET_NOT_FOUND")
+        if inbound_config is not None and type(inbound_config) is not AccountNurtureInboundConfig:
+            raise NurtureRunnerError("INBOUND_CONFIGURATION_INVALID")
         if type(apply_requested) is not bool:
             raise NurtureRunnerError("RUN_FAILED")
         if draft is not None and type(draft) is not NurtureDraft:
@@ -265,6 +279,7 @@ class NurtureRunner:
                         quote_draft=quote_draft,
                         content_candidate=content_candidate,
                         mutations=mutations,
+                        inbound_config=inbound_config,
                     )
                 except KeyboardInterrupt:
                     raise NurtureRunnerInterrupted(run_id) from None
@@ -287,6 +302,7 @@ class NurtureRunner:
         quote_draft: NurtureQuoteDraft | None,
         content_candidate: ContentCandidateV1 | None,
         mutations: LocalThreadsMutationRuntime | None,
+        inbound_config: AccountNurtureInboundConfig | None,
     ) -> NurtureRunResult:
         run_id = scope.receipt.id
         stage = "selection"
@@ -300,6 +316,7 @@ class NurtureRunner:
                     now,
                     draft,
                     quote_draft,
+                    inbound_config,
                 )
                 chosen = selection.candidate
                 selected_count = 1 if chosen is not None else 0
@@ -382,7 +399,9 @@ class NurtureRunner:
                         scope.link_operation(result.operation_id)
                         scope.update(replied_count=1, decision_codes=("REPLY_APPLIED",))
                         return NurtureRunResult(
-                            scope.finish("SUCCESS", now=now), selected_fingerprint
+                            scope.finish("SUCCESS", now=now),
+                            selected_fingerprint,
+                            inbound_status=selection.inbound_status,
                         )
 
                     stage = "observe"
@@ -398,7 +417,11 @@ class NurtureRunner:
                         raise NurtureStateError("NURTURE_STATE_INVALID")
                     if observed.action_state not in {"NONE", "CONFIRMED"}:
                         raise NurtureStateError("NURTURE_STATE_INVALID")
-                    return NurtureRunResult(scope.finish("SUCCESS", now=now), selected_fingerprint)
+                    return NurtureRunResult(
+                        scope.finish("SUCCESS", now=now),
+                        selected_fingerprint,
+                        inbound_status=selection.inbound_status,
+                    )
 
                 if content_candidate is None:
                     stage = "receipt"
@@ -412,7 +435,11 @@ class NurtureRunner:
                         skipped_count=selection.deduped_count,
                         decision_codes=("NO_ACTION",),
                     )
-                    return NurtureRunResult(scope.finish("SUCCESS", now=now), None)
+                    return NurtureRunResult(
+                        scope.finish("SUCCESS", now=now),
+                        None,
+                        inbound_status=selection.inbound_status,
+                    )
 
                 stage = "content_policy"
                 record = owner.register_content_candidate(
@@ -452,12 +479,14 @@ class NurtureRunner:
                         scope.finish("SUCCESS", now=now),
                         None,
                         record.candidate_id,
+                        selection.inbound_status,
                     )
                 if not apply_requested:
                     return NurtureRunResult(
                         scope.finish("SUCCESS", now=now),
                         None,
                         record.candidate_id,
+                        selection.inbound_status,
                     )
 
                 stage = "policy"
@@ -501,7 +530,12 @@ class NurtureRunner:
                 )
                 scope.link_operation(result.operation_id)
                 scope.update(published_count=1, decision_codes=("CONTENT_PUBLISHED",))
-                return NurtureRunResult(scope.finish("SUCCESS", now=now), None, record.candidate_id)
+                return NurtureRunResult(
+                    scope.finish("SUCCESS", now=now),
+                    None,
+                    record.candidate_id,
+                    selection.inbound_status,
+                )
             except KeyboardInterrupt, asyncio.CancelledError:
                 raise
             except NurtureDiscoveryError as error:
@@ -610,7 +644,11 @@ class NurtureRunner:
         )
         scope.link_operation(result.operation_id)
         scope.update(published_count=1, decision_codes=("QUOTE_PUBLISHED",))
-        return NurtureRunResult(scope.finish("SUCCESS", now=now), fingerprint)
+        return NurtureRunResult(
+            scope.finish("SUCCESS", now=now),
+            fingerprint,
+            inbound_status=selection.inbound_status,
+        )
 
     async def _select_current_candidate(
         self,
@@ -620,6 +658,7 @@ class NurtureRunner:
         now: datetime,
         draft: NurtureDraft | None,
         quote_draft: NurtureQuoteDraft | None,
+        inbound_config: AccountNurtureInboundConfig | None,
     ) -> _NurtureSelection:
         state = NurtureTargetStateV1(
             version=1,
@@ -647,7 +686,7 @@ class NurtureRunner:
             if bound_target is not None and bound_target.action_state != "NONE":
                 raise NurtureRunnerError("NURTURE_QUOTE_TARGET_MISMATCH")
 
-        inbound = await collect_nurture_inbound(self._api, account.alias, preset)
+        inbound = await collect_nurture_inbound(self._api, account.alias, preset, inbound_config)
         chosen = next(
             (
                 candidate
@@ -720,7 +759,7 @@ class NurtureRunner:
                 chosen is None or chosen.fingerprint != quote_draft.target_fingerprint
             ):
                 raise NurtureRunnerError("NURTURE_QUOTE_TARGET_MISMATCH")
-        return _NurtureSelection(chosen, targets, discovered_count, deduped_count)
+        return _NurtureSelection(chosen, targets, discovered_count, deduped_count, inbound.status)
 
 
 def _capture_utc(value: datetime | None) -> datetime:

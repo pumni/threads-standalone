@@ -508,7 +508,8 @@ def _format_nurture_run(
     return (
         f"nurture run={run.id} account={account.alias} preset={preset.id} "
         f"outcome={run.outcome} discovered={run.discovered_count} "
-        f"selected={run.selected_count} decision={decision}{target}{candidate}\n"
+        f"selected={run.selected_count} decision={decision} "
+        f"inbound={result.inbound_status.value}{target}{candidate}\n"
     )
 
 

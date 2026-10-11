@@ -17,6 +17,7 @@ import threads_platform.standalone.__main__ as cli_module
 from threads_platform.api.contracts import (
     DiscoveryPage,
     PublishingQuota,
+    RemoteAuthenticatedProfile,
     RemoteDiscoveryThread,
     RemoteReply,
     ReplyPage,
@@ -32,6 +33,7 @@ from threads_platform.standalone.mutations import (
 )
 from threads_platform.standalone.nurture import (
     NurturePresetV1,
+    build_account_nurture_inbound_config,
     get_nurture_preset,
     nurture_quote_allowed,
 )
@@ -140,6 +142,10 @@ class _Api:
         self.calls.append(("conversation", alias, thread_id, after))
         return self.conversations.get(thread_id, ReplyPage((), "reply cursor sentinel", True))
 
+    async def authenticated_profile(self, alias: str) -> RemoteAuthenticatedProfile:
+        self.calls.append(("authenticated_profile", alias))
+        return RemoteAuthenticatedProfile("synthetic_authenticated_id", "configured_owner")
+
     async def quota(self, alias: str) -> PublishingQuota:
         self.calls.append(("quota", alias))
         return self.quota_value
@@ -217,6 +223,16 @@ async def _run_apply(
         apply_requested=True,
         draft=draft,
         mutations=cast(LocalThreadsMutationRuntime, mutations),
+        inbound_config=(
+            None
+            if preset.owner_public_username is None
+            else build_account_nurture_inbound_config(
+                preset,
+                account.alias,
+                preset.owner_public_username,
+                preset.max_owned_threads_inspected_per_explicit_run,
+            )
+        ),
     )
 
 
@@ -235,6 +251,16 @@ async def _run_quote_apply(
         apply_requested=True,
         quote_draft=quote_draft,
         mutations=cast(LocalThreadsMutationRuntime, mutations),
+        inbound_config=(
+            None
+            if preset.owner_public_username is None
+            else build_account_nurture_inbound_config(
+                preset,
+                account.alias,
+                preset.owner_public_username,
+                preset.max_owned_threads_inspected_per_explicit_run,
+            )
+        ),
     )
 
 

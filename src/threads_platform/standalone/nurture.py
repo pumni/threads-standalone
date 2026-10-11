@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from typing import cast
 
 _PRESET_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_ACCOUNT_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _PUBLIC_USERNAME = re.compile(r"[A-Za-z0-9._]{1,30}\Z")
 _MAX_COOLDOWN_SECONDS = 31_536_000
 
@@ -21,6 +23,84 @@ class NurturePresetError(ValueError):
             raise ValueError("invalid nurture preset error code")
         self.code = code
         super().__init__(code)
+
+
+class NurtureInboundConfigError(ValueError):
+    """A bounded, data-safe account-scoped inbound configuration error."""
+
+    code = "INBOUND_CONFIGURATION_INVALID"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class AccountNurtureInboundConfig:
+    """Ephemeral inbound settings bound to one local alias and preset."""
+
+    account_alias: str = dataclass_field(repr=False)
+    preset_id: str = dataclass_field(repr=False)
+    owner_public_username: str = dataclass_field(repr=False)
+    max_owned_threads_inspected_per_explicit_run: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.account_alias) is not str
+            or _ACCOUNT_ALIAS.fullmatch(self.account_alias) is None
+            or type(self.preset_id) is not str
+            or _PRESET_ID.fullmatch(self.preset_id) is None
+            or type(self.owner_public_username) is not str
+            or _PUBLIC_USERNAME.fullmatch(self.owner_public_username) is None
+            or type(self.max_owned_threads_inspected_per_explicit_run) is not int
+            or not 0 <= self.max_owned_threads_inspected_per_explicit_run <= 10
+        ):
+            raise NurtureInboundConfigError()
+
+    def __repr__(self) -> str:
+        return (
+            "AccountNurtureInboundConfig("
+            f"preset_id={self.preset_id!r}, "
+            "owner_username_configured=True, "
+            f"max_owned_threads={self.max_owned_threads_inspected_per_explicit_run})"
+        )
+
+
+def build_account_nurture_inbound_config(
+    preset: NurturePresetV1,
+    account_alias: object,
+    owner_public_username: object,
+    max_owned_threads_inspected_per_explicit_run: object,
+) -> AccountNurtureInboundConfig:
+    """Build a validated, non-persisted inbound override for exactly one account alias."""
+
+    if type(preset) is not NurturePresetV1:
+        raise NurtureInboundConfigError()
+    if (
+        type(account_alias) is not str
+        or _ACCOUNT_ALIAS.fullmatch(account_alias) is None
+        or type(owner_public_username) is not str
+        or _PUBLIC_USERNAME.fullmatch(owner_public_username) is None
+        or type(max_owned_threads_inspected_per_explicit_run) is not int
+    ):
+        raise NurtureInboundConfigError()
+    try:
+        validated = replace(
+            preset,
+            owner_public_username=owner_public_username,
+            max_owned_threads_inspected_per_explicit_run=(
+                max_owned_threads_inspected_per_explicit_run
+            ),
+        )
+    except NurturePresetError:
+        raise NurtureInboundConfigError() from None
+    return AccountNurtureInboundConfig(
+        account_alias=account_alias,
+        preset_id=validated.id,
+        owner_public_username=validated.owner_public_username or "",
+        max_owned_threads_inspected_per_explicit_run=(
+            validated.max_owned_threads_inspected_per_explicit_run
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True, repr=False)

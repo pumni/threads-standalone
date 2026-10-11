@@ -14,6 +14,7 @@ import threads_platform.standalone.__main__ as cli_module
 import threads_platform.standalone.nurture_runner as runner_module
 from threads_platform.api.contracts import (
     DiscoveryPage,
+    RemoteAuthenticatedProfile,
     RemoteDiscoveryThread,
     RemoteReply,
     ReplyPage,
@@ -21,14 +22,20 @@ from threads_platform.api.contracts import (
 from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
 from threads_platform.standalone.api import LocalThreadsApiRuntime
 from threads_platform.standalone.app import StandaloneAppContext
-from threads_platform.standalone.nurture import NurturePresetV1, get_nurture_preset
+from threads_platform.standalone.nurture import (
+    AccountNurtureInboundConfig,
+    NurturePresetV1,
+    build_account_nurture_inbound_config,
+    get_nurture_preset,
+)
+from threads_platform.standalone.nurture_conversations import NurtureInboundStatus
 from threads_platform.standalone.nurture_discovery import (
     NurtureCandidate,
     NurtureDiscoveryResult,
     NurtureDiscoverySource,
     NurtureSourceCallCounts,
 )
-from threads_platform.standalone.nurture_runner import NurtureRunner, NurtureRunnerError
+from threads_platform.standalone.nurture_runner import NurtureRunner
 from threads_platform.standalone.nurture_store import (
     NurtureStore,
     NurtureTargetV1,
@@ -40,6 +47,15 @@ _NOW = datetime(2026, 10, 7, 1, 30, tzinfo=UTC)
 _REPLY_TEXT = "RAW_REPLY_TEXT_SENTINEL"
 _THREAD_ID = "OWN_THREAD_ID_SENTINEL"
 _REPLY_ID = "REMOTE_REPLY_ID_SENTINEL"
+
+
+def _binding(account: LocalAccount, preset: NurturePresetV1) -> AccountNurtureInboundConfig:
+    return build_account_nurture_inbound_config(
+        preset,
+        account.alias,
+        "configured_owner",
+        preset.max_owned_threads_inspected_per_explicit_run,
+    )
 
 
 def _preset() -> NurturePresetV1:
@@ -93,15 +109,22 @@ class _Api:
         discovery_threads: tuple[RemoteDiscoveryThread, ...] = (),
         profile_failure: Exception | None = None,
         conversation_failure: Exception | None = None,
+        identity_username: str = "configured_owner",
     ) -> None:
         self.owned_threads = owned_threads
         self.reply_pages = reply_pages or {}
         self.discovery_threads = discovery_threads
         self.profile_failure = profile_failure
         self.conversation_failure = conversation_failure
+        self.identity_username = identity_username
+        self.identity_calls: list[str] = []
         self.profile_calls: list[tuple[str, str, str | None, int]] = []
         self.conversation_calls: list[tuple[str, str, str | None]] = []
         self.discovery_calls: list[tuple[str, str | None, int, str | None]] = []
+
+    async def authenticated_profile(self, alias: str) -> RemoteAuthenticatedProfile:
+        self.identity_calls.append(alias)
+        return RemoteAuthenticatedProfile("synthetic_authenticated_id", self.identity_username)
 
     async def profile_posts(
         self, alias: str, username: str, *, after: str | None, limit: int
@@ -190,9 +213,10 @@ async def test_proven_inbound_short_circuits_discovery_and_persists_only_fingerp
     )
 
     receipt = await NurtureRunner(cast(LocalThreadsApiRuntime, api), store).run(
-        account, preset, now=_NOW
+        account, preset, now=_NOW, inbound_config=_binding(account, preset)
     )
 
+    assert api.identity_calls == ["alice"]
     assert api.profile_calls == [("alice", "configured_owner", None, 2)]
     assert api.conversation_calls == [("alice", _THREAD_ID, None)]
     assert api.discovery_calls == []
@@ -212,6 +236,36 @@ async def test_proven_inbound_short_circuits_discovery_and_persists_only_fingerp
     persisted = _json_state(root)
     for sentinel in (_REPLY_TEXT, _REPLY_ID, _THREAD_ID, "configured_owner", "query_sentinel"):
         assert sentinel not in persisted
+
+
+@pytest.mark.asyncio
+async def test_binding_for_another_account_reports_not_ready_without_inbound_target(
+    tmp_path: Path,
+) -> None:
+    store, account, preset = _setup(tmp_path)
+    api = _Api(
+        owned_threads=(_thread(_THREAD_ID),),
+        reply_pages={
+            _THREAD_ID: ReplyPage(
+                (RemoteReply(_REPLY_ID, _REPLY_TEXT, _NOW.isoformat(), _THREAD_ID, None, False),),
+                None,
+                False,
+            )
+        },
+    )
+    wrong_binding = build_account_nurture_inbound_config(preset, "bob", "configured_owner", 2)
+
+    result = await NurtureRunner(cast(LocalThreadsApiRuntime, api), store).run_with_selection(
+        account, preset, now=_NOW, inbound_config=wrong_binding
+    )
+
+    assert result.inbound_status is NurtureInboundStatus.ACCOUNT_MISMATCH
+    assert result.receipt.decision_codes == ("NO_ACTION",)
+    assert api.identity_calls == []
+    assert api.profile_calls == []
+    assert api.conversation_calls == []
+    with store.acquire_account_lock(account.id) as owner:
+        assert owner.get_targets(preset) == ()
 
 
 def test_inbound_cli_output_omits_remote_reply_data(
@@ -260,7 +314,10 @@ def test_inbound_cli_output_omits_remote_reply_data(
 
     output = capsys.readouterr()
     assert output.err == ""
-    assert "decision=INBOUND_CANDIDATE" in output.out
+    assert "decision=NO_ACTION" in output.out
+    assert "inbound=INBOUND_NOT_CONFIGURED" in output.out
+    assert api.profile_calls == []
+    assert api.conversation_calls == []
     for sentinel in (_REPLY_TEXT, _REPLY_ID, _THREAD_ID, "configured_owner", "query_sentinel"):
         assert sentinel not in output.out + output.err
 
@@ -282,8 +339,11 @@ async def test_recently_observed_inbound_is_suppressed_then_discovery_runs_once(
     )
     runner = NurtureRunner(cast(LocalThreadsApiRuntime, api), store)
 
-    first = await runner.run(account, preset, now=_NOW)
-    second = await runner.run(account, preset, now=_NOW + timedelta(seconds=1))
+    binding = _binding(account, preset)
+    first = await runner.run(account, preset, now=_NOW, inbound_config=binding)
+    second = await runner.run(
+        account, preset, now=_NOW + timedelta(seconds=1), inbound_config=binding
+    )
 
     assert first.decision_codes == ("INBOUND_CANDIDATE",)
     assert second.outcome == "SUCCESS"
@@ -317,7 +377,7 @@ async def test_future_seen_reply_is_suppressed_conservatively(tmp_path: Path) ->
     )
 
     receipt = await NurtureRunner(cast(LocalThreadsApiRuntime, api), store).run(
-        account, preset, now=_NOW
+        account, preset, now=_NOW, inbound_config=_binding(account, preset)
     )
 
     assert receipt.outcome == "SUCCESS"
@@ -348,7 +408,7 @@ async def test_zero_seen_cooldown_allows_same_time_inbound_surface(tmp_path: Pat
     )
 
     receipt = await NurtureRunner(cast(LocalThreadsApiRuntime, api), store).run(
-        account, preset, now=_NOW
+        account, preset, now=_NOW, inbound_config=_binding(account, preset)
     )
 
     assert receipt.decision_codes == ("INBOUND_CANDIDATE",)
@@ -389,7 +449,7 @@ async def test_inbound_observation_preserves_confirmed_action_history(tmp_path: 
     )
 
     receipt = await NurtureRunner(cast(LocalThreadsApiRuntime, api), store).run(
-        account, preset, now=_NOW
+        account, preset, now=_NOW, inbound_config=_binding(account, preset)
     )
 
     assert receipt.decision_codes == ("INBOUND_CANDIDATE",)
@@ -414,19 +474,16 @@ async def test_configured_inbound_source_failure_fails_without_discovery_fallbac
         conversation_failure=RuntimeError("reply text/token sentinel"),
     )
 
-    with pytest.raises(NurtureRunnerError) as captured:
-        await NurtureRunner(cast(LocalThreadsApiRuntime, api), store).run(account, preset, now=_NOW)
+    result = await NurtureRunner(cast(LocalThreadsApiRuntime, api), store).run_with_selection(
+        account, preset, now=_NOW, inbound_config=_binding(account, preset)
+    )
 
-    assert captured.value.code == "DISCOVERY_SOURCE_FAILED"
-    assert captured.value.run_id is not None
-    assert api.discovery_calls == []
+    assert result.inbound_status is NurtureInboundStatus.READ_FAILED
+    assert result.receipt.outcome == "SUCCESS"
+    assert result.receipt.decision_codes == ("NO_ACTION",)
+    assert [call[0] for call in api.discovery_calls] == ["mentions", "search"]
     assert api.conversation_calls == [("alice", _THREAD_ID, None)]
-    with store.acquire_account_lock(account.id) as owner:
-        assert captured.value.run_id is not None
-        receipt = owner.get_run(captured.value.run_id)
-    assert receipt.outcome == "FAILED"
-    assert receipt.failed_stage == "conversation"
-    assert "reply text" not in str(captured.value)
+    assert "reply text" not in repr(result)
 
 
 def _shortlist() -> tuple[NurtureCandidate, ...]:
@@ -494,7 +551,7 @@ async def test_runner_partitions_bounded_shortlist_and_preserves_group_order(
     )
 
     receipt = await NurtureRunner(cast(LocalThreadsApiRuntime, api), store).run(
-        account, preset, now=_NOW
+        account, preset, now=_NOW, inbound_config=_binding(account, preset)
     )
 
     assert calls == 1

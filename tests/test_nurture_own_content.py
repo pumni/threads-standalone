@@ -15,6 +15,7 @@ import threads_platform.standalone.__main__ as cli_module
 from threads_platform.api.contracts import (
     DiscoveryPage,
     PublishingQuota,
+    RemoteAuthenticatedProfile,
     RemoteDiscoveryThread,
     RemoteReply,
     ReplyPage,
@@ -26,7 +27,11 @@ from threads_platform.standalone.mutations import (
     PublishedTextResult,
     StandaloneMutationError,
 )
-from threads_platform.standalone.nurture import NurturePresetV1, get_nurture_preset
+from threads_platform.standalone.nurture import (
+    NurturePresetV1,
+    build_account_nurture_inbound_config,
+    get_nurture_preset,
+)
 from threads_platform.standalone.nurture_content import ContentCandidateV1, ContentCategory
 from threads_platform.standalone.nurture_runner import (
     NurtureRunner,
@@ -127,6 +132,10 @@ class _Api:
         self.calls.append(("conversation", alias, thread_id, after))
         return self.conversations.get(thread_id, ReplyPage((), "ignored-reply-cursor", True))
 
+    async def authenticated_profile(self, alias: str) -> RemoteAuthenticatedProfile:
+        self.calls.append(("authenticated_profile", alias))
+        return RemoteAuthenticatedProfile("synthetic_authenticated_id", "configured_owner")
+
     async def mentions(self, alias: str, *, after: str | None, limit: int) -> DiscoveryPage:
         self.calls.append(("mentions", alias, after, limit))
         if self.fail_mentions:
@@ -199,6 +208,16 @@ async def _run(
         apply_requested=apply,
         content_candidate=candidate,
         mutations=cast(LocalThreadsMutationRuntime, mutations) if apply else None,
+        inbound_config=(
+            None
+            if preset.owner_public_username is None
+            else build_account_nurture_inbound_config(
+                preset,
+                account.alias,
+                preset.owner_public_username,
+                preset.max_owned_threads_inspected_per_explicit_run,
+            )
+        ),
     )
 
 
@@ -374,6 +393,7 @@ async def test_proven_inbound_reply_outranks_content_and_short_circuits_discover
     assert result.receipt.outcome == "SUCCESS"
     assert result.receipt.decision_codes == ("INBOUND_CANDIDATE",)
     assert api.calls == [
+        ("authenticated_profile", "alice"),
         ("profile_posts", "alice", "configured_owner", None, 1),
         ("conversation", "alice", root_id, None),
     ]

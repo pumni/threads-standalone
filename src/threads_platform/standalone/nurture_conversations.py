@@ -5,15 +5,20 @@ from __future__ import annotations
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 
 from threads_platform.api.contracts import (
     DiscoveryPage,
+    RemoteAuthenticatedProfile,
     RemoteDiscoveryThread,
     RemoteReply,
     ReplyPage,
 )
 from threads_platform.standalone.api import LocalThreadsApiRuntime
-from threads_platform.standalone.nurture import NurturePresetV1
+from threads_platform.standalone.nurture import (
+    AccountNurtureInboundConfig,
+    NurturePresetV1,
+)
 from threads_platform.standalone.nurture_store import (
     NurtureStateError,
     fingerprint_remote_reply,
@@ -48,6 +53,19 @@ _PROFILE_STAGE = "profile_posts"
 _CONVERSATION_STAGE = "conversation"
 
 
+class NurtureInboundStatus(StrEnum):
+    """Safe status for the optional account-owned inbound capability."""
+
+    READY = "INBOUND_READY"
+    NOT_CONFIGURED = "INBOUND_NOT_CONFIGURED"
+    ACCOUNT_MISMATCH = "INBOUND_ACCOUNT_MISMATCH"
+    OWNERSHIP_MISMATCH = "INBOUND_OWNERSHIP_MISMATCH"
+    OWNERSHIP_UNVERIFIED = "INBOUND_OWNERSHIP_UNVERIFIED"
+    PERMISSION_MISSING = "INBOUND_PERMISSION_MISSING"
+    READ_FAILED = "INBOUND_READ_FAILED"
+    CONFIGURATION_INVALID = "INBOUND_CONFIGURATION_INVALID"
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class NurtureInboundCandidate:
     """An ephemeral proven reply with repr-hidden IDs for explicit apply only."""
@@ -67,17 +85,18 @@ class NurtureInboundCandidate:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class NurtureInboundResult:
-    """Bounded reply counts and ordered proven candidates from one own-thread scan."""
+    """Bounded reply counts, readiness and ordered proven candidates."""
 
     discovered_count: int
     deduped_count: int
     candidates: tuple[NurtureInboundCandidate, ...]
+    status: NurtureInboundStatus = NurtureInboundStatus.NOT_CONFIGURED
 
     def __repr__(self) -> str:
         return (
             "NurtureInboundResult("
             f"discovered_count={self.discovered_count}, deduped_count={self.deduped_count}, "
-            f"candidate_count={len(self.candidates)})"
+            f"candidate_count={len(self.candidates)}, status={self.status.value})"
         )
 
 
@@ -103,13 +122,30 @@ async def collect_nurture_inbound(
     api: LocalThreadsApiRuntime,
     account_alias: str,
     preset: NurturePresetV1,
+    inbound_config: AccountNurtureInboundConfig | None = None,
 ) -> NurtureInboundResult:
-    """Read one owner-profile page and one conversation page per selected own Thread."""
+    """Read replies only after the alias token proves the configured owner identity."""
 
-    owner_username = preset.owner_public_username
-    maximum_threads = preset.max_owned_threads_inspected_per_explicit_run
-    if owner_username is None or maximum_threads == 0:
-        return NurtureInboundResult(0, 0, ())
+    if inbound_config is None:
+        return _empty_result(NurtureInboundStatus.NOT_CONFIGURED)
+    if type(inbound_config) is not AccountNurtureInboundConfig:
+        return _empty_result(NurtureInboundStatus.CONFIGURATION_INVALID)
+    if inbound_config.account_alias != account_alias or inbound_config.preset_id != preset.id:
+        return _empty_result(NurtureInboundStatus.ACCOUNT_MISMATCH)
+    maximum_threads = inbound_config.max_owned_threads_inspected_per_explicit_run
+    if maximum_threads == 0:
+        return _empty_result(NurtureInboundStatus.NOT_CONFIGURED)
+
+    try:
+        identity = await api.authenticated_profile(account_alias)
+    except Exception as error:  # noqa: BLE001
+        status = _identity_failure_status(error)
+        return _empty_result(status)
+    if type(identity) is not RemoteAuthenticatedProfile:
+        return _empty_result(NurtureInboundStatus.OWNERSHIP_UNVERIFIED)
+    if identity.username.casefold() != inbound_config.owner_public_username.casefold():
+        return _empty_result(NurtureInboundStatus.OWNERSHIP_MISMATCH)
+    owner_username = identity.username
 
     profile_limit = min(preset.per_source_page_limit, maximum_threads)
     try:
@@ -120,12 +156,15 @@ async def collect_nurture_inbound(
             limit=profile_limit,
         )
     except Exception as error:  # noqa: BLE001
-        # API adapters may raise transport-specific exceptions; expose only the bounded source code.
-        raise _source_error(error, _PROFILE_STAGE) from None
+        # API adapters may raise transport-specific exceptions; expose only a safe status.
+        return _empty_result(_read_failure_status(error))
     if type(profile_page) is not DiscoveryPage or type(profile_page.threads) is not tuple:
-        raise NurtureConversationError("DISCOVERY_CONTRACT_MISMATCH", _PROFILE_STAGE)
+        return _empty_result(NurtureInboundStatus.READ_FAILED)
 
-    own_thread_ids = _unique_thread_prefix(profile_page, maximum_threads)
+    try:
+        own_thread_ids = _unique_thread_prefix(profile_page, maximum_threads)
+    except NurtureConversationError:
+        return _empty_result(NurtureInboundStatus.READ_FAILED)
     reply_occurrences = 0
     reply_fingerprints: set[str] = set()
     proven_by_fingerprint: dict[str, NurtureInboundCandidate] = {}
@@ -134,21 +173,21 @@ async def collect_nurture_inbound(
         try:
             page = await api.conversation(account_alias, own_thread_id, after=None)
         except Exception as error:  # noqa: BLE001
-            # API adapters may raise transport-specific exceptions; expose only the bounded source code.
-            raise _source_error(error, _CONVERSATION_STAGE) from None
+            # API adapters may raise transport-specific exceptions; expose only a safe status.
+            return _empty_result(_read_failure_status(error))
         if type(page) is not ReplyPage or type(page.replies) is not tuple:
-            raise NurtureConversationError("DISCOVERY_CONTRACT_MISMATCH", _CONVERSATION_STAGE)
+            return _empty_result(NurtureInboundStatus.READ_FAILED)
 
         # Conversation has no caller-supplied page limit in the accepted shared API.
         # Inspect only this deterministic prefix to keep receipt and candidate work bounded.
         for reply in page.replies[: preset.per_source_page_limit]:
             if type(reply) is not RemoteReply:
-                raise NurtureConversationError("DISCOVERY_CONTRACT_MISMATCH", _CONVERSATION_STAGE)
+                return _empty_result(NurtureInboundStatus.READ_FAILED)
             reply_occurrences += 1
             if reply.is_reply_owned_by_me is not None and (
                 type(reply.is_reply_owned_by_me) is not bool
             ):
-                raise NurtureConversationError("DISCOVERY_CONTRACT_MISMATCH", _CONVERSATION_STAGE)
+                return _empty_result(NurtureInboundStatus.READ_FAILED)
             try:
                 fingerprint = fingerprint_remote_reply(reply.reply_id)
             except NurtureStateError:
@@ -175,7 +214,36 @@ async def collect_nurture_inbound(
         discovered_count=reply_occurrences,
         deduped_count=len(reply_fingerprints),
         candidates=candidates,
+        status=NurtureInboundStatus.READY,
     )
+
+
+def _empty_result(status: NurtureInboundStatus) -> NurtureInboundResult:
+    return NurtureInboundResult(0, 0, (), status)
+
+
+def _identity_failure_status(error: Exception) -> NurtureInboundStatus:
+    return (
+        NurtureInboundStatus.PERMISSION_MISSING
+        if _safe_error_code(error) == "THREADS_PERMISSION_DENIED"
+        else NurtureInboundStatus.OWNERSHIP_UNVERIFIED
+    )
+
+
+def _read_failure_status(error: Exception) -> NurtureInboundStatus:
+    return (
+        NurtureInboundStatus.PERMISSION_MISSING
+        if _safe_error_code(error) == "THREADS_PERMISSION_DENIED"
+        else NurtureInboundStatus.READ_FAILED
+    )
+
+
+def _safe_error_code(error: Exception) -> str | None:
+    try:
+        code = getattr(error, "code", None)
+    except Exception:  # noqa: BLE001
+        return None
+    return code if type(code) is str and code in _SAFE_SOURCE_CODES else None
 
 
 def _unique_thread_prefix(page: DiscoveryPage, maximum_threads: int) -> tuple[str, ...]:
@@ -226,14 +294,3 @@ def _inbound_sort_key(
         + timestamp.microsecond
     )
     return (0, -epoch_microseconds, candidate.fingerprint)
-
-
-def _source_error(error: Exception, stage: str) -> NurtureConversationError:
-    try:
-        error_code = getattr(error, "code", None)
-    except Exception:  # noqa: BLE001
-        # A hostile or malformed error property must not escape the sanitizer.
-        error_code = None
-    if type(error_code) is not str or error_code not in _SAFE_SOURCE_CODES:
-        error_code = "DISCOVERY_SOURCE_FAILED"
-    return NurtureConversationError(error_code, stage)

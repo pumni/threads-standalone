@@ -7,7 +7,12 @@ from typing import cast
 import pytest
 from pydantic import SecretStr
 
-from threads_platform.api.contracts import PublishingQuota, ThreadsAPI, ThreadsAPIError
+from threads_platform.api.contracts import (
+    PublishingQuota,
+    RemoteAuthenticatedProfile,
+    ThreadsAPI,
+    ThreadsAPIError,
+)
 from threads_platform.standalone.accounts import LocalAccountStore
 from threads_platform.standalone.api import LocalThreadsApiRuntime, StandaloneApiError
 
@@ -28,6 +33,7 @@ class _Resolver:
 class _Api:
     def __init__(self) -> None:
         self.quota_calls: list[SecretStr] = []
+        self.authenticated_profile_calls: list[SecretStr] = []
         self.failure: Exception | None = None
 
     async def get_publishing_quota(self, token: SecretStr) -> PublishingQuota:
@@ -35,6 +41,12 @@ class _Api:
         if self.failure is not None:
             raise self.failure
         return PublishingQuota(usage=3, total=250, reply_usage=1, reply_total=100)
+
+    async def get_authenticated_profile(self, token: SecretStr) -> RemoteAuthenticatedProfile:
+        self.authenticated_profile_calls.append(token)
+        if self.failure is not None:
+            raise self.failure
+        return RemoteAuthenticatedProfile("synthetic_user_id", "synthetic_owner")
 
 
 def _runtime(root: Path) -> tuple[LocalThreadsApiRuntime, _Api, _Resolver]:
@@ -59,6 +71,18 @@ def test_quota_resolves_the_reference_on_each_invocation(tmp_path: Path) -> None
     assert first == second == PublishingQuota(usage=3, total=250, reply_usage=1, reply_total=100)
     assert resolver.references == [_CREDENTIAL_REF, _CREDENTIAL_REF]
     assert api.quota_calls == [resolver.secret, resolver.secret]
+
+
+def test_authenticated_profile_uses_alias_bound_credential(tmp_path: Path) -> None:
+    runtime, api, resolver = _runtime(tmp_path)
+
+    profile = asyncio.run(runtime.authenticated_profile("synthetic_account"))
+
+    assert profile == RemoteAuthenticatedProfile("synthetic_user_id", "synthetic_owner")
+    assert resolver.references == [_CREDENTIAL_REF]
+    assert api.authenticated_profile_calls == [resolver.secret]
+    assert "synthetic_user_id" not in repr(profile)
+    assert "synthetic_owner" not in repr(profile)
 
 
 @pytest.mark.parametrize("command", ["replies", "mentions"])

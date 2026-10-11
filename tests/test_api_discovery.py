@@ -109,6 +109,50 @@ def test_profile_posts_preserves_username_limit_and_after() -> None:
     assert seen[0].url.params["limit"] == "12"
 
 
+def test_authenticated_profile_reads_only_token_bound_me_identity() -> None:
+    seen: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(
+            200,
+            json={"id": "synthetic_authenticated_user_id", "username": "synthetic_owner"},
+        )
+
+    result = _call(handler, lambda api: api.get_authenticated_profile(_TOKEN))
+
+    assert result.remote_user_id == "synthetic_authenticated_user_id"
+    assert result.username == "synthetic_owner"
+    assert "synthetic_authenticated_user_id" not in repr(result)
+    assert "synthetic_owner" not in repr(result)
+    assert len(seen) == 1
+    assert seen[0].method == "GET"
+    assert seen[0].url.path.endswith("/me")
+    assert seen[0].url.params["fields"] == "id,username"
+    assert "access_token" not in seen[0].url.params
+    assert seen[0].headers["Authorization"] == f"Bearer {_TOKEN.get_secret_value()}"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"id": "synthetic_id"},
+        {"username": "synthetic_owner"},
+        {"id": "", "username": "synthetic_owner"},
+        {"id": "synthetic_id", "username": "invalid/name"},
+        {"id": "synthetic_id", "username": "u" * 31},
+    ],
+)
+def test_authenticated_profile_rejects_incomplete_or_invalid_identity(
+    payload: dict[str, str],
+) -> None:
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json=payload)
+
+    with pytest.raises(ThreadsContractError):
+        _call(handler, lambda api: api.get_authenticated_profile(_TOKEN))
+
+
 def test_mentions_continuation_is_forwarded_and_cursor_returned() -> None:
     seen: list[httpx2.Request] = []
 

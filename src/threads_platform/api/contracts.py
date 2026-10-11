@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Literal, Protocol
@@ -8,6 +9,7 @@ from typing import Literal, Protocol
 from pydantic import SecretStr
 
 MediaType = Literal["TEXT", "IMAGE", "VIDEO", "CAROUSEL"]
+_THREADS_USERNAME = re.compile(r"[A-Za-z0-9._]{1,30}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +159,27 @@ class RemotePublicProfile:
     profile_picture_url: str | None
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class RemoteAuthenticatedProfile:
+    """Identity returned for the user authenticated by a Threads access token."""
+
+    remote_user_id: str = field(repr=False)
+    username: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.remote_user_id) is not str
+            or not self.remote_user_id.strip()
+            or len(self.remote_user_id) > 255
+            or type(self.username) is not str
+            or _THREADS_USERNAME.fullmatch(self.username) is None
+        ):
+            raise ValueError("invalid authenticated Threads profile")
+
+    def __repr__(self) -> str:
+        return "RemoteAuthenticatedProfile(identity_present=True)"
+
+
 @dataclass(frozen=True, slots=True)
 class DiscoveryPage:
     threads: tuple[RemoteDiscoveryThread, ...]
@@ -226,6 +249,8 @@ class ThreadsAPI(Protocol):
     ) -> DiscoveryPage: ...
 
     async def get_public_profile(self, token: SecretStr, username: str) -> RemotePublicProfile: ...
+
+    async def get_authenticated_profile(self, token: SecretStr) -> RemoteAuthenticatedProfile: ...
 
     async def get_profile_posts(
         self, token: SecretStr, username: str, *, after: str | None, limit: int
