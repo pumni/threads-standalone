@@ -4,6 +4,7 @@ import asyncio
 import builtins
 import dataclasses
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -36,6 +37,19 @@ _PRIVATE_REPLY = "PRIVATE_SYNTHETIC_REPLY_SENTINEL Thanks for sharing the role."
 _FAKE_REPLY = (
     "Thanks for sharing this opportunity. What skills or experience would help "
     "someone thrive in this role?"
+)
+_SYNTHETIC_CONTEXT_A = (
+    "SYNTHETIC TARGET A: A recruiter hiring a junior analyst asks what career "
+    "portfolio helps before an interview?"
+)
+_SYNTHETIC_CONTEXT_B = (
+    "SYNTHETIC TARGET B: Career question? What should a product designer show in a case study?"
+)
+_SYNTHETIC_REPLY_A = (
+    "For the analyst role, which tools matter most: SQL, spreadsheets, or visualization?"
+)
+_SYNTHETIC_REPLY_B = (
+    "For the design role, which part of the product process should applicants emphasize?"
 )
 
 
@@ -306,10 +320,42 @@ def test_production_cli_keeps_existing_modes_and_has_no_ai_or_apply_proposal_mod
 def test_demo_source_script_runs_one_command_with_fake_generator_only() -> None:
     if os.environ.get("THREADS_STANDALONE_WHEEL_SMOKE") == "1":
         pytest.skip("the synthetic demo is a source-repository script, not a wheel entry point")
+    first = _run_demo()
+    second = _run_demo("--select", "2")
+
+    assert first.returncode == second.returncode == 0
+    _assert_selected_output(
+        first.stdout,
+        selection=1,
+        expected_context=_SYNTHETIC_CONTEXT_A,
+        expected_reply=_SYNTHETIC_REPLY_A,
+        other_context=_SYNTHETIC_CONTEXT_B,
+        other_reply=_SYNTHETIC_REPLY_B,
+    )
+    _assert_selected_output(
+        second.stdout,
+        selection=2,
+        expected_context=_SYNTHETIC_CONTEXT_B,
+        expected_reply=_SYNTHETIC_REPLY_B,
+        other_context=_SYNTHETIC_CONTEXT_A,
+        other_reply=_SYNTHETIC_REPLY_A,
+    )
+    assert first.stderr == second.stderr == ""
+    for selection in ("0", "3", "invalid"):
+        process = _run_demo("--select", selection)
+
+        assert process.returncode != 0
+        assert "selection must be 1 or 2" in process.stderr
+        assert process.stdout == ""
+        assert _SYNTHETIC_CONTEXT_A not in process.stderr
+        assert _SYNTHETIC_CONTEXT_B not in process.stderr
+
+
+def _run_demo(*arguments: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.pop("THREADS_LOCAL_DATA_ROOT", None)
-    process = subprocess.run(
-        [sys.executable, str(_SCRIPT)],
+    return subprocess.run(
+        [sys.executable, str(_SCRIPT), *arguments],
         cwd=_SCRIPT.parents[1],
         env=env,
         capture_output=True,
@@ -317,17 +363,42 @@ def test_demo_source_script_runs_one_command_with_fake_generator_only() -> None:
         check=False,
         timeout=30,
     )
-    assert process.returncode == 0, process.stderr
-    output = process.stdout
-    assert "Candidate selected: 1 [MENTIONS]" in output
-    assert "Synthetic reply preview: " + _FAKE_REPLY in output
+
+
+def _assert_selected_output(
+    output: str,
+    *,
+    selection: int,
+    expected_context: str,
+    expected_reply: str,
+    other_context: str,
+    other_reply: str,
+) -> None:
+    assert len(output) <= 2_048
+    assert f"Candidate selected: {selection} [MENTIONS]" in output
+    context_line = next(
+        line for line in output.splitlines() if line.startswith("Synthetic candidate context: ")
+    )
+    selected_context = json.loads(context_line.split(": ", maxsplit=1)[1])
+    reply_line = next(
+        line for line in output.splitlines() if line.startswith("Fake reply proposal: ")
+    )
+    selected_reply = reply_line.removeprefix("Fake reply proposal: ")
+    assert output.index(context_line) < output.index(reply_line)
+    assert len(selected_context) <= 500
+    assert len(selected_reply) <= 500
+    assert selected_context == expected_context
+    assert selected_reply == expected_reply
+    assert other_context not in output
+    assert other_reply not in output
+    assert "Candidate status: ELIGIBLE — REVIEW_CANDIDATE" in output
     assert "PROPOSED_FOR_HUMAN_REVIEW" in output
     assert "NOT_APPROVED" in output
     assert "NOT_SENT" in output
-    assert "remote_mutations=0" in output
     assert "DISCARDED" in output
-    assert "ao04a_synthetic_thread_001" not in output
-    assert process.stderr == ""
+    assert "candidate_or_reply_persistence=0" in output
+    assert "remote_mutations=0" in output
+    assert "ao04a_synthetic_thread_" not in output
 
 
 def test_new_proposal_module_imports_from_installed_wheel_when_requested() -> None:

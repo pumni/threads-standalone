@@ -342,23 +342,33 @@ Run the offline proposal demonstration from the source checkout with one command
 
 ```powershell
 uv run --locked python scripts/demo_recruitment_ai_draft.py
+uv run --locked python scripts/demo_recruitment_ai_draft.py --select 2
 ```
 
-The script creates a new temporary root and a credentialless synthetic account, runs the existing
-Nurture shortlist policy through a fake read-only API, and passes the selected in-memory candidate
-to a deterministic fake generator. It prints the selected candidate's source, score, reason codes,
-and eligibility, then a synthetic reply preview marked `PROPOSED_FOR_HUMAN_REVIEW`, `NOT_APPROVED`,
-and `NOT_SENT`. The demonstration ends with `DISCARDED` and `remote_mutations=0`. It has no
-selection-to-send, apply, approval, provider, network, or credential option. The script is in the
-source repository and is not a wheel entry point.
+The script creates a new temporary root and credentialless synthetic account, then runs the existing
+Nurture ranking and eligibility policy through a fake read-only API. Its two distinct eligible
+fixtures have context-specific static fake replies, so the selected context and reply visibly match.
+Candidate numbers follow the existing ranked shortlist order; the demo does not re-rank candidates.
+With no option, candidate 1 is selected. `--select 2` selects candidate 2. Other values and
+non-numeric input are rejected before the temporary root or fake API is opened. The option exists
+only on this source-only demo; the production CLI is unchanged.
+
+The output places the selected `SYNTHETIC` context beside its fake reply. Context and reply are each
+limited to 500 characters and total demo output is capped at 2,048 characters. The proposal remains
+`PROPOSED_FOR_HUMAN_REVIEW`, `NOT_APPROVED`, and `NOT_SENT`; the demonstration ends `DISCARDED` with
+`candidate_or_reply_persistence=0` and `remote_mutations=0`. Before printing, the demo checks its own
+temporary root for candidate context, fingerprint, remote ID, or reply content. The fake API exposes
+only read methods and has no mutation runtime. No provider, network, credential, apply, or approval
+option exists. The script is in the source repository and is not a wheel entry point.
 
 The proposal API accepts only the existing typed shortlist and a one-based selection. It binds the
 proposal to the exact selected candidate object and fingerprint, and rejects every status except
-`ELIGIBLE` with `REVIEW_CANDIDATE`. Candidate text is untrusted input. The only supplied generator
-is deterministic and ignores that text; generated output is rejected if empty, over 500 characters,
-whitespace-padded, or contains terminal control/format characters. Timeout and generator failures
-produce bounded error codes, and cancellation propagates. This synthetic behavior is not evidence
-that a real AI provider is safe or authorized.
+`ELIGIBLE` with `REVIEW_CANDIDATE`. Candidate text is untrusted input. The proposal module's fake
+generator is deterministic and ignores that text. The demo's separate fake generator maps its two
+fixed synthetic contexts to two fixed replies; it cannot contact a model or network. Generated output
+is rejected if empty, over 500 characters, whitespace-padded, or contains terminal control/format
+characters. Timeout and generator failures produce bounded error codes, and cancellation propagates.
+This synthetic behavior is not evidence that a real AI provider is safe or authorized.
 
 The selected candidate and proposal exist only in process memory. The proposal is not converted to
 `NurtureDraft(source="OPERATOR_FILE")`, does not create an approval token, and is not written to
@@ -376,7 +386,8 @@ workflow would require separate authorization and exact-target revalidation.
 | Timeout, generator failure, and cancellation fail safely without exposing exception data | `test_timeout_and_generator_exception_are_bounded_and_sanitized`; `test_cancellation_propagates_without_creating_a_proposal` |
 | Repr and errors redact target/content; proposal is ephemeral and causes no persistence or mutation | `test_repr_and_failures_hide_context_reply_and_target_fingerprint`; `test_proposal_path_has_no_persistence_or_mutation_side_effects` |
 | Existing production CLI modes remain intact with no AI/apply-proposal mode | `test_production_cli_keeps_existing_modes_and_has_no_ai_or_apply_proposal_mode` |
-| One-command source demo output and installed-wheel module provenance | `test_demo_source_script_runs_one_command_with_fake_generator_only`; `test_new_proposal_module_imports_from_installed_wheel_when_requested`; Windows/Ubuntu installed-wheel CI. |
+| Demo selection 1/2 displays only the matching synthetic context/reply; output bounds, invalid-selection rejection, no persistence/mutation | `test_demo_source_script_runs_one_command_with_fake_generator_only` |
+| Installed-wheel proposal-module provenance; source-only demo is explicitly skipped in wheel suite | `test_new_proposal_module_imports_from_installed_wheel_when_requested`; Windows/Ubuntu installed-wheel CI. |
 
 The package module is included in the installed wheel and its wheel suite checks `site-packages`
 provenance. The demonstration script remains source-only; its subprocess test runs in source-checkout
