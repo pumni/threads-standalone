@@ -126,9 +126,11 @@ def test_preflight_stop_and_read_failure_never_retry(tmp_path: Path) -> None:
     async def forbidden_observe() -> WatchCycle:
         pytest.fail("preflight STOP must not reach discovery")
 
+    quota_root = tmp_path / "quota-root"
+    quota_root.mkdir()
     stopped = asyncio.run(
         run_foreground_watch(
-            store=NurtureStore(tmp_path / "quota-root"),
+            store=NurtureStore(quota_root),
             account_id=uuid4(),
             interval_minutes=15,
             max_cycles=3,
@@ -156,9 +158,11 @@ def test_preflight_stop_and_read_failure_never_retry(tmp_path: Path) -> None:
         raise _ReadFailure("synthetic private API detail")
 
     failure_reports: list[str] = []
+    failure_root = tmp_path / "failure-root"
+    failure_root.mkdir()
     failed = asyncio.run(
         run_foreground_watch(
-            store=NurtureStore(tmp_path / "failure-root"),
+            store=NurtureStore(failure_root),
             account_id=uuid4(),
             interval_minutes=15,
             max_cycles=3,
