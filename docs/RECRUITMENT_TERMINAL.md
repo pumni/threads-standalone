@@ -266,3 +266,72 @@ terminal mutation rule, and READ-only Recurrence are unchanged.
 | 13. Token, identity, target, content, response, and path do not leak to terminal output | The one-command demo test; `tests/test_recruitment_e2e.py::test_real_script_watch_runs_three_read_only_cycles_in_one_event_loop`; `tests/test_recruitment_watch.py::test_watch_lock_path_error_fails_closed_without_cleanup` |
 | 14. Existing production CLI modes remain mutually exclusive and unchanged | `tests/test_recruitment_e2e.py::test_real_script_watch_help_and_mode_exclusivity`; `tests/test_recruitment_session.py::test_cli_requires_exactly_one_session_or_apply_mode` |
 | 15. v1 schema, Workflow terminal mutation rule, READ-only Recurrence, and source/wheel provenance remain intact | Full synthetic CI suite; `tests/test_recruitment_watch.py::test_watch_module_comes_from_installed_wheel_in_wheel_smoke`; `tests/test_recruitment_e2e.py::test_real_script_validate_is_zero_write_and_proves_wheel_import_provenance`; Windows/Ubuntu installed-wheel tests. |
+
+## AO-03 private recruitment shortlist
+
+Run one fresh bounded discovery pass and review a candidate in the foreground terminal:
+
+```powershell
+uv run --locked python scripts/run_recruitment.py --account ALIAS --shortlist
+```
+
+The command requires an interactive private terminal: stdin, stdout, and stderr must all be TTYs,
+and CI mode is rejected before account state or the API is opened. The shortlist and selected
+preview are written to the private terminal's stderr stream; stdout stays empty. Enter, EOF, an
+invalid selection, or Ctrl+C exits without creating a draft or sending an action. The CLI offers no
+POST, REPLY, APPLY, or approval choice. It displays at most five candidates; the internal typed
+API caps its requested limit at 10.
+
+Each row shows the discovery source, the existing Nurture score and reason codes, eligibility or
+suppression status, and a suggested next step. `ELIGIBLE — REVIEW_CANDIDATE` only means the item
+passed current observation policy; `COOLDOWN`, `PENDING`, `CONFIRMED`, `AMBIGUOUS`, and
+`NOT_ELIGIBLE` are read-only and show `OBSERVE_ONLY`. A numeric selection prints one ephemeral
+preview with source, score, reason codes, status, and at most 500 characters of content. Control
+characters are escaped before terminal output. No remote ID, author username, permalink, or
+credential is included in the preview.
+
+The shortlist runs a new discovery pass through the existing inbound and Nurture discovery/ranking
+policy. It does not reconstruct content from Auto Observe receipts: those receipts hold only the
+existing bounded decision/count state. The candidate and its bounded preview remain in memory for
+this process and are not written to a receipt or v1 target state. The per-account Nurture lock file
+may be created and remains after release. Acquiring that lock runs the existing stale-run repair,
+which may mark an interrupted receipt and move it to the completed area. Shortlisting reads existing
+target state and creates no shortlist receipt, reply draft, approval token, or candidate-content
+record. A later reply workflow would still have to revalidate the exact target.
+
+If inbound is configured, both `--inbound-owner-username USERNAME` and
+`--inbound-thread-cap N` must be supplied on this invocation. Owner binding and profile/conversation
+reads fail closed before discovery fallback. With no inbound configuration, the existing discovery
+path continues and the output says `INBOUND_NOT_CONFIGURED`; this does not claim that there are no
+messages.
+
+For a synthetic demonstration, run one command from the repository checkout:
+
+```powershell
+uv run --locked python scripts/demo_recruitment_shortlist.py
+```
+
+It creates a fresh temporary root and credentialless synthetic account, installs a fake-only API
+factory for the demo call, and supplies one eligible candidate, one cooldown candidate, and one
+excluded candidate. The optional `--select N` chooses which synthetic row to preview. The fake
+runtime has no mutation methods and its factory rejects mutation or browser runtimes. The demo has
+no path to a live backend, does not read `THREADS_LOCAL_DATA_ROOT` or credentials, and prints only
+synthetic content. It is a source-repository script, not a wheel entry point. The session, shortlist,
+Nurture discovery, store, and policy modules are shipped in the wheel; installed-wheel CI checks
+their import provenance from `site-packages` outside the checkout.
+
+`--validate`, `--preflight`, `--observe`, and `--watch-observe` remain safe-summary modes and do not
+print candidate content. `--shortlist` is the private interactive content review mode. Synthetic
+tests cover ranking reuse and duplicate handling, cooldown/action states, bounded output and privacy,
+private-terminal gating and exit input, account isolation, configured inbound failures, mode
+exclusivity, and the one-command fake demo. No real Threads API, credential, operator root, live
+terminal ACL, rights/provenance, or real-account behavior is verified here. Issues #2 and #18 remain
+open; RS-06 (#25) remains HOLD. AO-03 adds no AI, automatic posting, or automatic replies.
+
+| AO-03 acceptance | Synthetic evidence |
+| --- | --- |
+| Existing score/reason ranking, source precedence, duplicate removal, cooldown and ineligible states | `tests/test_recruitment_shortlist.py::test_shortlist_uses_existing_ranking_and_dedupes_api_source_duplicates`; `test_shortlist_explains_policy_and_durable_target_states_without_actionability` |
+| Configured inbound owner mismatch/profile/conversation failure stops without discovery fallback; no-config path remains available | `tests/test_recruitment_shortlist.py::test_configured_inbound_failures_stop_before_discovery_fallback`; `test_no_configured_inbound_keeps_legacy_discovery_path`; `test_inbound_configuration_needs_owner_and_cap_and_no_config_does_not_claim_ready` |
+| Bounded private preview, no candidate/draft/approval persistence, account isolation, and mutation runtime disabled | `tests/test_recruitment_shortlist.py::test_shortlist_bounds_items_and_preview_and_hides_private_fields_from_repr`; `test_shortlist_uses_account_scoped_state_and_writes_no_candidate_or_receipt`; `test_cli_shortlist_requires_private_tty_and_selection_stays_preview_only` |
+| Redirected/CI output refusal, selection validation, EOF, Ctrl+C, and existing mode exclusivity | `tests/test_recruitment_shortlist.py::test_redirected_output_or_ci_rejects_shortlist_before_api_or_lock`; `test_eof_invalid_input_and_ctrl_c_exit_without_action`; `test_shortlist_mode_is_mutually_exclusive_with_existing_modes` |
+| One-command fake demo, source-only script boundary, and independent wheel import provenance | `tests/test_recruitment_shortlist.py::test_demo_source_script_runs_one_command_with_fake_data_only`; Windows/Ubuntu full and installed-wheel CI. |

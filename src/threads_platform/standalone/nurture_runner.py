@@ -36,6 +36,7 @@ from threads_platform.standalone.nurture_discovery import (
     NurtureDiscoveryError,
     NurtureDiscoverySource,
     discover_nurture_candidates,
+    nurture_target_suppression_reason,
 )
 from threads_platform.standalone.nurture_draft import NurtureDraft
 from threads_platform.standalone.nurture_quote_draft import NurtureQuoteDraft
@@ -124,6 +125,7 @@ _SAFE_RUNNER_CODES = frozenset(
 _SAFE_STAGE = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
 _PREVIEW_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_PREVIEW_TEXT_CHARS = 500
+_MAX_SHORTLIST_PREVIEW_CHARS = 500
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -188,6 +190,86 @@ class NurtureRunResult:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class NurtureShortlistCandidate:
+    """Bounded in-memory shortlist item; identifiers and body stay out of repr."""
+
+    source: NurtureDiscoverySource | Literal["INBOUND_REPLY"]
+    score: int | None
+    reason_codes: tuple[str, ...]
+    status: Literal[
+        "ELIGIBLE",
+        "COOLDOWN",
+        "PENDING",
+        "CONFIRMED",
+        "AMBIGUOUS",
+        "NOT_ELIGIBLE",
+    ]
+    action_hint: Literal["OBSERVE_ONLY", "REVIEW_CANDIDATE"]
+    fingerprint: str = field(repr=False)
+    text: str | None = field(repr=False)
+    text_truncated: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.source not in {*NurtureDiscoverySource, "INBOUND_REPLY"}
+            or (self.score is not None and (type(self.score) is not int or self.score < 0))
+            or type(self.reason_codes) is not tuple
+            or len(self.reason_codes) > 16
+            or any(
+                type(code) is not str or re.fullmatch(r"[A-Z][A-Z0-9_]{0,31}", code) is None
+                for code in self.reason_codes
+            )
+            or self.status
+            not in {
+                "ELIGIBLE",
+                "COOLDOWN",
+                "PENDING",
+                "CONFIRMED",
+                "AMBIGUOUS",
+                "NOT_ELIGIBLE",
+            }
+            or self.action_hint not in {"OBSERVE_ONLY", "REVIEW_CANDIDATE"}
+            or type(self.fingerprint) is not str
+            or _PREVIEW_FINGERPRINT.fullmatch(self.fingerprint) is None
+            or (self.text is not None and type(self.text) is not str)
+            or type(self.text_truncated) is not bool
+            or (self.status == "ELIGIBLE") != (self.action_hint == "REVIEW_CANDIDATE")
+        ):
+            raise ValueError("invalid recruitment shortlist candidate")
+        if self.text is not None and len(self.text) > _MAX_SHORTLIST_PREVIEW_CHARS:
+            object.__setattr__(self, "text", self.text[:_MAX_SHORTLIST_PREVIEW_CHARS])
+            object.__setattr__(self, "text_truncated", True)
+
+    def __repr__(self) -> str:
+        source = (
+            self.source.value if isinstance(self.source, NurtureDiscoverySource) else self.source
+        )
+        return (
+            "NurtureShortlistCandidate("
+            f"source={source}, score={self.score if self.score is not None else '-'}, "
+            f"reason_codes={self.reason_codes!r}, status={self.status}, "
+            f"action_hint={self.action_hint}, text=<redacted>)"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class NurtureShortlistResult:
+    """Ephemeral result for one read-only candidate review session."""
+
+    candidates: tuple[NurtureShortlistCandidate, ...]
+    inbound_status: NurtureInboundStatus
+    discovered_count: int
+    deduped_count: int
+
+    def __repr__(self) -> str:
+        return (
+            "NurtureShortlistResult("
+            f"candidate_count={len(self.candidates)}, inbound_status={self.inbound_status.value}, "
+            f"discovered_count={self.discovered_count}, deduped_count={self.deduped_count})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class _NurtureSelection:
     candidate: NurtureInboundCandidate | NurtureCandidate | None
     target_by_fingerprint: dict[str, NurtureTargetV1]
@@ -235,6 +317,118 @@ class NurtureRunner:
     def __init__(self, api: LocalThreadsApiRuntime, store: NurtureStore) -> None:
         self._api = api
         self._store = store
+
+    async def shortlist(
+        self,
+        account: LocalAccount,
+        preset: NurturePresetV1,
+        *,
+        inbound_config: AccountNurtureInboundConfig | None = None,
+        now: datetime | None = None,
+        limit: int = 5,
+    ) -> NurtureShortlistResult:
+        """Read fresh candidates under the account lock without creating a run receipt."""
+
+        if type(account) is not LocalAccount or type(account.id) is not UUID:
+            raise NurtureRunnerError("RUN_FAILED")
+        if type(preset) is not NurturePresetV1:
+            raise NurtureRunnerError("PRESET_NOT_FOUND")
+        if type(limit) is not int or not 1 <= limit <= 10:
+            raise NurtureRunnerError("RUN_FAILED")
+
+        captured_now = _capture_utc(now)
+        owner = self._store.acquire_account_lock(account.id)
+        try:
+            async with owner:
+                target_state = NurtureTargetStateV1(
+                    version=1,
+                    account_id=account.id,
+                    preset_id=preset.id,
+                    targets=owner.get_targets(preset),
+                )
+                inbound = await collect_nurture_inbound(
+                    self._api,
+                    account.alias,
+                    preset,
+                    inbound_config,
+                )
+                if inbound.status not in {
+                    NurtureInboundStatus.READY,
+                    NurtureInboundStatus.NOT_CONFIGURED,
+                }:
+                    raise NurtureRunnerError(inbound.status.value)
+
+                discovery = await discover_nurture_candidates(
+                    self._api,
+                    account.alias,
+                    preset,
+                    target_state,
+                    captured_now,
+                    include_assessments=True,
+                )
+                targets = {target.fingerprint: target for target in target_state.targets}
+                candidates: list[NurtureShortlistCandidate] = []
+                seen_fingerprints: set[str] = set()
+
+                # The existing engagement policy gives verified inbound replies first review
+                # priority. Discovery assessments retain the established score/order afterward.
+                for candidate in inbound.candidates:
+                    if candidate.fingerprint in seen_fingerprints:
+                        continue
+                    seen_fingerprints.add(candidate.fingerprint)
+                    target = targets.get(candidate.fingerprint)
+                    reason = nurture_target_suppression_reason(
+                        target,
+                        preset.seen_cooldown_seconds,
+                        captured_now,
+                    )
+                    item = _shortlist_candidate(
+                        source="INBOUND_REPLY",
+                        score=None,
+                        fingerprint=candidate.fingerprint,
+                        text=candidate.text,
+                        reason_codes=("INBOUND_REPLY",)
+                        if reason is None
+                        else ("INBOUND_REPLY", reason),
+                        rejection_reason=reason,
+                        target=target,
+                    )
+                    candidates.append(item)
+
+                for assessment in discovery.candidate_assessments:
+                    if assessment.fingerprint in seen_fingerprints:
+                        continue
+                    seen_fingerprints.add(assessment.fingerprint)
+                    target = targets.get(assessment.fingerprint)
+                    candidate = assessment.candidate
+                    candidates.append(
+                        _shortlist_candidate(
+                            source=assessment.source_class,
+                            score=candidate.score,
+                            fingerprint=assessment.fingerprint,
+                            text=candidate.text,
+                            reason_codes=assessment.reason_codes,
+                            rejection_reason=assessment.rejection_reason,
+                            target=target,
+                        )
+                    )
+
+                return NurtureShortlistResult(
+                    candidates=tuple(candidates[:limit]),
+                    inbound_status=inbound.status,
+                    discovered_count=inbound.discovered_count + discovery.discovered_count,
+                    deduped_count=inbound.deduped_count + discovery.deduped_count,
+                )
+        except NurtureRunnerError:
+            raise
+        except NurtureDiscoveryError as error:
+            raise NurtureRunnerError(error.code) from None
+        except NurtureConversationError as error:
+            raise NurtureRunnerError(error.code) from None
+        except NurtureStateError as error:
+            raise NurtureRunnerError(error.code) from None
+        except Exception as error:  # noqa: BLE001 — never expose remote response details.
+            raise NurtureRunnerError(_safe_code(_exception_code(error))) from None
 
     async def run(
         self,
@@ -987,6 +1181,47 @@ def _candidate_surface_eligible(
     if fingerprint == bound_fingerprint and _can_bypass_seen_cooldown(target, now):
         return True
     return _surface_eligible(target, cooldown_seconds, now)
+
+
+def _shortlist_candidate(
+    *,
+    source: NurtureDiscoverySource | Literal["INBOUND_REPLY"],
+    score: int | None,
+    fingerprint: str,
+    text: str | None,
+    reason_codes: tuple[str, ...],
+    rejection_reason: str | None,
+    target: NurtureTargetV1 | None,
+) -> NurtureShortlistCandidate:
+    if target is not None and target.action_state == "PENDING":
+        status: Literal[
+            "ELIGIBLE",
+            "COOLDOWN",
+            "PENDING",
+            "CONFIRMED",
+            "AMBIGUOUS",
+            "NOT_ELIGIBLE",
+        ] = "PENDING"
+    elif target is not None and target.action_state == "AMBIGUOUS":
+        status = "AMBIGUOUS"
+    elif target is not None and target.action_state == "CONFIRMED":
+        # The durable reservation path rejects an already confirmed target even after cooldown.
+        status = "CONFIRMED"
+    elif rejection_reason in {"LOCAL_SEEN_COOLDOWN", "LOCAL_ACTION_COOLDOWN"}:
+        status = "COOLDOWN"
+    elif rejection_reason is not None:
+        status = "NOT_ELIGIBLE"
+    else:
+        status = "ELIGIBLE"
+    return NurtureShortlistCandidate(
+        source=source,
+        score=score,
+        reason_codes=reason_codes,
+        status=status,
+        action_hint="REVIEW_CANDIDATE" if status == "ELIGIBLE" else "OBSERVE_ONLY",
+        fingerprint=fingerprint,
+        text=text,
+    )
 
 
 def _selection_preview(
