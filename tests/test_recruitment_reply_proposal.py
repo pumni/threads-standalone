@@ -30,6 +30,7 @@ from threads_platform.standalone.recruitment_reply_proposal import (
     ReplyProposalError,
     ReplyProposalInput,
     create_human_reply_preview,
+    evaluate_synthetic_reply_quality,
 )
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "demo_recruitment_ai_draft.py"
@@ -183,6 +184,49 @@ async def test_editor_edits_preserve_exact_candidate_and_fingerprint() -> None:
     with pytest.raises(ReplyProposalError) as error:
         dataclasses.replace(second_edit, preview=preview_b)
     assert error.value.code == "INVALID_EDITOR_SESSION"
+
+
+async def test_synthetic_quality_advisory_updates_without_claiming_quality_or_approval() -> None:
+    candidate = _candidate("quality-advisory-candidate", text=_SYNTHETIC_CONTEXT_A)
+    preview = await create_human_reply_preview(
+        _shortlist(candidate),
+        1,
+        _RecordingGenerator(_SYNTHETIC_REPLY_A),
+    )
+    original = HumanReplyEditorialSession.begin(preview)
+    initial_advisory = evaluate_synthetic_reply_quality(original)
+    assert initial_advisory.outcome == "NO_OBVIOUS_ISSUE_DETECTED"
+    assert initial_advisory.flags == ()
+
+    low_information = original.edit("i dont know")
+    flagged = evaluate_synthetic_reply_quality(low_information)
+    assert flagged.outcome == "REVIEW_RECOMMENDED"
+    assert flagged.flags == ("LOW_INFORMATION",)
+    assert low_information.candidate is candidate
+    assert low_information.target_fingerprint == preview.proposal.target_fingerprint
+
+    more_informative = low_information.edit(_EDITED_REPLY_A)
+    refreshed = evaluate_synthetic_reply_quality(more_informative)
+    assert refreshed.outcome == "NO_OBVIOUS_ISSUE_DETECTED"
+    assert refreshed.flags == ()
+    assert more_informative.candidate is candidate
+    assert more_informative.target_fingerprint == preview.proposal.target_fingerprint
+
+    kept_while_flagged = low_information.keep_for_session()
+    assert kept_while_flagged.editorial_disposition == "KEPT_FOR_SESSION"
+    assert kept_while_flagged.current_reply == "i dont know"
+    assert kept_while_flagged.approval_status == "NOT_APPROVED_FOR_SENDING"
+    assert kept_while_flagged.delivery_status == "NOT_SENT"
+    rendered = repr(initial_advisory) + repr(flagged) + repr(refreshed)
+    for private_value in (
+        _SYNTHETIC_CONTEXT_A,
+        _SYNTHETIC_REPLY_A,
+        _EDITED_REPLY_A,
+        "i dont know",
+        candidate.fingerprint,
+    ):
+        assert private_value not in rendered
+    assert len(flagged.flags) <= 1
 
 
 async def test_invalid_selection_and_invalid_shortlist_fail_closed() -> None:
@@ -496,6 +540,13 @@ def test_demo_source_script_runs_one_command_with_fake_generator_only() -> None:
         assert "APPROVAL_STATUS=NOT_APPROVED_FOR_SENDING" in process.stdout
         assert "DELIVERY_STATUS=NOT_SENT" in process.stdout
         assert "DRAFT_PERSISTED=NO remote_mutations=0" in process.stdout
+        assert "QUALITY_FLAGS=LOW_INFORMATION" in process.stdout
+        assert process.stdout.count("QUALITY_FLAGS=NONE") == 2
+        assert "EDITORIAL_QUALITY=REVIEW_RECOMMENDED" in process.stdout
+        assert "EDITORIAL_QUALITY=NO_OBVIOUS_ISSUE_DETECTED" in process.stdout
+        assert "does not establish correctness or usefulness" in process.stdout
+        assert "Add a useful, specific detail before keeping" in process.stdout
+        assert "i dont know" in process.stdout
         assert process.stderr == ""
     environment_text = _run_demo(
         "--scripted",
@@ -713,6 +764,39 @@ def test_interactive_demo_discards_private_invalid_edit_without_persistence() ->
     assert "EDITORIAL_DISPOSITION=DISCARDED" in rendered
     assert "APPROVAL_STATUS=NOT_APPROVED_FOR_SENDING" in rendered
     assert "DELIVERY_STATUS=NOT_SENT" in rendered
+    assert "DRAFT_PERSISTED=NO remote_mutations=0" in rendered
+
+
+async def test_editor_quality_warning_precedes_nonblocking_flagged_keep() -> None:
+    if os.environ.get("THREADS_STANDALONE_WHEEL_SMOKE") == "1":
+        pytest.skip("script-only editor input loop is not included in the installed wheel")
+    demo = _load_demo_module()
+    candidate = _candidate("quality-editor-candidate", text=_SYNTHETIC_CONTEXT_A)
+    preview = await create_human_reply_preview(
+        _shortlist(candidate),
+        1,
+        _RecordingGenerator(_SYNTHETIC_REPLY_A),
+    )
+    output = io.StringIO()
+    observed_edits: list[str] = []
+    state = demo._run_editor_session(
+        preview,
+        io.StringIO("E\ni dont know\nK\n"),
+        output,
+        observed_edits=observed_edits,
+    )
+    demo._write_editor_outcome(state, output)
+    rendered = output.getvalue()
+
+    assert observed_edits == ["i dont know"]
+    assert "QUALITY_FLAGS=LOW_INFORMATION" in rendered
+    warning_position = rendered.index("Add a useful, specific detail before keeping")
+    keep_prompt_position = rendered.rindex("Action [E=edit, K=keep for session, D=discard]:")
+    assert warning_position < keep_prompt_position
+    assert state.editorial_disposition == "KEPT_FOR_SESSION"
+    assert state.current_reply == "i dont know"
+    assert state.approval_status == "NOT_APPROVED_FOR_SENDING"
+    assert state.delivery_status == "NOT_SENT"
     assert "DRAFT_PERSISTED=NO remote_mutations=0" in rendered
 
 

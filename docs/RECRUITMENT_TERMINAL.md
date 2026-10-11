@@ -450,3 +450,33 @@ script remains source-only; its subprocess, input-loop, persistence, and TTY tes
 in the independent installed-wheel suite. No real AI/provider, Threads/Meta API, account,
 credentials, or remote mutation is used. Rights/provenance issue #2 and live install/UAT issue #18
 remain OPEN; RS-06 issue #25 remains HOLD.
+
+## AO-04C synthetic reply quality advisory
+
+The existing source-only scripted demo now shows a nonbinding heuristic warning, its update after a
+more informative edit, and the session-only keep decision. Run it with synthetic candidate 1:
+
+```powershell
+uv run --locked python scripts/demo_recruitment_ai_draft.py --scripted --select 1
+```
+
+The scripted edit sequence starts with `i dont know`, which produces
+`EDITORIAL_QUALITY=REVIEW_RECOMMENDED` and `QUALITY_FLAGS=LOW_INFORMATION`. It then enters a longer
+synthetic reply, after which the preview reports `NO_OBVIOUS_ISSUE_DETECTED` and `QUALITY_FLAGS=NONE`.
+The editor still allows `K`; keeping remains `KEPT_FOR_SESSION`, `NOT_APPROVED_FOR_SENDING`,
+`NOT_SENT`, `DRAFT_PERSISTED=NO`, and `remote_mutations=0`.
+
+The evaluator is a small deterministic English phrase check, not a spelling, relevance, safety,
+correctness, or factuality checker. A short useful answer may be flagged, while a long vague,
+incorrect, harmful, or off-topic answer may not be. `NO_OBVIOUS_ISSUE_DETECTED` is not evidence that
+a reply is good, correct, approved, or publishable. The advisory never rewrites the reply or blocks
+keeping it for the current process session. It creates no approval token, state, receipt, journal
+entry, or saved draft. The interactive path retains the private-TTY guard; scripted output contains
+only hard-coded synthetic data.
+
+| AO-04C acceptance | Synthetic evidence |
+| --- | --- |
+| Known fake reply has neutral wording; `i dont know` flags low information; an informative edit updates the advisory | `tests/test_recruitment_reply_proposal.py::test_synthetic_quality_advisory_updates_without_claiming_quality_or_approval`; `test_demo_source_script_runs_one_command_with_fake_generator_only` |
+| Advisory has bounded safe codes and hides candidate, reply, and fingerprint in repr | `test_synthetic_quality_advisory_updates_without_claiming_quality_or_approval`; installed-wheel suite |
+| Warning appears before the keep action; keeping remains session-only and nonbinding | `test_editor_quality_warning_precedes_nonblocking_flagged_keep`; `test_demo_source_script_runs_one_command_with_fake_generator_only` |
+| Existing TTY, editor, proposal, production CLI, persistence, and mutation boundaries remain intact | `tests/test_recruitment_reply_proposal.py`; source-checkout Windows/Ubuntu CI |

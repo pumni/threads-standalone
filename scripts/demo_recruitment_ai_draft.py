@@ -31,6 +31,7 @@ from threads_platform.standalone.recruitment_reply_proposal import (
     ReplyProposalError,
     ReplyProposalInput,
     create_human_reply_preview,
+    evaluate_synthetic_reply_quality,
 )
 from threads_platform.standalone.recruitment_session import RecruitmentSession
 
@@ -80,6 +81,7 @@ _EDITED_REPLIES_BY_CONTEXT = {
 _MAX_EDITOR_EDITS = 5
 _MAX_ACTION_CHARS = 16
 _MAX_EDIT_CHARS = 500
+_SCRIPTED_LOW_INFORMATION_REPLY = "i dont know"
 
 
 class _InputLineTooLong(Exception):
@@ -269,7 +271,9 @@ def run_demo(
             observed_edits: list[str] = []
             if editor_mode == "scripted":
                 edited_reply = _EDITED_REPLIES_BY_CONTEXT[candidate.text or ""]
-                editor_input = io.StringIO(f"E\n{edited_reply}\nK\n")
+                editor_input = io.StringIO(
+                    f"E\n{_SCRIPTED_LOW_INFORMATION_REPLY}\nE\n{edited_reply}\nK\n"
+                )
             output.write("AO-04B SYNTHETIC HUMAN REPLY EDITOR\n")
             output.write(f"Candidate selected: {selection} [{candidate.source}]\n")
             state = _run_editor_session(
@@ -285,6 +289,9 @@ def run_demo(
                     *tuple(_REPLIES_BY_CONTEXT.values()),
                     *tuple(_EDITED_REPLIES_BY_CONTEXT.values()),
                     *tuple(observed_edits),
+                    "LOW_INFORMATION",
+                    "REVIEW_RECOMMENDED",
+                    "NO_OBVIOUS_ISSUE_DETECTED",
                 ),
             )
             if api.remote_mutations != 0:
@@ -383,6 +390,19 @@ def _write_editor_preview(
     output_stream.write(
         f"{json.dumps(context, ensure_ascii=True)} | {json.dumps(reply, ensure_ascii=True)}\n"
     )
+    advisory = evaluate_synthetic_reply_quality(session)
+    output_stream.write(f"EDITORIAL_QUALITY={advisory.outcome}\n")
+    output_stream.write(f"QUALITY_FLAGS={','.join(advisory.flags) or 'NONE'}\n")
+    if advisory.flags:
+        output_stream.write(
+            "Quality advisory: Add a useful, specific detail before keeping; "
+            "K remains an in-session choice only.\n"
+        )
+    else:
+        output_stream.write(
+            "Quality advisory: No obvious issue detected; this does not establish "
+            "correctness or usefulness.\n"
+        )
     output_stream.flush()
 
 

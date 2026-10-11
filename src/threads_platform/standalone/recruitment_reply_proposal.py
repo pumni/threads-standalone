@@ -20,6 +20,30 @@ _REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,31}\Z")
 _MAX_SHORTLIST_CANDIDATES = 10
 _MAX_REPLY_CHARS = 500
 _MAX_GENERATION_TIMEOUT_SECONDS = 30.0
+_LOW_INFORMATION_PHRASES = frozenset(
+    {
+        "i dont know",
+        "i don t know",
+        "idk",
+        "no idea",
+        "no comment",
+        "not sure",
+        "i am not sure",
+        "n a",
+        "na",
+        "ok",
+        "okay",
+        "yes",
+        "no",
+        "maybe",
+        "thanks",
+        "thank you",
+    }
+)
+_QUALITY_WORD_SEPARATOR = re.compile(r"[^a-z0-9]+")
+
+ReplyQualityFlag = Literal["LOW_INFORMATION"]
+ReplyQualityOutcome = Literal["REVIEW_RECOMMENDED", "NO_OBVIOUS_ISSUE_DETECTED"]
 
 
 class ReplyProposalError(ValueError):
@@ -40,6 +64,7 @@ class ReplyProposalError(ValueError):
             "INVALID_EDITOR_SESSION",
             "EDITOR_SESSION_CLOSED",
             "INVALID_EDITED_REPLY",
+            "INVALID_QUALITY_ADVISORY",
         }:
             raise ValueError("invalid reply proposal error code")
         self.code = code
@@ -267,6 +292,55 @@ class HumanReplyEditorialSession:
             f"editorial_disposition={self.editorial_disposition}, current_reply=<redacted>, "
             "approval_status=NOT_APPROVED_FOR_SENDING, delivery_status=NOT_SENT)"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ReplyQualityAdvisory:
+    """Bounded safe codes from a soft heuristic; it contains no reply content."""
+
+    outcome: ReplyQualityOutcome
+    flags: tuple[ReplyQualityFlag, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.outcome) is not str
+            or self.outcome not in {"REVIEW_RECOMMENDED", "NO_OBVIOUS_ISSUE_DETECTED"}
+            or type(self.flags) is not tuple
+            or len(self.flags) > 1
+            or any(type(flag) is not str or flag != "LOW_INFORMATION" for flag in self.flags)
+            or (self.outcome == "REVIEW_RECOMMENDED") != bool(self.flags)
+        ):
+            raise ReplyProposalError("INVALID_QUALITY_ADVISORY")
+
+
+def evaluate_synthetic_reply_quality(
+    session: HumanReplyEditorialSession,
+) -> ReplyQualityAdvisory:
+    """Flag a few low-information English phrases on the exact bound editor session.
+
+    This check does not assess correctness, relevance, safety, or factual support.
+    """
+
+    if type(session) is not HumanReplyEditorialSession:
+        raise ReplyProposalError("INVALID_EDITOR_SESSION")
+    candidate = session.candidate
+    context = candidate.text
+    reply = session.current_reply
+    if not session.is_bound_to(candidate):
+        raise ReplyProposalError("TARGET_BINDING_MISMATCH")
+    if type(context) is not str or not context.strip() or len(context) > _MAX_REPLY_CHARS:
+        raise ReplyProposalError("CANDIDATE_CONTEXT_UNAVAILABLE")
+    if reply is None or session.editorial_disposition == "DISCARDED":
+        raise ReplyProposalError("INVALID_EDITOR_SESSION")
+    _validate_reply(reply, error_code="INVALID_EDITED_REPLY")
+
+    normalized = unicodedata.normalize("NFKC", reply).casefold()
+    normalized_phrase = " ".join(_QUALITY_WORD_SEPARATOR.sub(" ", normalized).split())
+    flags: tuple[ReplyQualityFlag, ...] = (
+        ("LOW_INFORMATION",) if normalized_phrase in _LOW_INFORMATION_PHRASES else ()
+    )
+    outcome: ReplyQualityOutcome = "REVIEW_RECOMMENDED" if flags else "NO_OBVIOUS_ISSUE_DETECTED"
+    return ReplyQualityAdvisory(outcome, flags)
 
 
 async def create_human_reply_preview(
