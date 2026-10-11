@@ -36,6 +36,14 @@ Threads Standalone là công cụ chạy **cục bộ trên máy tính**, giúp 
 - Helper permalink hoạt động offline, chỉ nhận URL `https://www.threads.com` hoặc path tương đối có dạng post hợp lệ; query tracking nằm trong allowlist được loại khỏi kết quả. Helper đánh dấu `source=MANUAL_URL`, `context_status=UNKNOWN` và không ghi hàng đợi/state.
 - S2 chỉ synthetic-tested; **chưa live-verified**. Không dùng adapter fixture để suy ra Threads thật cho phép hoặc hỗ trợ tự động thu thập dữ liệu.
 
+### Trạng thái Micro-slice 3 — offline manual review
+
+- Có lệnh `threads-local recruitment manual-review` để đọc tối đa 20 permalink operator nhập trong file local, chuẩn hóa bằng helper S2, bỏ trùng theo URL canonical và hiển thị shortlist theo thứ tự nhập.
+- Operator phải chỉ định `--select` (đánh số từ 1). Author chỉ được suy ra từ permalink và luôn là **chưa xác minh**; URL không tạo nội dung bài, điểm liên quan, remote ID hay trạng thái API/Nurture.
+- Draft do operator tự viết/chỉnh sửa trong file UTF-8, tối đa 500 ký tự; không có AI. Context tùy chọn cũng do operator cung cấp và luôn có mức đầy đủ `UNKNOWN`. Review hiển thị hash SHA-256 và `NOT_SENT`.
+- CLI chỉ chạy trong terminal riêng tư tương tác; từ chối CI và luồng có stdout/stderr/stdin chuyển hướng. Draft, context và URL chỉ được in ở `stderr` terminal sau khi kiểm tra TTY. Lệnh không gọi API/browser và không ghi queue, receipt, journal hay Nurture state.
+- S3 synthetic-tested; **chưa live-verified**. S1 browser handoff là một lệnh riêng, chỉ dùng sau phê duyệt live riêng theo #18/#46 và operator phải tự xác minh actor/target.
+
 ## 2. Yêu cầu máy tính
 
 - Windows, PowerShell; Python **3.14**, [uv](https://docs.astral.sh/uv/), Git.
@@ -151,18 +159,42 @@ uv run --locked python scripts/run_recruitment.py --account test-a --observe
 
 `--shortlist` là danh sách ứng viên tạm thời, không tự tạo draft hoặc gửi reply. `--observe` có ghi local state, dù không gửi Threads reply. Không dùng `--apply-reply-file`, `--apply-post-file`, `threads-local reply` hoặc `threads-local post` nếu không được cấp quyền cụ thể cho account, target và nội dung.
 
-## 8. Quy trình operator mong muốn sau khi triển khai browser MVP
+## 8. Quy trình operator cho các chức năng đã có
 
-Đây là **hướng dẫn quy trình dự kiến**, **không phải tập lệnh đang chạy được**. Codex phải cập nhật phần này bằng lệnh CLI thực tế và regression tests sau từng micro-slice:
+### Review permalink và draft offline (Micro-slice 3)
 
-1. **Chọn account:** chọn `test-a` hoặc `test-b`; xem trạng thái session, kiểm tra đây là tài khoản đúng.
-2. **Mở Threads:** ứng dụng mở browser profile của account; operator tự giải quyết đăng nhập/challenge.
-3. **Tìm nội dung tuyển dụng:** operator tìm bằng Threads Search hoặc cung cấp permalink. Tính năng tự tìm/đọc trong UI chỉ bật khi đã được Meta cho phép và kiểm chứng riêng.
-4. **Review opportunity:** xem bài gốc, author, ngữ cảnh và các reply liên quan; bỏ qua bài không đủ thông tin, dữ liệu nhạy cảm, chủ đề không phù hợp hoặc trùng/cooldown.
-5. **Soạn và chỉnh sửa:** công cụ đề xuất draft hoặc operator nhập từ mẫu; xác nhận mọi chi tiết tuyển dụng, không bịa công việc/mức lương/chính sách.
-6. **Xác nhận đích:** hiển thị account đang dùng, permalink, author, bài/reply chính xác và toàn văn nội dung cuối cùng. Nếu bất kỳ chi tiết nào thay đổi, bỏ phê duyệt trước.
-7. **Gửi:** ở chế độ mặc định, operator thao tác nút gửi trong giao diện Threads chính thức. **Không có bulk reply hoặc gửi tự động không giám sát.** Nếu sau này dùng automated UI submit, phải có cho phép của nền tảng và sự chấp thuận riêng cho từng action.
-8. **Kiểm tra kết quả:** ghi nhận kết quả rõ ràng/không rõ; lỗi timeout không được coi là chưa gửi và không tự thử gửi lại.
+1. Chọn alias của account local đã tạo trước đó. Lệnh chỉ đọc alias/UUID; account không được chia sẻ giữa các alias.
+2. Dùng nguồn permalink mà operator được phép sử dụng. Tạo file UTF-8 riêng tư, mỗi dòng một URL; có thể có dòng trống. Không đặt file này, draft hoặc context vào GitHub/repository.
+
+   Ví dụ synthetic cho `targets.txt`:
+
+   ```text
+   https://www.threads.com/@synthetic/post/fake_01
+   https://www.threads.com/@synthetic/post/fake_02?utm_source=operator
+   ```
+
+   Có 1–20 dòng không trống, tối đa 64 KiB tổng file và tối đa 2048 byte/ký tự mỗi URL. Chỉ nhận UTF-8 không BOM và permalink đúng host `www.threads.com`; query tracking được S2 cho phép sẽ bị loại khi chuẩn hóa. URL trùng được gộp ổn định và lệnh in số dòng gốc ánh xạ tới mục shortlist còn lại. URL sai hoặc dữ liệu mơ hồ làm lệnh dừng.
+
+3. Tự viết/chỉnh sửa draft trong `draft.txt`; tối đa 500 ký tự. Context tùy chọn trong `context.txt` tối đa 4000 ký tự/16 KiB. Hai file phải là UTF-8 không BOM, không chứa control character hoặc ký tự vô hình nguy hiểm. Draft không được AI tạo; context chỉ là nội dung operator tự quan sát/cung cấp, không được app đọc từ Threads.
+4. Mở PowerShell tương tác riêng tư, không chuyển hướng stdin/stdout/stderr và không chạy trong CI. Chỉ file local được cung cấp rõ ràng mới được đọc:
+
+   ```powershell
+   uv run --locked threads-local recruitment manual-review test-a `
+     --targets-file .\targets.txt `
+     --select 2 `
+     --draft-file .\draft.txt `
+     --context-file .\context.txt
+   ```
+
+   Bỏ `--context-file` nếu chưa có context. `--select` là số thứ tự **một-based** trong shortlist đã in; bắt buộc chọn chính xác một mục, không có chọn mặc định.
+
+5. Review chỉ in ra `stderr` của terminal private: alias và UUID, actor `UNKNOWN_IDENTITY`, URL canonical, author chỉ từ permalink (chưa xác minh), provenance `MANUAL_URL`, context `OPERATOR_SUPPLIED`/`NONE` với completeness `UNKNOWN`, toàn văn draft, hash SHA-256 và `NOT_SENT`. Thay account, target hoặc draft làm thay hash; chỉnh file rồi chạy lại để review phiên bản mới.
+6. Lệnh offline này không mở Chromium, gọi API, đăng nhập, gửi reply, hoặc ghi queue/state/journal/receipt. `NOT_SENT` không phải là quyền gửi và không chứng minh danh tính actor.
+7. **Chỉ sau khi có phê duyệt live riêng theo #18/#46**, operator có thể tự chọn lệnh S1 được in trong review: `threads-local browser open-thread test-a "/@synthetic/post/fake_02" --interactive`. Đây là lệnh browser riêng; operator phải tự xác minh account và target trong UI chính thức. S1 không tự điền hay gửi reply.
+
+### API-driven Nurture
+
+`scripts/run_recruitment.py --shortlist/--observe` và `threads-local nurture` là luồng riêng dựa trên Threads API, với quyền/token và semantics state riêng. Không dùng chúng như thể là reader của browser S2: search/conversation adapters ở S2 hiện chỉ dùng fixture synthetic. `--observe` có thể ghi Nurture state/receipt; `--apply` và các lệnh post/reply có thể tạo remote effect, cần quyền riêng theo account, target và nội dung.
 
 ## 9. Dừng, khôi phục và xử lý lỗi
 
