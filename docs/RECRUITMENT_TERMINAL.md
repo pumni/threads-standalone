@@ -538,3 +538,48 @@ for the private terminal only; scripted output contains hard-coded synthetic dat
 for CI. It adds no production CLI mode, ranking/cooldown policy, schema, journal, approval token,
 AI call, remote mutation, scheduler, or daemon. Threads/Meta behavior and live-account UAT remain
 unverified.
+
+## Customer-facing synthetic launcher
+
+The one-file source entrypoint calls the accepted AO-05A journey without copying its watch,
+shortlist, cooldown, proposal, or editor logic. It sits next to the AO-05A script, is not included in
+the installed wheel, and does not add a `threads-local` command. Run it from the repository root in
+PowerShell:
+
+```powershell
+uv run --locked python scripts/customer_recruitment_demo.py
+uv run --locked python scripts/customer_recruitment_demo.py --interactive
+uv run --locked python scripts/customer_recruitment_demo.py --readiness-only
+```
+
+The default command is scripted and uses a temporary synthetic root, fake identity, fake read-only
+API, and fake reply generator. It prints `DEMO_MODE=SYNTHETIC`, `CHROME_LOGIN=NOT_EXECUTED`,
+`OAUTH_STATUS=NOT_CONNECTED`, `LONG_LIVED_TOKEN=NOT_ACQUIRED`, `REAL_API=DISABLED`, and
+`SEND=DISABLED`, then runs AO-05A. The interactive command delegates to AO-05A's private-TTY guard;
+CI, pytest, or redirected streams are rejected before the temporary account/root or fake API is
+created. `--readiness-only` prints the capability table without loading the AO-05A module or
+creating files.
+
+One-minute walkthrough: run the default command to show the fake watch receipt, W cooldown block,
+eligible F, bound synthetic proposal, quality advisory, and session-only keep. In a private terminal,
+run `--interactive`, select the displayed eligible F (normally `2`), then use `E` to edit, `K` to
+keep only in the current process, or `D` to discard. Both choices remain
+`NOT_APPROVED_FOR_SENDING`, `NOT_SENT`, and `remote_mutations=0`.
+
+| Capability | Current status |
+| --- | --- |
+| Offline customer walkthrough | Available; synthetic-only, no credential, no network, no send |
+| Existing headed Chrome login | `threads-local account login ALIAS` exists, but this launcher never starts it and it is not live-verified |
+| Existing credential reference | `threads-local account credential set-env ALIAS ENV_NAME` references an operator-provided environment variable; it does not obtain an OAuth token |
+| Official OAuth and long-lived token lifecycle | Not implemented: no authorization/code exchange, 60-day token acquisition/refresh, or token-from-cookie behavior |
+| Account owner/scope verification and Meta App Review | Not completed or verified |
+| Fresh installed-wheel and real-account UAT | Not authorized by this demo; requires a separate operator GO under issue #18 |
+
+For future OAuth implementation research, see the [official Meta Threads API authorization
+collection](https://www.postman.com/meta/threads/documentation/dht3nzz/threads-api?entity=folder-34203612-995a4593-61de-4558-9b26-6c8becae85e4).
+No real browser login or OAuth call is part of this launcher. Any future real login/token step needs
+separate operator approval under #18, resolved rights/provenance under #2, an approved Meta app and
+scopes, verified account-owner binding, a newly approved private data/profile location, explicit
+secret storage and rotation rules, and an authorized read-only UAT plan. Do not extract tokens from
+browser cookies. Rights #2 remains open, install/live UAT #18 remains blocked pending approval, and
+optional AI/provider work #25 remains on hold.
