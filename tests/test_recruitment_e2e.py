@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -7,7 +8,7 @@ import runpy
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -15,6 +16,7 @@ from uuid import uuid4
 import pytest
 from pydantic import SecretStr
 
+import threads_platform.standalone.nurture_store as nurture_store_module
 import threads_platform.standalone.recruitment_session as recruitment_module
 from threads_platform.api.contracts import (
     DiscoveryPage,
@@ -112,6 +114,9 @@ class _SyntheticThreadsAPI:
         conversation_error: ThreadsAPIError | None = None,
         owned_posts: tuple[RemoteDiscoveryThread, ...] = (),
         search_threads: tuple[RemoteDiscoveryThread, ...] = (_THREAD,),
+        search_error: ThreadsAPIError | None = None,
+        search_entered: asyncio.Event | None = None,
+        search_release: asyncio.Event | None = None,
         publish_error: bool = False,
         events: list[str] | None = None,
     ) -> None:
@@ -123,6 +128,9 @@ class _SyntheticThreadsAPI:
         self.conversation_error = conversation_error
         self.owned_posts = owned_posts
         self.search_results = search_threads
+        self.search_error = search_error
+        self.search_entered = search_entered
+        self.search_release = search_release
         self.publish_error = publish_error
         self.events = events if events is not None else []
         self.calls: list[str] = []
@@ -180,6 +188,12 @@ class _SyntheticThreadsAPI:
         assert after is None and since is None and until is None and limit > 0
         self.calls.append("search")
         self.events.append("search")
+        if self.search_entered is not None:
+            self.search_entered.set()
+        if self.search_release is not None:
+            await self.search_release.wait()
+        if self.search_error is not None:
+            raise self.search_error
         return DiscoveryPage(self.search_results, None, False)
 
     async def get_profile_posts(
@@ -358,6 +372,45 @@ def _account(root: Path, *, credential: bool = True, alias: str = "alice") -> Lo
     return accounts
 
 
+class _FakeWatchTiming:
+    def __init__(self) -> None:
+        self.current = datetime(2026, 10, 11, tzinfo=UTC)
+        self.monotonic_value = 0.0
+        self.sleep_calls: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.monotonic_value
+
+    def utc_now(self) -> datetime:
+        return self.current
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleep_calls.append(seconds)
+        self.monotonic_value += seconds
+        self.current += timedelta(seconds=seconds)
+
+
+def _inject_watch_timing(
+    monkeypatch: pytest.MonkeyPatch,
+    timing: _FakeWatchTiming,
+) -> None:
+    original = recruitment_module.RecruitmentSession.watch_observe
+
+    async def watch_with_fake_timing(
+        session: recruitment_module.RecruitmentSession,
+        account_alias: str,
+        **kwargs: object,
+    ) -> object:
+        kwargs["timing"] = timing
+        return await original(session, account_alias, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        recruitment_module.RecruitmentSession,
+        "watch_observe",
+        watch_with_fake_timing,
+    )
+
+
 def test_real_script_validate_is_zero_write_and_proves_wheel_import_provenance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -527,6 +580,543 @@ def test_real_script_preflight_reports_bounded_quota_snapshot(
     assert not (root / "nurture").exists()
     assert _TOKEN not in output.out
     assert "synthetic_owner" not in output.out
+
+
+def test_real_script_watch_runs_three_read_only_cycles_in_one_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "synthetic-root"
+    accounts = _account(root)
+    api = _SyntheticThreadsAPI(root)
+    mutation_modes = _install_synthetic_app(root, monkeypatch, api)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(root))
+    timing = _FakeWatchTiming()
+    _inject_watch_timing(monkeypatch, timing)
+
+    real_asyncio_run = asyncio.run
+    run_calls: list[object] = []
+
+    def count_asyncio_run(awaitable: object, **kwargs: object) -> object:
+        run_calls.append(awaitable)
+        return real_asyncio_run(awaitable, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(recruitment_module.asyncio, "run", count_asyncio_run)
+    assert (
+        _run_script(
+            monkeypatch,
+            [
+                "--account",
+                "alice",
+                "--watch-observe",
+                "--max-cycles",
+                "3",
+            ],
+        )
+        == 0
+    )
+
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert output.out.count("watch cycle=") == 3
+    assert "watch preflight status=OBSERVED" in output.out
+    assert "inbound=INBOUND_NOT_CONFIGURED" in output.out
+    assert output.out.endswith("watch shutdown status=COMPLETED cycles=3\n")
+    assert len(run_calls) == 1
+    assert timing.sleep_calls == [1_800, 1_800]
+    assert api.calls.count("identity") == 1
+    assert api.calls.count("quota") == 1
+    assert api.calls.count("mentions") == 3
+    assert api.calls.count("search") == 33
+    assert mutation_modes == [False, False, False, False]
+    assert api.remote_mutations == []
+    assert not (root / "operations").exists()
+
+    receipts = sorted(
+        _receipts(root, accounts.get("alice").id),
+        key=lambda receipt: receipt["started_at"],
+    )
+    assert len(receipts) == 3
+    assert all(receipt["outcome"] == "SUCCESS" for receipt in receipts)
+    assert sum(receipt["selected_count"] for receipt in receipts) == 1
+    assert all(
+        set(receipt)
+        == {
+            "version",
+            "id",
+            "account_id",
+            "preset_id",
+            "preset_version",
+            "started_at",
+            "finished_at",
+            "outcome",
+            "discovered_count",
+            "deduped_count",
+            "selected_count",
+            "enriched_count",
+            "replied_count",
+            "published_count",
+            "skipped_count",
+            "decision_codes",
+            "operation_ids",
+            "error_code",
+            "failed_stage",
+        }
+        for receipt in receipts
+    )
+
+    private_markers = (
+        _TOKEN,
+        _TOKEN_REF,
+        _REMOTE_TEXT,
+        _THREAD.remote_thread_id,
+        "synthetic_author",
+        "https://threads.example/private",
+    )
+    assert all(marker not in output.out + output.err for marker in private_markers)
+    persisted_nurture = "".join(
+        path.read_text(encoding="utf-8") for path in (root / "nurture").rglob("*.json")
+    )
+    assert all(marker not in persisted_nurture for marker in private_markers)
+
+
+def test_real_script_watch_checks_inbound_binding_and_stops_without_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "synthetic-root"
+    _account(root)
+    api = _SyntheticThreadsAPI(
+        root,
+        identity_username="foreign_synthetic_owner",
+        owned_posts=(_OWN_THREAD,),
+    )
+    mutation_modes = _install_synthetic_app(root, monkeypatch, api)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(root))
+    _inject_watch_timing(monkeypatch, _FakeWatchTiming())
+
+    assert (
+        _run_script(
+            monkeypatch,
+            [
+                "--account",
+                "alice",
+                "--watch-observe",
+                "--max-cycles",
+                "3",
+                "--inbound-owner-username",
+                "synthetic_owner",
+                "--inbound-thread-cap",
+                "1",
+            ],
+        )
+        == 1
+    )
+
+    output = capsys.readouterr()
+    assert "reason=INBOUND_OWNERSHIP_MISMATCH inbound=UNAVAILABLE" in output.out
+    assert output.out.endswith(
+        "watch shutdown status=STOP cycles=1 reason=INBOUND_OWNERSHIP_MISMATCH\n"
+    )
+    assert "search" not in api.calls
+    assert "mentions" not in api.calls
+    assert api.calls == ["identity", "quota", "identity"]
+    assert mutation_modes == [False, False]
+    assert api.remote_mutations == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("profile", "INBOUND_READ_FAILED"),
+        ("permission", "INBOUND_PERMISSION_MISSING"),
+        ("conversation", "INBOUND_READ_FAILED"),
+        ("discovery", "THREADS_RATE_LIMITED"),
+    ],
+)
+def test_real_script_watch_fails_closed_on_read_errors(
+    failure: str,
+    expected_code: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "synthetic-root"
+    _account(root)
+    api = _SyntheticThreadsAPI(
+        root,
+        owned_posts=(_OWN_THREAD,),
+        profile_error=(
+            ThreadsAPIError(
+                "THREADS_PERMISSION_DENIED"
+                if failure == "permission"
+                else "THREADS_TRANSPORT_FAILURE"
+            )
+            if failure in {"profile", "permission"}
+            else None
+        ),
+        conversation_error=(
+            ThreadsAPIError("THREADS_TRANSPORT_FAILURE") if failure == "conversation" else None
+        ),
+        search_error=(ThreadsAPIError("THREADS_RATE_LIMITED") if failure == "discovery" else None),
+    )
+    mutation_modes = _install_synthetic_app(root, monkeypatch, api)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(root))
+    _inject_watch_timing(monkeypatch, _FakeWatchTiming())
+    args = ["--account", "alice", "--watch-observe", "--max-cycles", "3"]
+    if failure != "discovery":
+        args.extend(
+            [
+                "--inbound-owner-username",
+                "synthetic_owner",
+                "--inbound-thread-cap",
+                "1",
+            ]
+        )
+
+    assert _run_script(monkeypatch, args) == 1
+    output = capsys.readouterr()
+    assert f"reason={expected_code} inbound=UNAVAILABLE" in output.out
+    assert output.out.endswith(f"watch shutdown status=STOP cycles=1 reason={expected_code}\n")
+    assert api.remote_mutations == []
+    assert mutation_modes == [False] * len(mutation_modes)
+    assert len(mutation_modes) == 2
+    if failure in {"profile", "permission", "conversation"}:
+        assert "search" not in api.calls
+        assert "mentions" not in api.calls
+    else:
+        assert api.calls.count("search") == 1
+
+
+def test_real_script_watch_quota_stop_prevents_first_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "synthetic-root"
+    _account(root)
+    api = _SyntheticThreadsAPI(
+        root,
+        quota=PublishingQuota(usage=100, total=100, reply_usage=1, reply_total=50),
+    )
+    mutation_modes = _install_synthetic_app(root, monkeypatch, api)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(root))
+
+    assert (
+        _run_script(
+            monkeypatch,
+            ["--account", "alice", "--watch-observe", "--max-cycles", "1"],
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out == (
+        "watch preflight status=STOP credential=verified post_quota=exhausted "
+        "reply_quota=available\n"
+        "watch shutdown status=STOP cycles=0 reason=PREFLIGHT_STOP\n"
+    )
+    assert api.calls == ["identity", "quota"]
+    assert mutation_modes == [False]
+    assert not (root / "nurture" / "runs").exists()
+
+
+def test_real_script_watch_help_and_mode_exclusivity(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _run_script(monkeypatch, ["--help"]) == 0
+    help_output = capsys.readouterr()
+    assert "--watch-observe" in help_output.out
+    assert "--interval-minutes" in help_output.out
+    assert "--max-cycles" in help_output.out
+
+    assert (
+        _run_script(
+            monkeypatch,
+            ["--account", "alice", "--watch-observe", "--observe"],
+        )
+        == 2
+    )
+    exclusive = capsys.readouterr()
+    assert "not allowed with argument" in exclusive.err
+
+    assert (
+        _run_script(
+            monkeypatch,
+            ["--account", "alice", "--watch-observe", "--interval-minutes", "14"],
+        )
+        == 2
+    )
+    invalid_interval = capsys.readouterr()
+    assert "watch interval must be an integer from 15 to 1440 minutes" in invalid_interval.err
+
+    assert (
+        _run_script(
+            monkeypatch,
+            ["--account", "alice", "--observe", "--max-cycles", "2"],
+        )
+        == 1
+    )
+    non_watch = capsys.readouterr()
+    assert non_watch.err == "ERROR WATCH_OPTIONS_REQUIRE_WATCH_MODE\n"
+
+
+def test_real_script_watch_reports_verified_inbound_capability_without_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "synthetic-root"
+    _account(root)
+    api = _SyntheticThreadsAPI(root, owned_posts=(_OWN_THREAD,))
+    mutation_modes = _install_synthetic_app(root, monkeypatch, api)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(root))
+    _inject_watch_timing(monkeypatch, _FakeWatchTiming())
+
+    assert (
+        _run_script(
+            monkeypatch,
+            [
+                "--account",
+                "alice",
+                "--watch-observe",
+                "--max-cycles",
+                "1",
+                "--inbound-owner-username",
+                "synthetic_owner",
+                "--inbound-thread-cap",
+                "1",
+            ],
+        )
+        == 0
+    )
+    output = capsys.readouterr()
+    assert "inbound=INBOUND_READY" in output.out
+    assert "Synthetic owned post" not in output.out
+    assert "synthetic_owner" not in output.out
+    assert api.calls.count("profile") == 1
+    assert api.calls.count("conversation") == 1
+    assert (
+        api.calls.index("profile") < api.calls.index("conversation") < api.calls.index("mentions")
+    )
+    assert mutation_modes == [False, False]
+    assert api.remote_mutations == []
+    persisted_nurture = "".join(
+        path.read_text(encoding="utf-8") for path in (root / "nurture").rglob("*.json")
+    )
+    assert "synthetic_owner" not in persisted_nurture
+
+
+@pytest.mark.parametrize(
+    ("credential", "identity_error", "expected_code", "expected_calls"),
+    [
+        (False, None, "THREADS_CREDENTIAL_NOT_CONFIGURED", []),
+        (True, "THREADS_AUTHENTICATION_FAILED", "THREADS_AUTHENTICATION_FAILED", ["identity"]),
+        (True, "THREADS_PERMISSION_DENIED", "THREADS_PERMISSION_DENIED", ["identity"]),
+        (True, "THREADS_RATE_LIMITED", "THREADS_RATE_LIMITED", ["identity"]),
+    ],
+)
+def test_real_script_watch_stops_on_preflight_authentication_failure(
+    credential: bool,
+    identity_error: str | None,
+    expected_code: str,
+    expected_calls: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "synthetic-root"
+    _account(root, credential=credential)
+    api = _SyntheticThreadsAPI(
+        root,
+        identity_error=None if identity_error is None else ThreadsAPIError(identity_error),
+    )
+    mutation_modes = _install_synthetic_app(root, monkeypatch, api)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(root))
+
+    assert (
+        _run_script(
+            monkeypatch,
+            ["--account", "alice", "--watch-observe", "--max-cycles", "2"],
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out.endswith(f"watch shutdown status=STOP cycles=0 reason={expected_code}\n")
+    assert api.calls == expected_calls
+    assert mutation_modes == [False]
+    assert api.remote_mutations == []
+    assert "synthetic private" not in output.out + output.err
+
+
+def test_real_script_watch_stops_on_expired_credential_before_api_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "synthetic-root"
+    _account(root)
+    api = _SyntheticThreadsAPI(root)
+    mutation_modes = _install_synthetic_app(
+        root,
+        monkeypatch,
+        api,
+        resolver=_SyntheticResolver(
+            error=ThreadsCredentialError(ThreadsCredentialErrorCode.EXPIRED)
+        ),
+    )
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(root))
+
+    assert (
+        _run_script(
+            monkeypatch,
+            ["--account", "alice", "--watch-observe", "--max-cycles", "2"],
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out.endswith(
+        "watch shutdown status=STOP cycles=0 reason=THREADS_CREDENTIAL_EXPIRED\n"
+    )
+    assert api.calls == []
+    assert mutation_modes == [False]
+    assert api.remote_mutations == []
+
+
+def test_watch_cancellation_persists_interrupted_receipt_and_allows_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "synthetic-root"
+    accounts = _account(root)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    api = _SyntheticThreadsAPI(root, search_entered=entered, search_release=release)
+    mutation_modes = _install_synthetic_app(root, monkeypatch, api)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(root))
+
+    async def cancel_during_read() -> object:
+        session = recruitment_module.RecruitmentSession(root)
+        pending = asyncio.create_task(
+            session.watch_observe(
+                "alice",
+                interval_minutes=15,
+                max_cycles=3,
+                timing=_FakeWatchTiming(),
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        pending.cancel()
+        return await pending
+
+    interrupted = asyncio.run(cancel_during_read())
+    assert interrupted.status == "INTERRUPTED"
+    assert interrupted.cycles == 1
+    output = capsys.readouterr()
+    assert output.out.endswith("watch shutdown status=INTERRUPTED cycles=1 reason=INTERRUPTED\n")
+    receipts = _receipts(root, accounts.get("alice").id)
+    assert len(receipts) == 1
+    assert receipts[0]["outcome"] == "INTERRUPTED"
+    assert receipts[0]["error_code"] == "INTERRUPTED"
+    assert api.remote_mutations == []
+
+    release.set()
+    restarted = asyncio.run(
+        recruitment_module.RecruitmentSession(root).watch_observe(
+            "alice",
+            interval_minutes=15,
+            max_cycles=1,
+            timing=_FakeWatchTiming(),
+        )
+    )
+    assert restarted.status == "COMPLETED"
+    assert restarted.cycles == 1
+    assert len(_receipts(root, accounts.get("alice").id)) == 2
+    assert mutation_modes == [False, False, False, False]
+    assert api.remote_mutations == []
+
+
+def test_real_script_watch_missing_root_stops_without_creating_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing_root = tmp_path / "synthetic-missing-root"
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(missing_root))
+
+    assert (
+        _run_script(
+            monkeypatch,
+            ["--account", "alice", "--watch-observe", "--max-cycles", "1"],
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out == ("watch shutdown status=STOP cycles=0 reason=LOCAL_DATA_ROOT_NOT_FOUND\n")
+    assert output.err == ""
+    assert not missing_root.exists()
+
+
+def test_real_script_watch_malformed_v1_state_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "synthetic-root"
+    accounts = _account(root)
+    account_id = accounts.get("alice").id
+    state_directory = root / "nurture" / "state" / str(account_id)
+    state_directory.mkdir(parents=True)
+    (state_directory / "recruitment.json").write_text("not valid json", encoding="utf-8")
+    api = _SyntheticThreadsAPI(root)
+    mutation_modes = _install_synthetic_app(root, monkeypatch, api)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(root))
+
+    assert (
+        _run_script(
+            monkeypatch,
+            ["--account", "alice", "--watch-observe", "--max-cycles", "3"],
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out.endswith("watch shutdown status=STOP cycles=1 reason=NURTURE_STATE_INVALID\n")
+    assert "search" not in api.calls and "mentions" not in api.calls
+    assert mutation_modes == [False, False]
+    assert api.remote_mutations == []
+
+
+def test_real_script_watch_synthetic_full_disk_failure_stops_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "synthetic-root"
+    _account(root)
+    api = _SyntheticThreadsAPI(root)
+    mutation_modes = _install_synthetic_app(root, monkeypatch, api)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(root))
+
+    def fail_new_temporary_file(*_args: object, **_kwargs: object) -> None:
+        raise OSError(28, "synthetic full disk private detail")
+
+    monkeypatch.setattr(nurture_store_module.tempfile, "mkstemp", fail_new_temporary_file)
+    assert (
+        _run_script(
+            monkeypatch,
+            ["--account", "alice", "--watch-observe", "--max-cycles", "2"],
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out.endswith("watch shutdown status=STOP cycles=1 reason=NURTURE_STATE_INVALID\n")
+    assert "synthetic full disk private detail" not in output.out + output.err
+    assert "search" not in api.calls and "mentions" not in api.calls
+    assert mutation_modes == [False, False]
+    assert api.remote_mutations == []
 
 
 def test_real_script_no_config_preserves_legacy_discovery_and_persists_success_receipt(
