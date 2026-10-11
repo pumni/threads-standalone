@@ -347,9 +347,12 @@ def _private_interactive_terminal_available(
     error_stream: TextIO,
     environment: Mapping[str, str],
 ) -> bool:
-    if any(
-        environment.get(name, "").strip().casefold() in {"1", "true", "yes"}
-        for name in ("CI", "GITHUB_ACTIONS", "PYTEST_CURRENT_TEST")
+    if (
+        any(
+            environment.get(name, "").strip().casefold() in {"1", "true", "yes"}
+            for name in ("CI", "GITHUB_ACTIONS")
+        )
+        or environment.get("PYTEST_CURRENT_TEST", "").strip()
     ):
         return False
     try:

@@ -560,18 +560,30 @@ def test_interactive_demo_refuses_redirected_and_ci_before_setup(
         assert streams[1].getvalue() == ""
         assert streams[2].getvalue() == "demo status=STOP reason=PRIVATE_TTY_REQUIRED\n"
 
-    ci_out = _TtyStringIO()
-    ci_err = _TtyStringIO()
-    ci_result = demo.main(
-        ["--interactive", "--select", "2"],
-        input_stream=_TtyStringIO(),
-        output_stream=ci_out,
-        error_stream=ci_err,
-        environment={"GITHUB_ACTIONS": "true"},
-    )
-    assert ci_result == 2
-    assert ci_out.getvalue() == ""
-    assert ci_err.getvalue() == "demo status=STOP reason=PRIVATE_TTY_REQUIRED\n"
+    for blocked_environment in (
+        {"CI": "true"},
+        {"GITHUB_ACTIONS": "true"},
+        {"PYTEST_CURRENT_TEST": ("tests/test_recruitment_reply_proposal.py::test_guard (call)")},
+    ):
+        private_out = _TtyStringIO()
+        private_err = _TtyStringIO()
+        result = demo.main(
+            ["--interactive", "--select", "2"],
+            input_stream=_TtyStringIO(),
+            output_stream=private_out,
+            error_stream=private_err,
+            environment=blocked_environment,
+        )
+        assert result == 2
+        assert private_out.getvalue() == ""
+        assert private_err.getvalue() == ("demo status=STOP reason=PRIVATE_TTY_REQUIRED\n")
+        for private_value in (
+            _SYNTHETIC_CONTEXT_A,
+            _SYNTHETIC_CONTEXT_B,
+            _PRIVATE_REPLY,
+        ):
+            assert private_value not in private_out.getvalue()
+            assert private_value not in private_err.getvalue()
     assert run_calls == []
 
     untrusted_arg_error = io.StringIO()
