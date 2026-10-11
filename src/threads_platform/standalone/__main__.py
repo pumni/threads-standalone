@@ -650,6 +650,13 @@ def _build_parser() -> argparse.ArgumentParser:
     feed_parser.add_argument("alias")
     feed_parser.add_argument("--limit", type=int, default=10)
 
+    browser_parser = commands.add_parser("browser")
+    browser_commands = browser_parser.add_subparsers(dest="browser_command", required=True)
+    open_thread_parser = browser_commands.add_parser("open-thread")
+    open_thread_parser.add_argument("alias")
+    open_thread_parser.add_argument("thread_ref")
+    open_thread_parser.add_argument("--interactive", action="store_true", required=True)
+
     api_parser = commands.add_parser("api")
     api_commands = api_parser.add_subparsers(dest="api_command", required=True)
     quota_parser = api_commands.add_parser("quota")
@@ -765,6 +772,12 @@ def _run_browser_command(args: argparse.Namespace, root: Path, store: LocalAccou
 
     runtime = LocalRuntime(root, store)
     try:
+        if args.command == "browser":
+            result = asyncio.run(runtime.open_thread_interactive(args.alias, args.thread_ref))
+            sys.stdout.write(
+                f"browser session closed target={result.target_ref} identity=UNKNOWN_IDENTITY\n"
+            )
+            return 0
         if args.command == "account":
             asyncio.run(runtime.login(args.alias))
             sys.stdout.write(f"login browser closed {args.alias}\n")
@@ -867,7 +880,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sys.stdout.write(f"{account.alias} {account.id}\n")
             return 0
 
-        if args.command in {"profile", "thread", "feed"}:
+        if args.command in {"profile", "thread", "feed", "browser"}:
             return _run_browser_command(args, root, store)
 
         if args.command == "operation":

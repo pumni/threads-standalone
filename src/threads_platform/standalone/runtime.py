@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
-from collections.abc import Callable
+import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Literal, cast
 
@@ -45,6 +47,63 @@ _SAFE_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 _BROWSER_READ_TIMEOUT_SECONDS = 30
 _THREADS_WEB_ORIGINS = frozenset({BROWSER_FEED_ORIGIN})
 _DEFAULT_OPERATOR_WAITER = cast(Callable[[str], None], input)
+
+
+async def _wait_for_windows_console_enter(
+    key_available: Callable[[], bool],
+    read_key: Callable[[], str],
+) -> None:
+    while True:
+        if key_available():
+            key = read_key()
+            if key in {"\r", "\n"}:
+                return
+            if key == "\x1a":
+                raise EOFError
+            if key == "\x03":
+                raise KeyboardInterrupt
+        await asyncio.sleep(0.05)
+
+
+async def _wait_for_interactive_operator(prompt: str) -> None:
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    if not sys.stdin.isatty():
+        raise EOFError
+
+    if os.name == "nt":
+        import msvcrt
+
+        await _wait_for_windows_console_enter(msvcrt.kbhit, msvcrt.getwch)
+    else:
+        loop = asyncio.get_running_loop()
+        input_ready: asyncio.Future[None] = loop.create_future()
+        input_fd = sys.stdin.fileno()
+
+        def read_console_input() -> None:
+            if input_ready.done():
+                return
+            try:
+                character = os.read(input_fd, 1)
+            except OSError:
+                input_ready.set_exception(EOFError())
+                return
+            if character in {b"", b"\x04"}:
+                input_ready.set_exception(EOFError())
+            elif character in {b"\r", b"\n"}:
+                input_ready.set_result(None)
+
+        loop.add_reader(input_fd, read_console_input)
+        try:
+            await input_ready
+        finally:
+            loop.remove_reader(input_fd)
+
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+_DEFAULT_INTERACTIVE_OPERATOR_WAITER = _wait_for_interactive_operator
 
 
 class StandaloneRuntimeError(Exception):
@@ -132,6 +191,27 @@ class LocalRuntime:
             target_ref,
             target_kind="THREAD",
             author_username=author_username,
+        )
+
+    async def open_thread_interactive(
+        self,
+        alias: str,
+        thread_ref: str,
+        *,
+        wait_for_operator: Callable[[str], Awaitable[None]] = (
+            _DEFAULT_INTERACTIVE_OPERATOR_WAITER
+        ),
+    ) -> BrowserTargetOpenResultV1:
+        parsed_target = parse_thread_ref(thread_ref)
+        if parsed_target is None:
+            raise StandaloneRuntimeError("INVALID_THREAD_TARGET")
+        target_ref, author_username = parsed_target
+        return await self._open_browser_target(
+            alias,
+            target_ref,
+            target_kind="THREAD",
+            author_username=author_username,
+            wait_for_operator=wait_for_operator,
         )
 
     async def browse_feed(self, alias: str, max_items: int = 10) -> BrowserFeedResultV1:
@@ -232,7 +312,10 @@ class LocalRuntime:
         *,
         target_kind: Literal["PROFILE", "THREAD"],
         author_username: str | None = None,
+        wait_for_operator: Callable[[str], Awaitable[None]] | None = None,
     ) -> BrowserTargetOpenResultV1:
+        lock: FilesystemProcessLock | None = None
+        session: BrowserEngineSession | None = None
         try:
             async with asyncio.timeout(_BROWSER_READ_TIMEOUT_SECONDS):
                 account = await asyncio.to_thread(self._accounts.get, alias)
@@ -244,7 +327,6 @@ class LocalRuntime:
                 except OSError:
                     raise StandaloneRuntimeError("LOCAL_PROFILE_UNAVAILABLE") from None
 
-                session: BrowserEngineSession | None = None
                 try:
                     profile_directory = self._profile_directory(account)
                     if not profile_directory.is_dir():
@@ -278,28 +360,56 @@ class LocalRuntime:
                             target_ref=target_ref,
                             author_username=author_username,
                         )
-                    return BrowserTargetOpenResultV1(
-                        target_kind=target_kind,
-                        target_ref=target_ref,
-                        recognized=True,
-                    )
                 except BrowserAdapterError as error:
                     raise StandaloneRuntimeError(error.code) from None
                 except StandaloneRuntimeError:
                     raise
                 except Exception:  # noqa: BLE001 - convert unexpected browser failures to safe CLI codes
                     raise StandaloneRuntimeError("BROWSER_RUNTIME_UNAVAILABLE") from None
-                finally:
-                    try:
-                        if session is not None:
-                            await session.close()
-                    finally:
-                        try:
-                            lock.release()
-                        except OSError:
-                            raise StandaloneRuntimeError("LOCAL_PROFILE_UNAVAILABLE") from None
+
+            result = BrowserTargetOpenResultV1(
+                target_kind=target_kind,
+                target_ref=target_ref,
+                recognized=True,
+            )
+            if wait_for_operator is not None:
+                prompt = (
+                    f"Thread target recognized target={target_ref} author=@{author_username}; "
+                    f"account={alias} identity=UNKNOWN_IDENTITY. Verify the logged-in account "
+                    "yourself. Press Enter here to end and close this browser session: "
+                )
+                try:
+                    await wait_for_operator(prompt)
+                except EOFError:
+                    raise StandaloneRuntimeError("OPERATOR_HANDOFF_ABORTED") from None
+                except Exception:  # noqa: BLE001 - keep interactive input errors bounded
+                    raise StandaloneRuntimeError("OPERATOR_HANDOFF_FAILED") from None
+                if author_username is None:
+                    raise StandaloneRuntimeError("BROWSER_CONTRACT_MISMATCH")
+                try:
+                    await cast(BrowserThreadOpenEngineSession, session).verify_thread_target(
+                        target_ref=target_ref,
+                        author_username=author_username,
+                    )
+                except BrowserAdapterError:
+                    raise
+                except Exception:  # noqa: BLE001 - keep browser failures as safe CLI codes
+                    raise StandaloneRuntimeError("BROWSER_RUNTIME_UNAVAILABLE") from None
+            return result
         except TimeoutError:
             raise StandaloneRuntimeError("BROWSER_NAVIGATION_TIMEOUT") from None
+        except BrowserAdapterError as error:
+            raise StandaloneRuntimeError(error.code) from None
+        finally:
+            try:
+                if session is not None:
+                    await session.close()
+            finally:
+                if lock is not None and lock.held:
+                    try:
+                        lock.release()
+                    except OSError:
+                        raise StandaloneRuntimeError("LOCAL_PROFILE_UNAVAILABLE") from None
 
     def _profile_directory(self, account: LocalAccount) -> Path:
         return self._resolve_managed_path("profiles", str(account.id))

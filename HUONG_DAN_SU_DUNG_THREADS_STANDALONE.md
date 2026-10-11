@@ -12,13 +12,14 @@ Threads Standalone là công cụ chạy **cục bộ trên máy tính**, giúp 
 
 **Nguyên tắc:** Mỗi tài khoản phải thuộc sở hữu khách hàng hoặc được ủy quyền hợp pháp; người dùng chịu trách nhiệm kiểm tra nội dung và đích gửi. Không tạo tương tác giả, spam hoặc dùng phần mềm vượt challenge/CAPTCHA. Các hoạt động đọc/ghi tự động trên website chỉ được kích hoạt khi nền tảng cho phép hành vi tương ứng.
 
-### Trạng thái chức năng (trước khi Codex triển khai issue #47)
+### Trạng thái chức năng sau Micro-slice 1
 
 | Chức năng | Trạng thái |
 | --- | --- |
 | Tạo local account, đặt bí danh, tách Chromium profile theo UUID | **Đã có mã nguồn; synthetic-tested** |
 | Mở Chromium để người dùng tự đăng nhập | **Đã có mã nguồn; chưa live-verified trong repo mới** |
-| Mở profile/thread chính xác và đọc feed permalink (tối đa 20) | **Đã có mã nguồn; synthetic-tested**, mỗi lệnh đóng browser sau khi xong |
+| Các lệnh `profile`, `thread`, `feed` (tối đa 20 permalink) | **Đã có mã nguồn; synthetic-tested**, mỗi lệnh đóng browser sau khi xong |
+| Mở một thread chính xác và giữ Chromium cho operator review | **Có ở Micro-slice 1; synthetic-tested; chưa live-verified**; actor identity luôn là `UNKNOWN_IDENTITY` |
 | Tìm kiếm bài qua browser và trích xuất đầy đủ text/replies | **Chưa có** |
 | Nhập permalink do người vận hành tìm được; hàng đợi tuyển dụng liền mạch | **Chưa có workflow hoàn chỉnh** |
 | Tìm kiếm/mentions/replies thông qua official Threads API | **Đã có mã nguồn**, phụ thuộc quyền token và endpoint |
@@ -101,11 +102,14 @@ Không nhập mật khẩu/token ở CLI của ứng dụng, không export cooki
 uv run --locked threads-local feed test-a --limit 10
 uv run --locked threads-local profile test-a synthetic_user
 uv run --locked threads-local thread test-a "/@synthetic_user/post/SYNTHETIC_POST_ID"
+uv run --locked threads-local browser open-thread test-a "/@synthetic_user/post/SYNTHETIC_POST_ID" --interactive
 ```
 
 - `feed` lấy danh sách permalink hạn chế, **không phải nội dung bài viết đầy đủ**. Giới hạn tối đa hiện tại là 20.
 - `profile` và `thread` xác minh cấu trúc target ở mức giới hạn, **không đồng nghĩa xác minh danh tính account đang đăng nhập**.
-- Các lệnh browser hiện tại mở, kiểm tra và đóng Chromium. **Chưa có chế độ giữ cửa sổ mở để operator đọc/gửi trong một phiên**. Chế độ này là micro-slice đầu tiên trong issue #47.
+- `account login`, `feed`, `profile`, và `thread` đóng Chromium sau khi hoàn tất. Lệnh handoff bên dưới giữ cửa sổ mở trong lúc operator review.
+- `browser open-thread ... --interactive` giữ Chromium và account lock sau khi đã xác minh đúng permalink/author. Nhấn Enter trong terminal để kết thúc phiên; lệnh không điền nội dung hoặc gửi action. Terminal luôn báo `identity=UNKNOWN_IDENTITY`, vì profile path không chứng minh actor đang đăng nhập.
+- Lệnh mới chỉ được synthetic-tested; chưa thực hiện live Threads UAT. Chỉ mở target live sau khi có phê duyệt riêng cho phạm vi đó.
 - Lệnh `thread` không hỗ trợ toàn bộ URL tùy ý; ví dụ dùng dạng tham chiếu `/@username/post/id`.
 
 Không chạy quét feed/search liên tục hoặc sử dụng browser tự thu thập dữ liệu khi chưa xác minh việc đó được Meta cho phép.
