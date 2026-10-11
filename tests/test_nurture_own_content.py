@@ -33,6 +33,7 @@ from threads_platform.standalone.nurture import (
     get_nurture_preset,
 )
 from threads_platform.standalone.nurture_content import ContentCandidateV1, ContentCategory
+from threads_platform.standalone.nurture_conversations import NurtureInboundStatus
 from threads_platform.standalone.nurture_runner import (
     NurtureRunner,
     NurtureRunnerError,
@@ -491,6 +492,41 @@ async def test_disabled_content_apply_fails_before_quota_and_reservation(
         "candidates"
     ][0]
     assert record["publication_state"] == "NEW"
+
+
+@pytest.mark.asyncio
+async def test_foreign_inbound_alias_blocks_approved_content_post_apply(tmp_path: Path) -> None:
+    preset = _preset(
+        owner_public_username="configured_owner",
+        max_owned_threads_inspected_per_explicit_run=2,
+    )
+    root, store, account, preset = _setup(tmp_path, preset)
+    api = _Api()
+    mutations = _Mutations()
+    approved_candidate = _candidate()
+    foreign_binding = build_account_nurture_inbound_config(preset, "bob", "configured_owner", 2)
+
+    with pytest.raises(NurtureRunnerError) as error:
+        await NurtureRunner(cast(LocalThreadsApiRuntime, api), store).run(
+            account,
+            preset,
+            now=_NOW,
+            apply_requested=True,
+            content_candidate=approved_candidate,
+            mutations=cast(LocalThreadsMutationRuntime, mutations),
+            inbound_config=foreign_binding,
+        )
+
+    assert error.value.code == NurtureInboundStatus.ACCOUNT_MISMATCH.value
+    assert error.value.run_id is not None
+    with store.acquire_account_lock(account.id) as owner:
+        receipt = owner.get_run(error.value.run_id)
+    assert receipt.outcome == "FAILED"
+    assert receipt.error_code == NurtureInboundStatus.ACCOUNT_MISMATCH.value
+    assert receipt.failed_stage == "selection"
+    assert api.calls == []
+    assert mutations.calls == []
+    assert not _content_path(root, account, preset).exists()
 
 
 @pytest.mark.asyncio

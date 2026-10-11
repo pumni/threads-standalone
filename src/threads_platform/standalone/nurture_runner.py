@@ -67,7 +67,12 @@ _SAFE_RUNNER_CODES = frozenset(
         "INVALID_SEARCH_TYPE",
         "INVALID_THREAD_ID",
         "INVALID_USERNAME",
+        "INBOUND_ACCOUNT_MISMATCH",
         "INBOUND_CONFIGURATION_INVALID",
+        "INBOUND_OWNERSHIP_MISMATCH",
+        "INBOUND_OWNERSHIP_UNVERIFIED",
+        "INBOUND_PERMISSION_MISSING",
+        "INBOUND_READ_FAILED",
         "LOCAL_OPERATION_UNAVAILABLE",
         "NURTURE_BUSY",
         "NURTURE_DRAFT_TARGET_MISMATCH",
@@ -228,8 +233,6 @@ class NurtureRunner:
             raise NurtureRunnerError("RUN_FAILED")
         if type(preset) is not NurturePresetV1:
             raise NurtureRunnerError("PRESET_NOT_FOUND")
-        if inbound_config is not None and type(inbound_config) is not AccountNurtureInboundConfig:
-            raise NurtureRunnerError("INBOUND_CONFIGURATION_INVALID")
         if type(apply_requested) is not bool:
             raise NurtureRunnerError("RUN_FAILED")
         if draft is not None and type(draft) is not NurtureDraft:
@@ -687,6 +690,11 @@ class NurtureRunner:
                 raise NurtureRunnerError("NURTURE_QUOTE_TARGET_MISMATCH")
 
         inbound = await collect_nurture_inbound(self._api, account.alias, preset, inbound_config)
+        if inbound.status not in {
+            NurtureInboundStatus.READY,
+            NurtureInboundStatus.NOT_CONFIGURED,
+        }:
+            raise NurtureRunnerError(inbound.status.value)
         chosen = next(
             (
                 candidate
