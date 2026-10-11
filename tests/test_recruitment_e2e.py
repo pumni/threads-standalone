@@ -37,7 +37,7 @@ from threads_platform.standalone.mutations import (
     LocalOperationStore,
     LocalThreadsMutationRuntime,
 )
-from threads_platform.standalone.nurture_content import fingerprint_remote_thread
+from threads_platform.standalone.nurture_store import fingerprint_remote_thread
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run_recruitment.py"
 _TOKEN = "synthetic-rs05-token"
