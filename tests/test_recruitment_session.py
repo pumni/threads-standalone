@@ -276,7 +276,7 @@ async def test_observe_uses_read_only_api_runtime_and_keeps_no_config_discovery(
     assert mutations.calls == []
     assert any(call[0] == "search" for call in api.calls)
     assert not any(call[0] == "authenticated_profile" for call in api.calls)
-    assert result.inbound_status == "NOT_CONFIGURED"
+    assert result.inbound_status == "INBOUND_NOT_CONFIGURED"
 
 
 @pytest.mark.asyncio
@@ -392,7 +392,7 @@ async def test_apply_reply_uses_one_approved_exact_target_effect(
     mutations = _FakeMutations()
     mutation_modes = _install_fake_app(monkeypatch, api, mutations)
     draft = NurtureDraft(
-        target_fingerprint=fingerprint_remote_thread(api.thread),
+        target_fingerprint=fingerprint_remote_thread(api.thread.remote_thread_id),
         text="PRIVATE_SYNTHETIC_REPLY_TEXT",
     )
 

@@ -206,7 +206,10 @@ class RecruitmentSession:
         }
         if (mode is RecruitmentSessionMode.APPLY_REPLY) != (draft is not None):
             raise RecruitmentSessionError("INVALID_NURTURE_DRAFT")
-        if (mode is RecruitmentSessionMode.APPLY_POST) != (content_candidate is not None):
+        if (mode is RecruitmentSessionMode.APPLY_POST and content_candidate is None) or (
+            mode not in {RecruitmentSessionMode.APPLY_POST, RecruitmentSessionMode.REVIEW}
+            and content_candidate is not None
+        ):
             raise RecruitmentSessionError("INVALID_NURTURE_CONTENT")
 
         inbound_config = _bound_inbound_config(account, preset)
