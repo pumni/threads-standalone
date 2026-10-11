@@ -335,3 +335,52 @@ open; RS-06 (#25) remains HOLD. AO-03 adds no AI, automatic posting, or automati
 | Bounded private preview, no candidate/draft/approval persistence, account isolation, and mutation runtime disabled | `tests/test_recruitment_shortlist.py::test_shortlist_bounds_items_and_preview_and_hides_private_fields_from_repr`; `test_shortlist_uses_account_scoped_state_and_writes_no_candidate_or_receipt`; `test_cli_shortlist_requires_private_tty_and_selection_stays_preview_only` |
 | Redirected/CI output refusal, selection validation, EOF, Ctrl+C, and existing mode exclusivity | `tests/test_recruitment_shortlist.py::test_redirected_output_or_ci_rejects_shortlist_before_api_or_lock`; `test_eof_invalid_input_and_ctrl_c_exit_without_action`; `test_shortlist_mode_is_mutually_exclusive_with_existing_modes` |
 | One-command fake demo, source-only script boundary, and independent wheel import provenance | `tests/test_recruitment_shortlist.py::test_demo_source_script_runs_one_command_with_fake_data_only`; Windows/Ubuntu full and installed-wheel CI. |
+
+## AO-04A synthetic reply proposal preview
+
+Run the offline proposal demonstration from the source checkout with one command:
+
+```powershell
+uv run --locked python scripts/demo_recruitment_ai_draft.py
+```
+
+The script creates a new temporary root and a credentialless synthetic account, runs the existing
+Nurture shortlist policy through a fake read-only API, and passes the selected in-memory candidate
+to a deterministic fake generator. It prints the selected candidate's source, score, reason codes,
+and eligibility, then a synthetic reply preview marked `PROPOSED_FOR_HUMAN_REVIEW`, `NOT_APPROVED`,
+and `NOT_SENT`. The demonstration ends with `DISCARDED` and `remote_mutations=0`. It has no
+selection-to-send, apply, approval, provider, network, or credential option. The script is in the
+source repository and is not a wheel entry point.
+
+The proposal API accepts only the existing typed shortlist and a one-based selection. It binds the
+proposal to the exact selected candidate object and fingerprint, and rejects every status except
+`ELIGIBLE` with `REVIEW_CANDIDATE`. Candidate text is untrusted input. The only supplied generator
+is deterministic and ignores that text; generated output is rejected if empty, over 500 characters,
+whitespace-padded, or contains terminal control/format characters. Timeout and generator failures
+produce bounded error codes, and cancellation propagates. This synthetic behavior is not evidence
+that a real AI provider is safe or authorized.
+
+The selected candidate and proposal exist only in process memory. The proposal is not converted to
+`NurtureDraft(source="OPERATOR_FILE")`, does not create an approval token, and is not written to
+Nurture v1 state/receipts, the operation journal, public logs, or any durable inbox. The demo's
+temporary root may contain its synthetic account and the existing shortlist lock while it runs;
+the temporary directory is removed on exit. The production `--shortlist` command remains a private
+human review of fresh discovery; it does not call this generator or add an AI mode. A later send
+workflow would require separate authorization and exact-target revalidation.
+
+| AO-04A acceptance | Synthetic evidence |
+| --- | --- |
+| Only `ELIGIBLE` / `REVIEW_CANDIDATE` can generate; cooldown, pending, confirmed, ambiguous, and ineligible states stop before generation | `tests/test_recruitment_reply_proposal.py::test_non_eligible_candidate_states_cannot_generate_proposal` |
+| Selection binds the exact candidate and target fingerprint; candidate replacement fails | `test_only_selected_eligible_candidate_is_exactly_bound_to_preview` |
+| Reply is fake-only, deterministic, bounded, and untrusted candidate instructions are not executed | `test_fake_generator_is_deterministic_and_treats_candidate_text_as_untrusted`; `test_invalid_or_oversized_generator_output_is_rejected_without_truncation` |
+| Timeout, generator failure, and cancellation fail safely without exposing exception data | `test_timeout_and_generator_exception_are_bounded_and_sanitized`; `test_cancellation_propagates_without_creating_a_proposal` |
+| Repr and errors redact target/content; proposal is ephemeral and causes no persistence or mutation | `test_repr_and_failures_hide_context_reply_and_target_fingerprint`; `test_proposal_path_has_no_persistence_or_mutation_side_effects` |
+| Existing production CLI modes remain intact with no AI/apply-proposal mode | `test_production_cli_keeps_existing_modes_and_has_no_ai_or_apply_proposal_mode` |
+| One-command source demo output and installed-wheel module provenance | `test_demo_source_script_runs_one_command_with_fake_generator_only`; `test_new_proposal_module_imports_from_installed_wheel_when_requested`; Windows/Ubuntu installed-wheel CI. |
+
+The package module is included in the installed wheel and its wheel suite checks `site-packages`
+provenance. The demonstration script remains source-only; its subprocess test runs in source-checkout
+CI and is skipped only in the independent installed-wheel suite. No real AI call, Threads/Meta API,
+operator root, credential, approval, post, reply, quote, follow, or DM is exercised. Content rights
+and provenance issue #2 and real installation/live UAT issue #18 remain open; RS-06 issue #25 remains
+HOLD. AO-04A does not add AI-assisted production drafting or unattended publishing.
