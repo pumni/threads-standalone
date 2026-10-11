@@ -30,7 +30,7 @@ from threads_platform.standalone.nurture import (
     build_account_nurture_inbound_config,
     get_nurture_preset,
 )
-from threads_platform.standalone.nurture_content import ContentCandidateV1, ContentCategory
+from threads_platform.standalone.nurture_content import ContentCandidateV1
 from threads_platform.standalone.nurture_conversations import NurtureInboundStatus
 from threads_platform.standalone.nurture_discovery import (
     NurtureCandidate,
@@ -570,7 +570,7 @@ async def test_configured_inbound_failure_fails_without_fallback_or_mutation(
         account.alias,
         preset.id,
         "approved_post_source",
-        ContentCategory.CAREER_TIP,
+        "CAREER_TIP",
         "synthetic approved post",
     )
     mutations = _Mutations()
