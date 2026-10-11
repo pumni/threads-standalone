@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 from uuid import UUID
 
 from threads_platform.api.contracts import PublishingQuota
@@ -120,6 +121,49 @@ _SAFE_RUNNER_CODES = frozenset(
     }
 )
 _SAFE_STAGE = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
+_PREVIEW_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_PREVIEW_TEXT_CHARS = 500
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class NurturePreview:
+    """Bounded in-memory preview; remote and proposed text never enter repr or receipts."""
+
+    target_fingerprint: str
+    source: NurtureDiscoverySource | Literal["INBOUND_REPLY"]
+    reason_codes: tuple[str, ...]
+    action: Literal["OBSERVE", "REPLY_RECOMMENDED", "REPLY", "QUOTE"]
+    target_text: str | None = field(repr=False)
+    proposed_text: str | None = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.target_fingerprint) is not str
+            or _PREVIEW_FINGERPRINT.fullmatch(self.target_fingerprint) is None
+            or self.source not in {*NurtureDiscoverySource, "INBOUND_REPLY"}
+            or type(self.reason_codes) is not tuple
+            or len(self.reason_codes) > 16
+            or any(
+                type(code) is not str or re.fullmatch(r"[A-Z][A-Z0-9_]{0,31}", code) is None
+                for code in self.reason_codes
+            )
+            or self.action not in {"OBSERVE", "REPLY_RECOMMENDED", "REPLY", "QUOTE"}
+        ):
+            raise ValueError("invalid nurture preview")
+        for name in ("target_text", "proposed_text"):
+            value = getattr(self, name)
+            if value is not None and type(value) is not str:
+                raise ValueError("invalid nurture preview")
+            if value is not None and len(value) > _MAX_PREVIEW_TEXT_CHARS:
+                object.__setattr__(self, name, value[:_MAX_PREVIEW_TEXT_CHARS])
+
+    def __repr__(self) -> str:
+        return (
+            "NurturePreview("
+            f"target_fingerprint={self.target_fingerprint[:12]}…, "
+            f"source={self.source}, reason_codes={self.reason_codes!r}, "
+            f"action={self.action}, target_text=<redacted>, proposed_text=<redacted>)"
+        )
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -130,6 +174,7 @@ class NurtureRunResult:
     target_fingerprint: str | None
     content_candidate_id: UUID | None = None
     inbound_status: NurtureInboundStatus = NurtureInboundStatus.NOT_CONFIGURED
+    preview: NurturePreview | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         return (
@@ -148,6 +193,7 @@ class _NurtureSelection:
     discovered_count: int
     deduped_count: int
     inbound_status: NurtureInboundStatus
+    preview: NurturePreview | None = None
 
 
 class NurtureRunnerError(Exception):
@@ -320,6 +366,8 @@ class NurtureRunner:
                     draft,
                     quote_draft,
                     inbound_config,
+                    apply_requested,
+                    content_candidate is not None,
                 )
                 chosen = selection.candidate
                 selected_count = 1 if chosen is not None else 0
@@ -405,6 +453,7 @@ class NurtureRunner:
                             scope.finish("SUCCESS", now=now),
                             selected_fingerprint,
                             inbound_status=selection.inbound_status,
+                            preview=selection.preview,
                         )
 
                     stage = "observe"
@@ -424,6 +473,7 @@ class NurtureRunner:
                         scope.finish("SUCCESS", now=now),
                         selected_fingerprint,
                         inbound_status=selection.inbound_status,
+                        preview=selection.preview,
                     )
 
                 if content_candidate is None:
@@ -651,6 +701,7 @@ class NurtureRunner:
             scope.finish("SUCCESS", now=now),
             fingerprint,
             inbound_status=selection.inbound_status,
+            preview=selection.preview,
         )
 
     async def _select_current_candidate(
@@ -662,6 +713,8 @@ class NurtureRunner:
         draft: NurtureDraft | None,
         quote_draft: NurtureQuoteDraft | None,
         inbound_config: AccountNurtureInboundConfig | None,
+        apply_requested: bool,
+        own_content_requested: bool,
     ) -> _NurtureSelection:
         state = NurtureTargetStateV1(
             version=1,
@@ -695,21 +748,43 @@ class NurtureRunner:
             NurtureInboundStatus.NOT_CONFIGURED,
         }:
             raise NurtureRunnerError(inbound.status.value)
-        chosen = next(
-            (
-                candidate
-                for candidate in inbound.candidates
-                if _candidate_surface_eligible(
-                    candidate.fingerprint,
-                    targets.get(candidate.fingerprint),
-                    preset.seen_cooldown_seconds,
-                    now,
-                    draft,
-                    quote_draft,
-                )
-            ),
-            None,
-        )
+        if draft is not None:
+            inbound_bound = next(
+                (
+                    candidate
+                    for candidate in inbound.candidates
+                    if candidate.fingerprint == draft.target_fingerprint
+                ),
+                None,
+            )
+            if inbound_bound is not None and not _candidate_surface_eligible(
+                inbound_bound.fingerprint,
+                targets.get(inbound_bound.fingerprint),
+                preset.seen_cooldown_seconds,
+                now,
+                draft,
+                None,
+            ):
+                raise NurtureRunnerError("NURTURE_DRAFT_TARGET_MISMATCH")
+            chosen: NurtureInboundCandidate | NurtureCandidate | None = inbound_bound
+        elif quote_draft is None:
+            chosen = next(
+                (
+                    candidate
+                    for candidate in inbound.candidates
+                    if _candidate_surface_eligible(
+                        candidate.fingerprint,
+                        targets.get(candidate.fingerprint),
+                        preset.seen_cooldown_seconds,
+                        now,
+                        None,
+                        None,
+                    )
+                ),
+                None,
+            )
+        else:
+            chosen = None
         discovered_count = inbound.discovered_count
         deduped_count = inbound.deduped_count
         if chosen is not None:
@@ -721,44 +796,73 @@ class NurtureRunner:
             ):
                 raise NurtureRunnerError("NURTURE_QUOTE_TARGET_MISMATCH")
         else:
-            discovery = await discover_nurture_candidates(
-                self._api,
-                account.alias,
-                preset,
-                _discovery_state_for_bound_target(
-                    state,
-                    bound_target,
-                    bound_fingerprint,
-                ),
-                now,
+            discovery_state = _discovery_state_for_bound_target(
+                state,
+                bound_target,
+                bound_fingerprint,
             )
+            if bound_fingerprint is None:
+                discovery = await discover_nurture_candidates(
+                    self._api,
+                    account.alias,
+                    preset,
+                    discovery_state,
+                    now,
+                )
+            else:
+                discovery = await discover_nurture_candidates(
+                    self._api,
+                    account.alias,
+                    preset,
+                    discovery_state,
+                    now,
+                    exact_target_fingerprint=bound_fingerprint,
+                )
             discovered_count += discovery.discovered_count
             deduped_count += discovery.deduped_count
-            mentions = tuple(
-                candidate
-                for candidate in discovery.selected_candidates
-                if candidate.source_class is NurtureDiscoverySource.MENTIONS
-            )
-            remaining = tuple(
-                candidate
-                for candidate in discovery.selected_candidates
-                if candidate.source_class is not NurtureDiscoverySource.MENTIONS
-            )
-            chosen = next(
-                (
+            if bound_fingerprint is not None:
+                chosen = next(
+                    (
+                        candidate
+                        for candidate in discovery.selected_candidates
+                        if candidate.fingerprint == bound_fingerprint
+                        and _candidate_surface_eligible(
+                            candidate.fingerprint,
+                            targets.get(candidate.fingerprint),
+                            preset.seen_cooldown_seconds,
+                            now,
+                            draft,
+                            quote_draft,
+                        )
+                    ),
+                    None,
+                )
+            else:
+                mentions = tuple(
                     candidate
-                    for candidate in (*mentions, *remaining)
-                    if _candidate_surface_eligible(
-                        candidate.fingerprint,
-                        targets.get(candidate.fingerprint),
-                        preset.seen_cooldown_seconds,
-                        now,
-                        draft,
-                        quote_draft,
-                    )
-                ),
-                None,
-            )
+                    for candidate in discovery.selected_candidates
+                    if candidate.source_class is NurtureDiscoverySource.MENTIONS
+                )
+                remaining = tuple(
+                    candidate
+                    for candidate in discovery.selected_candidates
+                    if candidate.source_class is not NurtureDiscoverySource.MENTIONS
+                )
+                chosen = next(
+                    (
+                        candidate
+                        for candidate in (*mentions, *remaining)
+                        if _candidate_surface_eligible(
+                            candidate.fingerprint,
+                            targets.get(candidate.fingerprint),
+                            preset.seen_cooldown_seconds,
+                            now,
+                            None,
+                            None,
+                        )
+                    ),
+                    None,
+                )
             if draft is not None and (
                 chosen is None or chosen.fingerprint != draft.target_fingerprint
             ):
@@ -767,7 +871,20 @@ class NurtureRunner:
                 chosen is None or chosen.fingerprint != quote_draft.target_fingerprint
             ):
                 raise NurtureRunnerError("NURTURE_QUOTE_TARGET_MISMATCH")
-        return _NurtureSelection(chosen, targets, discovered_count, deduped_count, inbound.status)
+        return _NurtureSelection(
+            chosen,
+            targets,
+            discovered_count,
+            deduped_count,
+            inbound.status,
+            _selection_preview(
+                chosen,
+                draft,
+                quote_draft,
+                apply_requested=apply_requested,
+                own_content_requested=own_content_requested,
+            ),
+        )
 
 
 def _capture_utc(value: datetime | None) -> datetime:
@@ -800,6 +917,46 @@ def _candidate_surface_eligible(
     if fingerprint == bound_fingerprint and _can_bypass_seen_cooldown(target, now):
         return True
     return _surface_eligible(target, cooldown_seconds, now)
+
+
+def _selection_preview(
+    candidate: NurtureInboundCandidate | NurtureCandidate | None,
+    draft: NurtureDraft | None,
+    quote_draft: NurtureQuoteDraft | None,
+    *,
+    apply_requested: bool,
+    own_content_requested: bool,
+) -> NurturePreview | None:
+    if candidate is None:
+        return None
+    if isinstance(candidate, NurtureInboundCandidate):
+        source: NurtureDiscoverySource | Literal["INBOUND_REPLY"] = "INBOUND_REPLY"
+        reason_codes = ("INBOUND_REPLY",)
+        target_text = candidate.text
+    else:
+        source = candidate.source_class
+        reason_codes = candidate.reason_codes
+        target_text = candidate.text
+    if quote_draft is not None:
+        action: Literal["OBSERVE", "REPLY_RECOMMENDED", "REPLY", "QUOTE"] = "QUOTE"
+        proposed_text = quote_draft.text
+    elif draft is not None:
+        action = "REPLY"
+        proposed_text = draft.text
+    elif apply_requested and not own_content_requested:
+        action = "REPLY_RECOMMENDED"
+        proposed_text = None
+    else:
+        action = "OBSERVE"
+        proposed_text = None
+    return NurturePreview(
+        target_fingerprint=candidate.fingerprint,
+        source=source,
+        reason_codes=reason_codes,
+        action=action,
+        target_text=target_text,
+        proposed_text=proposed_text,
+    )
 
 
 def _can_bypass_seen_cooldown(target: NurtureTargetV1 | None, now: datetime) -> bool:

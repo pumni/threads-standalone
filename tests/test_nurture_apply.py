@@ -38,6 +38,7 @@ from threads_platform.standalone.nurture import (
     nurture_quote_allowed,
 )
 from threads_platform.standalone.nurture_conversations import NurtureInboundStatus
+from threads_platform.standalone.nurture_discovery import NurtureDiscoverySource
 from threads_platform.standalone.nurture_draft import (
     NurtureDraft,
     NurtureDraftError,
@@ -49,6 +50,7 @@ from threads_platform.standalone.nurture_quote_draft import (
     load_nurture_quote_draft,
 )
 from threads_platform.standalone.nurture_runner import (
+    NurturePreview,
     NurtureRunner,
     NurtureRunnerError,
     NurtureRunResult,
@@ -105,12 +107,18 @@ class _Api:
         owned_threads: tuple[RemoteDiscoveryThread, ...] = (),
         conversations: dict[str, ReplyPage] | None = None,
         identity_username: str = "configured_owner",
+        identity_failure: Exception | None = None,
+        profile_failure: Exception | None = None,
+        conversation_failure: Exception | None = None,
     ) -> None:
         self.threads = threads
         self.quota_value = quota or PublishingQuota()
         self.owned_threads = owned_threads
         self.conversations = conversations or {}
         self.identity_username = identity_username
+        self.identity_failure = identity_failure
+        self.profile_failure = profile_failure
+        self.conversation_failure = conversation_failure
         self.calls: list[tuple[object, ...]] = []
 
     async def mentions(self, alias: str, *, after: str | None, limit: int) -> DiscoveryPage:
@@ -139,14 +147,20 @@ class _Api:
         limit: int,
     ) -> DiscoveryPage:
         self.calls.append(("profile_posts", alias, username, after, limit))
+        if self.profile_failure is not None:
+            raise self.profile_failure
         return DiscoveryPage(self.owned_threads, "profile cursor sentinel", True)
 
     async def conversation(self, alias: str, thread_id: str, *, after: str | None) -> ReplyPage:
         self.calls.append(("conversation", alias, thread_id, after))
+        if self.conversation_failure is not None:
+            raise self.conversation_failure
         return self.conversations.get(thread_id, ReplyPage((), "reply cursor sentinel", True))
 
     async def authenticated_profile(self, alias: str) -> RemoteAuthenticatedProfile:
         self.calls.append(("authenticated_profile", alias))
+        if self.identity_failure is not None:
+            raise self.identity_failure
         return RemoteAuthenticatedProfile("synthetic_authenticated_id", self.identity_username)
 
     async def quota(self, alias: str) -> PublishingQuota:
@@ -488,10 +502,16 @@ async def test_inbound_apply_uses_root_thread_and_selected_reply_as_parent(tmp_p
     fingerprint = fingerprint_remote_reply(_REPLY_ID)
     mutations = _Mutations()
 
-    await _run_apply(api, store, account, preset, _draft(fingerprint), mutations)
+    result = await _run_apply(api, store, account, preset, _draft(fingerprint), mutations)
 
     assert mutations.calls == [("alice", _ROOT_ID, _DRAFT_TEXT, _REPLY_ID)]
     assert not any(call[0] == "mentions" for call in api.calls)
+    assert result.preview is not None
+    assert result.preview.source == "INBOUND_REPLY"
+    assert result.preview.reason_codes == ("INBOUND_REPLY",)
+    assert result.preview.target_text == "reply text sentinel"
+    assert result.preview.proposed_text == _DRAFT_TEXT
+    assert "reply text sentinel" not in repr(result.preview)
     persisted = _all_nurture_json(root)
     for secret in (_ROOT_ID, _REPLY_ID, "parent-other", "reply text sentinel", _DRAFT_TEXT):
         assert secret not in persisted
@@ -518,6 +538,90 @@ async def test_wrong_authenticated_username_blocks_reply_draft_apply(tmp_path: P
     assert receipt.failed_stage == "selection"
     assert api.calls == [("authenticated_profile", "alice")]
     assert mutations.calls == []
+
+
+@pytest.mark.asyncio
+async def test_foreign_inbound_binding_blocks_approved_discovery_target(
+    tmp_path: Path,
+) -> None:
+    preset = _preset(owner="configured_owner")
+    root, store, account, preset = _setup(tmp_path, preset=preset)
+    api = _Api()
+    mutations = _Mutations()
+    foreign_binding = build_account_nurture_inbound_config(
+        preset,
+        "foreign_alias",
+        "configured_owner",
+        preset.max_owned_threads_inspected_per_explicit_run,
+    )
+
+    with pytest.raises(NurtureRunnerError) as error:
+        await NurtureRunner(cast(LocalThreadsApiRuntime, api), store).run_with_selection(
+            account,
+            preset,
+            now=_NOW,
+            apply_requested=True,
+            draft=_draft(fingerprint_remote_thread(_THREAD_ID)),
+            mutations=cast(LocalThreadsMutationRuntime, mutations),
+            inbound_config=foreign_binding,
+        )
+
+    assert error.value.code == NurtureInboundStatus.ACCOUNT_MISMATCH.value
+    assert error.value.run_id is not None
+    assert api.calls == []
+    assert mutations.calls == []
+    with store.acquire_account_lock(account.id) as owner:
+        receipt = owner.get_run(error.value.run_id)
+    assert receipt.outcome == "FAILED"
+    assert receipt.error_code == NurtureInboundStatus.ACCOUNT_MISMATCH.value
+    assert receipt.failed_stage == "selection"
+    assert not (root / "nurture" / "state" / str(account.id) / f"{preset.id}.json").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failed_read", "expected_code"),
+    [
+        ("identity", NurtureInboundStatus.OWNERSHIP_UNVERIFIED.value),
+        ("profile", NurtureInboundStatus.READ_FAILED.value),
+        ("conversation", NurtureInboundStatus.READ_FAILED.value),
+    ],
+)
+async def test_configured_inbound_read_failure_blocks_approved_discovery_target(
+    tmp_path: Path,
+    failed_read: str,
+    expected_code: str,
+) -> None:
+    preset = _preset(owner="configured_owner")
+    _, store, account, preset = _setup(tmp_path, preset=preset)
+    failure = RuntimeError("synthetic read failure")
+    api = _Api(
+        owned_threads=(_thread(_ROOT_ID),),
+        identity_failure=failure if failed_read == "identity" else None,
+        profile_failure=failure if failed_read == "profile" else None,
+        conversation_failure=failure if failed_read == "conversation" else None,
+    )
+    mutations = _Mutations()
+
+    with pytest.raises(NurtureRunnerError) as error:
+        await _run_apply(
+            api,
+            store,
+            account,
+            preset,
+            _draft(fingerprint_remote_thread(_THREAD_ID)),
+            mutations,
+        )
+
+    assert error.value.code == expected_code
+    assert error.value.run_id is not None
+    assert not any(call[0] in {"mentions", "search"} for call in api.calls)
+    assert mutations.calls == []
+    with store.acquire_account_lock(account.id) as owner:
+        receipt = owner.get_run(error.value.run_id)
+    assert receipt.outcome == "FAILED"
+    assert receipt.error_code == expected_code
+    assert receipt.failed_stage == "selection"
 
 
 @pytest.mark.asyncio
@@ -548,10 +652,17 @@ async def test_recently_observed_exact_target_can_apply_but_stale_or_other_targe
             other_mutations,
         )
     assert error.value.code == "NURTURE_DRAFT_TARGET_MISMATCH"
+    assert error.value.run_id is not None
     assert other_mutations.calls == []
+    assert other_api.calls
     assert not (
         other_root / "nurture" / "state" / str(other_account.id) / f"{other_preset.id}.json"
     ).exists()
+    with other_store.acquire_account_lock(other_account.id) as owner:
+        failed_receipt = owner.get_run(error.value.run_id)
+    assert failed_receipt.outcome == "FAILED"
+    assert failed_receipt.error_code == "NURTURE_DRAFT_TARGET_MISMATCH"
+    assert failed_receipt.failed_stage == "selection"
 
 
 @pytest.mark.asyncio
@@ -569,25 +680,73 @@ async def test_future_seen_timestamp_does_not_use_apply_cooldown_bypass(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_higher_priority_current_candidate_makes_bound_draft_mismatch(tmp_path: Path) -> None:
-    root, store, account, preset = _setup(tmp_path)
+async def test_bound_draft_revalidates_exact_candidate_below_current_top_rank(
+    tmp_path: Path,
+) -> None:
+    root, store, account, preset = _setup(
+        tmp_path,
+        preset=replace(_preset(), max_selected_candidates=1, max_browser_enrichments=1),
+    )
     later = replace(_thread("bound-lower-priority"), timestamp=_NOW.replace(day=1))
     api = _Api(threads=(_thread("higher-priority"), later))
     mutations = _Mutations()
 
-    with pytest.raises(NurtureRunnerError) as error:
-        await _run_apply(
-            api,
-            store,
-            account,
-            preset,
-            _draft(fingerprint_remote_thread("bound-lower-priority")),
-            mutations,
-        )
+    result = await _run_apply(
+        api,
+        store,
+        account,
+        preset,
+        _draft(fingerprint_remote_thread("bound-lower-priority")),
+        mutations,
+    )
 
-    assert error.value.code == "NURTURE_DRAFT_TARGET_MISMATCH"
-    assert mutations.calls == []
-    assert not (root / "nurture" / "state" / str(account.id) / f"{preset.id}.json").exists()
+    assert result.receipt.outcome == "SUCCESS"
+    assert result.receipt.decision_codes == ("REPLY_APPLIED",)
+    assert result.receipt.replied_count == 1
+    assert result.receipt.operation_ids == (mutations.operation_id,)
+    assert mutations.calls == [("alice", "bound-lower-priority", _DRAFT_TEXT, None)]
+    assert result.preview is not None
+    assert type(result.preview) is NurturePreview
+    assert result.preview.target_fingerprint == fingerprint_remote_thread("bound-lower-priority")
+    assert result.preview.source is NurtureDiscoverySource.MENTIONS
+    assert result.preview.reason_codes[0] == "SOURCE_MENTIONS"
+    assert result.preview.action == "REPLY"
+    assert result.preview.target_text == _REMOTE_TEXT
+    assert result.preview.proposed_text == _DRAFT_TEXT
+    assert _REMOTE_TEXT not in repr(result.preview)
+    assert _DRAFT_TEXT not in repr(result.preview)
+    assert _REMOTE_TEXT not in repr(result)
+    persisted = _all_nurture_json(root)
+    assert _REMOTE_TEXT not in persisted
+    assert _DRAFT_TEXT not in persisted
+    target = _target_state_json(root, account, preset)["targets"][0]
+    assert target["fingerprint"] == fingerprint_remote_thread("bound-lower-priority")
+    assert target["action_state"] == "CONFIRMED"
+
+
+@pytest.mark.asyncio
+async def test_observe_result_exposes_only_a_bounded_typed_local_preview(
+    tmp_path: Path,
+) -> None:
+    root, store, account, preset = _setup(tmp_path)
+    remote_text = "career " + ("REMOTE_PREVIEW_SENTINEL " * 40)
+    result = await NurtureRunner(
+        cast(LocalThreadsApiRuntime, _Api(threads=(_thread(_THREAD_ID, remote_text),))), store
+    ).run_with_selection(account, preset, now=_NOW)
+
+    assert result.receipt.outcome == "SUCCESS"
+    assert result.preview is not None
+    assert type(result.preview) is NurturePreview
+    assert result.preview.target_fingerprint == fingerprint_remote_thread(_THREAD_ID)
+    assert result.preview.source is NurtureDiscoverySource.MENTIONS
+    assert result.preview.reason_codes[0] == "SOURCE_MENTIONS"
+    assert result.preview.action == "OBSERVE"
+    assert result.preview.proposed_text is None
+    assert result.preview.target_text == remote_text[:500]
+    assert len(result.preview.target_text) <= 500
+    assert "REMOTE_PREVIEW_SENTINEL" not in repr(result.preview)
+    assert "REMOTE_PREVIEW_SENTINEL" not in repr(result)
+    assert "REMOTE_PREVIEW_SENTINEL" not in _all_nurture_json(root)
 
 
 @pytest.mark.asyncio
@@ -1024,7 +1183,7 @@ async def test_quote_binding_fails_closed_without_silent_retarget(tmp_path: Path
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bind_to_inbound", [False, True])
-async def test_actionable_inbound_outranks_quote_and_is_never_quote_eligible(
+async def test_quote_binding_revalidates_exact_discovery_target_and_never_converts_inbound(
     tmp_path: Path,
     bind_to_inbound: bool,
 ) -> None:
@@ -1056,8 +1215,22 @@ async def test_actionable_inbound_outranks_quote_and_is_never_quote_eligible(
         else fingerprint_remote_thread(_THREAD_ID)
     )
 
-    with pytest.raises(NurtureRunnerError) as caught:
-        await _run_quote_apply(
+    if bind_to_inbound:
+        with pytest.raises(NurtureRunnerError) as caught:
+            await _run_quote_apply(
+                api,
+                store,
+                account,
+                preset,
+                NurtureQuoteDraft(fingerprint, _QUOTE_TEXT),
+                mutations,
+            )
+        assert caught.value.code == "NURTURE_QUOTE_TARGET_MISMATCH"
+        assert mutations.quote_calls == []
+        assert not any(call[0] == "mentions" for call in api.calls)
+        assert not any(call[0] == "search" for call in api.calls)
+    else:
+        result = await _run_quote_apply(
             api,
             store,
             account,
@@ -1065,11 +1238,43 @@ async def test_actionable_inbound_outranks_quote_and_is_never_quote_eligible(
             NurtureQuoteDraft(fingerprint, _QUOTE_TEXT),
             mutations,
         )
+        assert result.receipt.outcome == "SUCCESS"
+        assert result.preview is not None
+        assert result.preview.action == "QUOTE"
+        assert mutations.quote_calls == [("alice", _THREAD_ID, _QUOTE_TEXT)]
+        assert mutations.calls == []
+        assert any(call[0] == "mentions" for call in api.calls)
 
-    assert caught.value.code == "NURTURE_QUOTE_TARGET_MISMATCH"
-    assert mutations.quote_calls == []
-    assert not any(call[0] == "mentions" for call in api.calls)
-    assert not any(call[0] == "search" for call in api.calls)
+
+@pytest.mark.asyncio
+async def test_quote_draft_revalidates_exact_target_below_current_top_rank(
+    tmp_path: Path,
+) -> None:
+    _, store, account, preset = _setup(
+        tmp_path,
+        preset=replace(_preset(), max_selected_candidates=1, max_browser_enrichments=1),
+    )
+    bound = replace(_thread("bound-quote-lower-rank"), timestamp=_NOW.replace(day=1))
+    api = _Api(threads=(_thread("higher-quote-rank"), bound))
+    mutations = _Mutations()
+
+    result = await _run_quote_apply(
+        api,
+        store,
+        account,
+        preset,
+        NurtureQuoteDraft(fingerprint_remote_thread("bound-quote-lower-rank"), _QUOTE_TEXT),
+        mutations,
+    )
+
+    assert result.receipt.outcome == "SUCCESS"
+    assert result.receipt.published_count == 1
+    assert result.receipt.operation_ids == (mutations.operation_id,)
+    assert mutations.quote_calls == [("alice", "bound-quote-lower-rank", _QUOTE_TEXT)]
+    assert mutations.calls == []
+    assert result.preview is not None
+    assert result.preview.action == "QUOTE"
+    assert result.preview.target_fingerprint == fingerprint_remote_thread("bound-quote-lower-rank")
 
 
 @pytest.mark.asyncio
