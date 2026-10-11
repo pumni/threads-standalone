@@ -20,13 +20,21 @@ Threads Standalone là công cụ chạy **cục bộ trên máy tính**, giúp 
 | Mở Chromium để người dùng tự đăng nhập | **Đã có mã nguồn; chưa live-verified trong repo mới** |
 | Các lệnh `profile`, `thread`, `feed` (tối đa 20 permalink) | **Đã có mã nguồn; synthetic-tested**, mỗi lệnh đóng browser sau khi xong |
 | Mở một thread chính xác và giữ Chromium cho operator review | **Có ở Micro-slice 1; synthetic-tested; chưa live-verified**; actor identity luôn là `UNKNOWN_IDENTITY` |
-| Tìm kiếm bài qua browser và trích xuất đầy đủ text/replies | **Chưa có** |
-| Nhập permalink do người vận hành tìm được; hàng đợi tuyển dụng liền mạch | **Chưa có workflow hoàn chỉnh** |
+| Tìm kiếm bài qua browser và đọc hội thoại trên Threads thật | **Chưa được bật**; UI selector chưa xác minh, chỉ có adapter/fixture synthetic ở S2 |
+| Chuẩn hóa permalink do người vận hành nhập | **Có helper offline ở S2**, chưa nối vào CLI hoặc hàng đợi tuyển dụng |
 | Tìm kiếm/mentions/replies thông qua official Threads API | **Đã có mã nguồn**, phụ thuộc quyền token và endpoint |
 | Nurture discovery, ranking, dedupe, cooldown | **Đã có mã nguồn**, hiện sử dụng **API** thay vì browser |
 | Review, áp dụng trả lời/đăng bài qua API | **Đã có mã nguồn**, có thể phát sinh tác động thật; **không sử dụng khi chưa được duyệt** |
 | Browser điền/gửi reply | **Chưa có**; hành vi tự động cần kiểm tra quyền Meta riêng |
 | Customer demo launcher | **Chỉ synthetic, không đăng nhập và không gửi thật** |
+
+### Trạng thái Micro-slice 2 — synthetic-only
+
+- Adapter tìm kiếm và đọc hội thoại chỉ nhận dữ liệu fixture/fake engine. Chưa có selector Threads thật và không có lệnh `browser search` hay `browser scan`.
+- Search yêu cầu query do operator cung cấp (1–120 ký tự), tối đa 5 batch, 100 candidate đầu vào và 20 kết quả; excerpt tối đa 500 ký tự. Đọc hội thoại nhận đúng permalink, tối đa 100 candidate và trả tối đa 20 observation.
+- Kết quả hội thoại chỉ ghi `parent_ref` khi parent xuất hiện và khớp rõ trong fixture. Thiếu parent hoặc ngữ cảnh chưa hoàn chỉnh được đánh dấu `PARTIAL`/`UNKNOWN`.
+- Helper permalink hoạt động offline, chỉ nhận URL `https://www.threads.com` hoặc path tương đối có dạng post hợp lệ; query tracking nằm trong allowlist được loại khỏi kết quả. Helper đánh dấu `source=MANUAL_URL`, `context_status=UNKNOWN` và không ghi hàng đợi/state.
+- S2 chỉ synthetic-tested; **chưa live-verified**. Không dùng adapter fixture để suy ra Threads thật cho phép hoặc hỗ trợ tự động thu thập dữ liệu.
 
 ## 2. Yêu cầu máy tính
 

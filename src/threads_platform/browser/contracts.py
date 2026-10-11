@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -47,6 +48,11 @@ class RemoteSessionStateUncertain(BrowserAdapterError):
 class NavigationTimeout(BrowserAdapterError):
     def __init__(self) -> None:
         super().__init__("BROWSER_NAVIGATION_TIMEOUT")
+
+
+class BrowserReadTimeout(BrowserAdapterError):
+    def __init__(self) -> None:
+        super().__init__("BROWSER_READ_TIMEOUT")
 
 
 class UnsupportedUIState(BrowserAdapterError):
@@ -111,6 +117,29 @@ class BrowserFeedEngineSession(BrowserEngineSession, Protocol):
 
 class BrowserThreadOpenEngineSession(BrowserEngineSession, Protocol):
     async def verify_thread_target(self, *, target_ref: str, author_username: str) -> None: ...
+
+
+class BrowserSearchEngineSession(Protocol):
+    """Read contract for synthetic search fixtures; no production engine implements it."""
+
+    async def search_candidates(
+        self,
+        query: str,
+        *,
+        iteration_bound: int,
+        candidate_bound: int,
+    ) -> Sequence[Sequence[Mapping[str, object]]]: ...
+
+
+class BrowserConversationEngineSession(Protocol):
+    """Read contract for synthetic conversation fixtures; no production engine implements it."""
+
+    async def read_conversation(
+        self,
+        target_ref: str,
+        *,
+        candidate_bound: int,
+    ) -> tuple[Sequence[Mapping[str, object]], bool | None]: ...
 
 
 class BrowserProfileOpenEngineSession(BrowserEngineSession, Protocol):
