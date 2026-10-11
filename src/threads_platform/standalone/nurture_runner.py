@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -371,6 +372,7 @@ class NurtureRunner:
                 )
                 chosen = selection.candidate
                 selected_count = 1 if chosen is not None else 0
+                engagement_decision: str | None = None
                 if chosen is not None:
                     decision = (
                         "QUOTE_APPLY"
@@ -382,6 +384,7 @@ class NurtureRunner:
                             own_content_requested=content_candidate is not None,
                         )
                     )
+                    engagement_decision = decision
                     stage = "receipt"
                     scope.update(
                         discovered_count=selection.discovered_count,
@@ -469,12 +472,13 @@ class NurtureRunner:
                         raise NurtureStateError("NURTURE_STATE_INVALID")
                     if observed.action_state not in {"NONE", "CONFIRMED"}:
                         raise NurtureStateError("NURTURE_STATE_INVALID")
-                    return NurtureRunResult(
-                        scope.finish("SUCCESS", now=now),
-                        selected_fingerprint,
-                        inbound_status=selection.inbound_status,
-                        preview=selection.preview,
-                    )
+                    if content_candidate is None:
+                        return NurtureRunResult(
+                            scope.finish("SUCCESS", now=now),
+                            selected_fingerprint,
+                            inbound_status=selection.inbound_status,
+                            preview=selection.preview,
+                        )
 
                 if content_candidate is None:
                     stage = "receipt"
@@ -494,100 +498,23 @@ class NurtureRunner:
                         inbound_status=selection.inbound_status,
                     )
 
-                stage = "content_policy"
-                record = owner.register_content_candidate(
-                    preset,
-                    content_candidate.candidate_id,
-                    content_candidate.source_fingerprint,
-                    content_candidate.draft_fingerprint,
-                    content_candidate.category,
-                    run_id,
-                    now=now,
-                )
-                content_state = owner.get_content_state(preset)
-                is_due = _own_content_is_due(content_state.candidates, preset, now)
-                discovered_count = selection.discovered_count + 1
-                deduped_count = selection.deduped_count + 1
-                selected_count = 1 if is_due else 0
-                decision = (
-                    "CONTENT_NOT_DUE"
-                    if not is_due
-                    else "CONTENT_APPLY"
-                    if apply_requested
-                    else "CONTENT_RECOMMENDED_NO_APPLY"
-                )
-                stage = "receipt"
-                scope.update(
-                    discovered_count=discovered_count,
-                    deduped_count=deduped_count,
-                    selected_count=selected_count,
-                    enriched_count=0,
-                    replied_count=0,
-                    published_count=0,
-                    skipped_count=deduped_count - selected_count,
-                    decision_codes=(decision,),
-                )
-                if not is_due:
-                    return NurtureRunResult(
-                        scope.finish("SUCCESS", now=now),
-                        None,
-                        record.candidate_id,
-                        selection.inbound_status,
-                    )
-                if not apply_requested:
-                    return NurtureRunResult(
-                        scope.finish("SUCCESS", now=now),
-                        None,
-                        record.candidate_id,
-                        selection.inbound_status,
-                    )
+                def set_stage(value: str) -> None:
+                    nonlocal stage
+                    stage = value
 
-                stage = "policy"
-                if (
-                    not preset.engagement_enabled
-                    or preset.max_own_post_mutations_per_explicit_run < 1
-                ):
-                    raise NurtureRunnerError("NURTURE_CONTENT_APPLY_DISABLED")
-                if mutations is None:
-                    raise NurtureRunnerError("RUN_FAILED")
-                stage = "quota"
-                quota = await self._api.quota(account.alias)
-                if _publishing_quota_exhausted(quota):
-                    raise NurtureRunnerError("THREADS_PUBLISHING_QUOTA_REACHED")
-
-                stage = "reserve"
-                owner.reserve_content_candidate(
+                return await self._run_own_content(
+                    owner,
+                    scope,
+                    account,
                     preset,
-                    content_candidate.source_fingerprint,
-                    content_candidate.draft_fingerprint,
+                    now,
                     run_id,
-                )
-                stage = "publish"
-                result = await mutations.publish_text(account.alias, content_candidate.text)
-                if (
-                    type(result) is not PublishedTextResult
-                    or type(result.operation_id) is not UUID
-                    or result.operation_id.version != 4
-                ):
-                    raise NurtureRunnerError("RUN_FAILED")
-
-                stage = "confirm"
-                owner.complete_content_candidate(
-                    preset,
-                    content_candidate.source_fingerprint,
-                    content_candidate.draft_fingerprint,
-                    run_id,
-                    "PUBLISHED",
-                    result.operation_id,
-                    now=now,
-                )
-                scope.link_operation(result.operation_id)
-                scope.update(published_count=1, decision_codes=("CONTENT_PUBLISHED",))
-                return NurtureRunResult(
-                    scope.finish("SUCCESS", now=now),
-                    None,
-                    record.candidate_id,
-                    selection.inbound_status,
+                    selection,
+                    content_candidate,
+                    apply_requested,
+                    mutations,
+                    engagement_decision,
+                    set_stage,
                 )
             except KeyboardInterrupt, asyncio.CancelledError:
                 raise
@@ -604,9 +531,7 @@ class NurtureRunner:
                     and type(error.operation_id) is UUID
                     and error.operation_id.version == 4
                 ):
-                    if content_candidate is not None and (
-                        selection is not None and selection.candidate is None
-                    ):
+                    if content_candidate is not None:
                         _best_effort_content_ambiguous(
                             owner,
                             scope,
@@ -646,6 +571,124 @@ class NurtureRunner:
                 _finish_failed(scope, code, stage, run_id)
                 raise NurtureRunnerError(code, run_id) from None
         raise NurtureRunnerError("RUN_FAILED", run_id) from None
+
+    async def _run_own_content(
+        self,
+        owner: NurtureAccountLock,
+        scope: NurtureRunScope,
+        account: LocalAccount,
+        preset: NurturePresetV1,
+        now: datetime,
+        run_id: UUID,
+        selection: _NurtureSelection,
+        content_candidate: ContentCandidateV1,
+        apply_requested: bool,
+        mutations: LocalThreadsMutationRuntime | None,
+        engagement_decision: str | None,
+        set_stage: Callable[[str], None],
+    ) -> NurtureRunResult:
+        """Evaluate and, only when separately approved, publish own content."""
+
+        set_stage("content_policy")
+        record = owner.register_content_candidate(
+            preset,
+            content_candidate.candidate_id,
+            content_candidate.source_fingerprint,
+            content_candidate.draft_fingerprint,
+            content_candidate.category,
+            run_id,
+            now=now,
+        )
+        content_state = owner.get_content_state(preset)
+        is_due = _own_content_is_due(content_state.candidates, preset, now)
+        discovered_count = selection.discovered_count + 1
+        deduped_count = selection.deduped_count + 1
+        selected_count = 1 if is_due or selection.candidate is not None else 0
+        content_decision = (
+            "CONTENT_NOT_DUE"
+            if not is_due
+            else "CONTENT_APPLY"
+            if apply_requested
+            else "CONTENT_RECOMMENDED_NO_APPLY"
+        )
+        set_stage("receipt")
+        scope.update(
+            discovered_count=discovered_count,
+            deduped_count=deduped_count,
+            selected_count=selected_count,
+            enriched_count=0,
+            replied_count=0,
+            published_count=0,
+            skipped_count=deduped_count - selected_count,
+            decision_codes=(
+                (content_decision,)
+                if engagement_decision is None
+                else (engagement_decision, content_decision)
+            ),
+        )
+        target_fingerprint = (
+            None if selection.candidate is None else selection.candidate.fingerprint
+        )
+        if not is_due or not apply_requested:
+            return NurtureRunResult(
+                scope.finish("SUCCESS", now=now),
+                target_fingerprint,
+                record.candidate_id,
+                selection.inbound_status,
+                selection.preview,
+            )
+
+        set_stage("policy")
+        if not preset.engagement_enabled or preset.max_own_post_mutations_per_explicit_run < 1:
+            raise NurtureRunnerError("NURTURE_CONTENT_APPLY_DISABLED")
+        if mutations is None:
+            raise NurtureRunnerError("RUN_FAILED")
+        set_stage("quota")
+        quota = await self._api.quota(account.alias)
+        if _publishing_quota_exhausted(quota):
+            raise NurtureRunnerError("THREADS_PUBLISHING_QUOTA_REACHED")
+
+        set_stage("reserve")
+        owner.reserve_content_candidate(
+            preset,
+            content_candidate.source_fingerprint,
+            content_candidate.draft_fingerprint,
+            run_id,
+        )
+        set_stage("publish")
+        result = await mutations.publish_text(account.alias, content_candidate.text)
+        if (
+            type(result) is not PublishedTextResult
+            or type(result.operation_id) is not UUID
+            or result.operation_id.version != 4
+        ):
+            raise NurtureRunnerError("RUN_FAILED")
+
+        set_stage("confirm")
+        owner.complete_content_candidate(
+            preset,
+            content_candidate.source_fingerprint,
+            content_candidate.draft_fingerprint,
+            run_id,
+            "PUBLISHED",
+            result.operation_id,
+            now=now,
+        )
+        scope.link_operation(result.operation_id)
+        scope.update(
+            published_count=1,
+            decision_codes=(
+                *scope.receipt.decision_codes[:-1],
+                "CONTENT_PUBLISHED",
+            ),
+        )
+        return NurtureRunResult(
+            scope.finish("SUCCESS", now=now),
+            target_fingerprint,
+            record.candidate_id,
+            selection.inbound_status,
+            selection.preview,
+        )
 
     async def _apply_quote(
         self,
@@ -1198,7 +1241,12 @@ def _best_effort_content_ambiguous(
         # Best-effort journal linking must not permit a retry or mask the original failure.
         pass
     try:
-        scope.update(decision_codes=("CONTENT_PUBLISH_AMBIGUOUS",))
+        scope.update(
+            decision_codes=(
+                *scope.receipt.decision_codes[:-1],
+                "CONTENT_PUBLISH_AMBIGUOUS",
+            )
+        )
     except Exception:  # noqa: BLE001, S110
         # Best-effort receipt update must not mask the original ambiguous outcome.
         pass

@@ -342,28 +342,62 @@ async def test_due_policy_uses_the_stricter_preset_interval(
 
 
 @pytest.mark.asyncio
-async def test_conversation_candidate_wins_without_registering_or_publishing_content(
+async def test_discovery_candidate_and_own_content_are_decided_independently(
     tmp_path: Path,
 ) -> None:
     root, store, account, preset = _setup(tmp_path)
     api = _Api(mentions=(_thread(),))
     mutations = _Mutations()
+    candidate = _candidate()
 
-    result = await _run(api, store, account, preset, _candidate(), apply=True, mutations=mutations)
+    result = await _run(api, store, account, preset, candidate, apply=True, mutations=mutations)
 
     assert result.receipt.outcome == "SUCCESS"
-    assert result.receipt.decision_codes == ("OBSERVE_ONLY",)
+    assert result.receipt.decision_codes == ("OBSERVE_ONLY", "CONTENT_PUBLISHED")
     assert result.receipt.selected_count == 1
     assert result.target_fingerprint is not None
-    assert mutations.calls == []
-    assert not _content_path(root, account, preset).exists()
+    assert result.content_candidate_id == candidate.candidate_id
+    assert result.receipt.replied_count == 0
+    assert result.receipt.published_count == 1
+    assert result.receipt.operation_ids == (mutations.operation_id,)
+    assert mutations.calls == [("alice", _TEXT_SENTINEL)]
+    content = json.loads(_content_path(root, account, preset).read_text(encoding="utf-8"))
+    assert content["candidates"][0]["publication_state"] == "PUBLISHED"
     target_path = root / "nurture" / "state" / str(account.id) / f"{preset.id}.json"
     target = json.loads(target_path.read_text(encoding="utf-8"))["targets"][0]
     assert target["action_state"] == "NONE"
 
 
 @pytest.mark.asyncio
-async def test_proven_inbound_reply_outranks_content_and_short_circuits_discovery(
+async def test_engagement_candidate_does_not_hide_recommendation_without_apply(
+    tmp_path: Path,
+) -> None:
+    root, store, account, preset = _setup(tmp_path)
+    candidate = _candidate()
+    api = _Api(mentions=(_thread(),))
+
+    result = await _run(api, store, account, preset, candidate)
+
+    assert result.receipt.outcome == "SUCCESS"
+    assert result.receipt.decision_codes == (
+        "OBSERVE_ONLY",
+        "CONTENT_RECOMMENDED_NO_APPLY",
+    )
+    assert result.target_fingerprint is not None
+    assert result.content_candidate_id == candidate.candidate_id
+    assert result.receipt.published_count == 0
+    assert result.receipt.replied_count == 0
+    assert not any(call[0] == "quota" for call in api.calls)
+    assert (
+        json.loads(_content_path(root, account, preset).read_text(encoding="utf-8"))["candidates"][
+            0
+        ]["publication_state"]
+        == "NEW"
+    )
+
+
+@pytest.mark.asyncio
+async def test_proven_inbound_and_own_content_are_evaluated_without_reply_mutation(
     tmp_path: Path,
 ) -> None:
     preset = _preset(
@@ -392,15 +426,19 @@ async def test_proven_inbound_reply_outranks_content_and_short_circuits_discover
     result = await _run(api, store, account, preset, _candidate(), apply=True, mutations=mutations)
 
     assert result.receipt.outcome == "SUCCESS"
-    assert result.receipt.decision_codes == ("INBOUND_CANDIDATE",)
+    assert result.receipt.decision_codes == ("INBOUND_CANDIDATE", "CONTENT_PUBLISHED")
     assert api.calls == [
         ("authenticated_profile", "alice"),
         ("profile_posts", "alice", "configured_owner", None, 1),
         ("conversation", "alice", root_id, None),
+        ("quota", "alice"),
     ]
     assert result.target_fingerprint is not None
-    assert mutations.calls == []
-    assert not _content_path(root, account, preset).exists()
+    assert mutations.calls == [("alice", _TEXT_SENTINEL)]
+    assert result.receipt.replied_count == 0
+    assert result.receipt.published_count == 1
+    content = json.loads(_content_path(root, account, preset).read_text(encoding="utf-8"))
+    assert content["candidates"][0]["publication_state"] == "PUBLISHED"
 
 
 @pytest.mark.asyncio
@@ -449,6 +487,37 @@ async def test_not_due_content_is_successful_and_not_published(tmp_path: Path) -
     assert result.receipt.selected_count == 0
     assert result.receipt.published_count == 0
     assert mutations.calls == []
+
+
+@pytest.mark.asyncio
+async def test_published_source_and_draft_are_rejected_after_store_restart(
+    tmp_path: Path,
+) -> None:
+    root, store, account, preset = _setup(tmp_path)
+    candidate = _candidate()
+    first_mutations = _Mutations()
+    first_result = await _run(
+        _Api(), store, account, preset, candidate, apply=True, mutations=first_mutations
+    )
+    assert first_result.receipt.published_count == 1
+
+    second_api = _Api()
+    second_mutations = _Mutations()
+    with pytest.raises(NurtureRunnerError) as error:
+        await _run(
+            second_api,
+            NurtureStore(root),
+            account,
+            preset,
+            candidate,
+            apply=True,
+            mutations=second_mutations,
+        )
+
+    assert error.value.code == "NURTURE_CONTENT_ALREADY_USED"
+    assert first_mutations.calls == [("alice", _TEXT_SENTINEL)]
+    assert second_mutations.calls == []
+    assert not any(call[0] == "quota" for call in second_api.calls)
 
 
 @pytest.mark.asyncio
@@ -631,7 +700,15 @@ async def test_exact_publish_ambiguity_links_operation_and_never_retries(tmp_pat
         failure=StandaloneMutationError("PUBLISH_OUTCOME_AMBIGUOUS", operation_id),
     )
     with pytest.raises(NurtureRunnerError) as error:
-        await _run(_Api(), store, account, preset, candidate, apply=True, mutations=mutations)
+        await _run(
+            _Api(mentions=(_thread(),)),
+            store,
+            account,
+            preset,
+            candidate,
+            apply=True,
+            mutations=mutations,
+        )
 
     assert error.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
     assert error.value.operation_id == operation_id
@@ -645,22 +722,38 @@ async def test_exact_publish_ambiguity_links_operation_and_never_retries(tmp_pat
     with store.acquire_account_lock(account.id) as owner:
         run = owner.get_run(error.value.run_id)
     assert run.outcome == "AMBIGUOUS"
+    assert run.decision_codes == ("OBSERVE_ONLY", "CONTENT_PUBLISH_AMBIGUOUS")
     assert run.published_count == 0
     assert run.operation_ids == (operation_id,)
+    target_path = root / "nurture" / "state" / str(account.id) / f"{preset.id}.json"
+    target = json.loads(target_path.read_text(encoding="utf-8"))["targets"][0]
+    assert target["action_state"] == "NONE"
 
+    restarted_store = NurtureStore(root)
     with pytest.raises(NurtureRunnerError) as retry_error:
-        await _run(_Api(), store, account, preset, candidate, apply=True, mutations=mutations)
+        await _run(
+            _Api(),
+            restarted_store,
+            account,
+            preset,
+            candidate,
+            apply=True,
+            mutations=mutations,
+        )
     assert retry_error.value.code == "NURTURE_CONTENT_UNRESOLVED"
     assert len(mutations.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_cancelled_publish_keeps_reserved_and_interrupted_receipt(tmp_path: Path) -> None:
+async def test_cancelled_publish_stays_reserved_and_unresolved_after_restart(
+    tmp_path: Path,
+) -> None:
     root, store, account, preset = _setup(tmp_path)
+    candidate = _candidate()
     mutations = _Mutations(failure=asyncio.CancelledError())
 
     with pytest.raises(asyncio.CancelledError):
-        await _run(_Api(), store, account, preset, _candidate(), apply=True, mutations=mutations)
+        await _run(_Api(), store, account, preset, candidate, apply=True, mutations=mutations)
 
     assert len(mutations.calls) == 1
     record = json.loads(_content_path(root, account, preset).read_text(encoding="utf-8"))[
@@ -670,6 +763,98 @@ async def test_cancelled_publish_keeps_reserved_and_interrupted_receipt(tmp_path
     completed = list((root / "nurture" / "runs" / str(account.id) / "completed").glob("*.json"))
     assert len(completed) == 1
     assert json.loads(completed[0].read_text(encoding="utf-8"))["outcome"] == "INTERRUPTED"
+
+    retry_mutations = _Mutations()
+    with pytest.raises(NurtureRunnerError) as retry_error:
+        await _run(
+            _Api(),
+            NurtureStore(root),
+            account,
+            preset,
+            candidate,
+            apply=True,
+            mutations=retry_mutations,
+        )
+    assert retry_error.value.code == "NURTURE_CONTENT_UNRESOLVED"
+    assert len(mutations.calls) == 1
+    assert retry_mutations.calls == []
+
+
+@pytest.mark.asyncio
+async def test_same_account_content_apply_is_serialized_by_nurture_lock(tmp_path: Path) -> None:
+    root, store, account, preset = _setup(tmp_path)
+    candidate = _candidate()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _BlockingMutations(_Mutations):
+        async def publish_text(self, alias: str, text: str) -> PublishedTextResult:
+            self.calls.append((alias, text))
+            started.set()
+            await release.wait()
+            return PublishedTextResult(self.operation_id, _MEDIA_SENTINEL)
+
+    first_api = _Api()
+    first_mutations = _BlockingMutations()
+    first_task = asyncio.create_task(
+        _run(
+            first_api,
+            store,
+            account,
+            preset,
+            candidate,
+            apply=True,
+            mutations=first_mutations,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    second_api = _Api()
+    second_mutations = _Mutations()
+    try:
+        with pytest.raises(NurtureRunnerError) as error:
+            await _run(
+                second_api,
+                NurtureStore(root),
+                account,
+                preset,
+                candidate,
+                apply=True,
+                mutations=second_mutations,
+            )
+        assert error.value.code == "NURTURE_BUSY"
+        assert second_api.calls == []
+        assert second_mutations.calls == []
+    finally:
+        release.set()
+
+    result = await first_task
+    assert result.receipt.published_count == 1
+    assert first_mutations.calls == [("alice", _TEXT_SENTINEL)]
+
+
+@pytest.mark.asyncio
+async def test_content_apply_for_another_account_is_independent(tmp_path: Path) -> None:
+    root, store, first_account, preset = _setup(tmp_path)
+    second_account = LocalAccountStore(root).add("bob")
+    second_candidate = replace(_candidate(), account_alias="bob")
+    mutations = _Mutations()
+
+    with store.acquire_account_lock(first_account.id):
+        result = await _run(
+            _Api(),
+            store,
+            second_account,
+            preset,
+            second_candidate,
+            apply=True,
+            mutations=mutations,
+        )
+
+    assert result.receipt.outcome == "SUCCESS"
+    assert result.receipt.published_count == 1
+    assert mutations.calls == [("bob", _TEXT_SENTINEL)]
+    state = json.loads(_content_path(root, second_account, preset).read_text(encoding="utf-8"))
+    assert state["candidates"][0]["publication_state"] == "PUBLISHED"
 
 
 def test_canonical_cli_parse_mutual_exclusion_and_invalid_packet_preflight(
