@@ -17,6 +17,7 @@ import threads_platform.standalone.__main__ as cli_module
 from threads_platform.api.contracts import (
     DiscoveryPage,
     PublishingQuota,
+    RemoteAuthenticatedProfile,
     RemoteDiscoveryThread,
     RemoteReply,
     ReplyPage,
@@ -32,9 +33,11 @@ from threads_platform.standalone.mutations import (
 )
 from threads_platform.standalone.nurture import (
     NurturePresetV1,
+    build_account_nurture_inbound_config,
     get_nurture_preset,
     nurture_quote_allowed,
 )
+from threads_platform.standalone.nurture_conversations import NurtureInboundStatus
 from threads_platform.standalone.nurture_draft import (
     NurtureDraft,
     NurtureDraftError,
@@ -101,11 +104,13 @@ class _Api:
         quota: PublishingQuota | None = None,
         owned_threads: tuple[RemoteDiscoveryThread, ...] = (),
         conversations: dict[str, ReplyPage] | None = None,
+        identity_username: str = "configured_owner",
     ) -> None:
         self.threads = threads
         self.quota_value = quota or PublishingQuota()
         self.owned_threads = owned_threads
         self.conversations = conversations or {}
+        self.identity_username = identity_username
         self.calls: list[tuple[object, ...]] = []
 
     async def mentions(self, alias: str, *, after: str | None, limit: int) -> DiscoveryPage:
@@ -139,6 +144,10 @@ class _Api:
     async def conversation(self, alias: str, thread_id: str, *, after: str | None) -> ReplyPage:
         self.calls.append(("conversation", alias, thread_id, after))
         return self.conversations.get(thread_id, ReplyPage((), "reply cursor sentinel", True))
+
+    async def authenticated_profile(self, alias: str) -> RemoteAuthenticatedProfile:
+        self.calls.append(("authenticated_profile", alias))
+        return RemoteAuthenticatedProfile("synthetic_authenticated_id", self.identity_username)
 
     async def quota(self, alias: str) -> PublishingQuota:
         self.calls.append(("quota", alias))
@@ -217,6 +226,16 @@ async def _run_apply(
         apply_requested=True,
         draft=draft,
         mutations=cast(LocalThreadsMutationRuntime, mutations),
+        inbound_config=(
+            None
+            if preset.owner_public_username is None
+            else build_account_nurture_inbound_config(
+                preset,
+                account.alias,
+                preset.owner_public_username,
+                preset.max_owned_threads_inspected_per_explicit_run,
+            )
+        ),
     )
 
 
@@ -235,6 +254,16 @@ async def _run_quote_apply(
         apply_requested=True,
         quote_draft=quote_draft,
         mutations=cast(LocalThreadsMutationRuntime, mutations),
+        inbound_config=(
+            None
+            if preset.owner_public_username is None
+            else build_account_nurture_inbound_config(
+                preset,
+                account.alias,
+                preset.owner_public_username,
+                preset.max_owned_threads_inspected_per_explicit_run,
+            )
+        ),
     )
 
 
@@ -466,6 +495,29 @@ async def test_inbound_apply_uses_root_thread_and_selected_reply_as_parent(tmp_p
     persisted = _all_nurture_json(root)
     for secret in (_ROOT_ID, _REPLY_ID, "parent-other", "reply text sentinel", _DRAFT_TEXT):
         assert secret not in persisted
+
+
+@pytest.mark.asyncio
+async def test_wrong_authenticated_username_blocks_reply_draft_apply(tmp_path: Path) -> None:
+    preset = _preset(owner="configured_owner")
+    _, store, account, preset = _setup(tmp_path, preset=preset)
+    fingerprint = fingerprint_remote_reply(_INBOUND_REPLY_ID)
+    _seed_seen(store, account, preset, fingerprint)
+    api = _Api(threads=(), identity_username="different_synthetic_user")
+    mutations = _Mutations()
+
+    with pytest.raises(NurtureRunnerError) as error:
+        await _run_apply(api, store, account, preset, _draft(fingerprint), mutations)
+
+    assert error.value.code == NurtureInboundStatus.OWNERSHIP_MISMATCH.value
+    assert error.value.run_id is not None
+    with store.acquire_account_lock(account.id) as owner:
+        receipt = owner.get_run(error.value.run_id)
+    assert receipt.outcome == "FAILED"
+    assert receipt.error_code == NurtureInboundStatus.OWNERSHIP_MISMATCH.value
+    assert receipt.failed_stage == "selection"
+    assert api.calls == [("authenticated_profile", "alice")]
+    assert mutations.calls == []
 
 
 @pytest.mark.asyncio

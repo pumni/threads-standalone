@@ -12,6 +12,7 @@ from threads_platform.api.contracts import (
     DiscoverySearchMode,
     DiscoverySearchType,
     PublishingQuota,
+    RemoteAuthenticatedProfile,
     RemoteMedia,
     RemotePublicProfile,
     ReplyPage,
@@ -123,6 +124,12 @@ class LocalThreadsApiRuntime:
         normalized_username = self.validate_lookup_text(username, "INVALID_USERNAME")
         token = await self._resolve_token(alias)
         return await self._api.get_public_profile(token, normalized_username)
+
+    async def authenticated_profile(self, alias: str) -> RemoteAuthenticatedProfile:
+        """Return the identity associated with this alias's resolved API credential."""
+
+        token = await self._resolve_token(alias)
+        return await self._api.get_authenticated_profile(token)
 
     async def profile_posts(
         self,

@@ -7,8 +7,10 @@ import pytest
 
 import threads_platform.standalone.nurture as nurture_module
 from threads_platform.standalone.nurture import (
+    NurtureInboundConfigError,
     NurturePresetError,
     NurturePresetV1,
+    build_account_nurture_inbound_config,
     get_nurture_preset,
     validate_nurture_preset_v1,
 )
@@ -202,6 +204,40 @@ def test_builtin_recruitment_uses_public_validator_and_returns_fresh_models(
     assert preset.id == "recruitment"
     assert preset is not another
     assert len(preset.keyword_queries) + len(preset.tag_queries) <= 16
+
+
+def test_account_inbound_config_is_validated_ephemeral_and_does_not_mutate_preset() -> None:
+    preset = get_nurture_preset("recruitment")
+
+    config = build_account_nurture_inbound_config(preset, "synthetic-account", "synthetic_owner", 3)
+
+    assert config.account_alias == "synthetic-account"
+    assert config.preset_id == preset.id
+    assert config.owner_public_username == "synthetic_owner"
+    assert config.max_owned_threads_inspected_per_explicit_run == 3
+    assert preset.owner_public_username is None
+    assert preset.max_owned_threads_inspected_per_explicit_run == 0
+    assert "synthetic-account" not in repr(config)
+    assert "synthetic_owner" not in repr(config)
+
+
+@pytest.mark.parametrize(
+    ("alias", "username", "maximum"),
+    [
+        ("bad/account", "synthetic_owner", 3),
+        ("synthetic-account", "bad/name", 3),
+        ("synthetic-account", "synthetic_owner", True),
+        ("synthetic-account", "synthetic_owner", -1),
+        ("synthetic-account", "synthetic_owner", 11),
+    ],
+)
+def test_account_inbound_config_rejects_unbounded_or_malformed_claims(
+    alias: object, username: object, maximum: object
+) -> None:
+    with pytest.raises(NurtureInboundConfigError, match="^INBOUND_CONFIGURATION_INVALID$"):
+        build_account_nurture_inbound_config(
+            get_nurture_preset("recruitment"), alias, username, maximum
+        )
 
 
 @pytest.mark.parametrize("preset_id", ["unknown", "RECRUITMENT", True, None])

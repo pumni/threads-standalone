@@ -13,6 +13,7 @@ from threads_platform.api.contracts import (
     MediaContainer,
     MediaContainerRequest,
     PublishingQuota,
+    RemoteAuthenticatedProfile,
     RemoteDiscoveryThread,
     RemoteMedia,
     RemotePublicProfile,
@@ -254,6 +255,25 @@ class HttpThreadsAPI:
                 payload.get("threads_profile_picture_url")
             ),
         )
+
+    async def get_authenticated_profile(self, token: SecretStr) -> RemoteAuthenticatedProfile:
+        """Read the token-bound Threads identity through Meta's documented `/me` endpoint."""
+
+        response = await self._request("GET", "me", token, params={"fields": "id,username"})
+        payload = self._object(response)
+        remote_user_id = payload.get("id")
+        username = payload.get("username")
+        if (
+            type(remote_user_id) is not str
+            or not remote_user_id.strip()
+            or len(remote_user_id) > 255
+            or type(username) is not str
+        ):
+            raise ThreadsContractError()
+        try:
+            return RemoteAuthenticatedProfile(remote_user_id, username)
+        except ValueError:
+            raise ThreadsContractError() from None
 
     async def get_profile_posts(
         self, token: SecretStr, username: str, *, after: str | None, limit: int
