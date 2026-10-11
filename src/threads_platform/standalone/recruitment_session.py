@@ -16,12 +16,19 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
+from threads_platform.api.contracts import (
+    PublishingQuota,
+    RemoteAuthenticatedProfile,
+    ThreadsAPIError,
+    ThreadsCredentialError,
+)
 from threads_platform.standalone.accounts import (
     LocalAccount,
     LocalAccountStore,
     StandaloneAccountError,
     resolve_standalone_data_root,
 )
+from threads_platform.standalone.api import StandaloneApiError
 from threads_platform.standalone.app import build_standalone_app
 from threads_platform.standalone.nurture import (
     AccountNurtureInboundConfig,
@@ -54,6 +61,7 @@ _SAFE_ERROR = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 
 class RecruitmentSessionMode(StrEnum):
     VALIDATE = "validate"
+    PREFLIGHT = "preflight"
     OBSERVE = "observe"
     REVIEW = "review"
     APPLY_REPLY = "apply_reply"
@@ -118,6 +126,9 @@ class RecruitmentSessionResult:
     inbound_status: str | None = None
     target_preview: NurturePreview | None = field(default=None, repr=False)
     content_preview: RecruitmentContentPreview | None = field(default=None, repr=False)
+    credential_status: str | None = None
+    publishing_quota_status: str | None = None
+    reply_quota_status: str | None = None
 
     def __repr__(self) -> str:
         return (
@@ -148,6 +159,49 @@ class RecruitmentSession:
         account, preset = self._validated_local_state(account_alias)
         _bound_inbound_config(account, preset, inbound_owner_username, inbound_thread_cap)
         return RecruitmentSessionResult(RecruitmentSessionMode.VALIDATE, "READY")
+
+    async def preflight(self, account_alias: str) -> RecruitmentSessionResult:
+        """Read token identity and both quota counters without writing local or remote state."""
+
+        self._validated_local_state(account_alias)
+        try:
+            async with build_standalone_app(
+                self._root,
+                self._accounts,
+                include_api=True,
+                include_mutations=False,
+                include_browser=False,
+            ) as app:
+                identity = await app.api.authenticated_profile(account_alias)
+                if type(identity) is not RemoteAuthenticatedProfile:
+                    raise RecruitmentSessionError("THREADS_DOCUMENTATION_CONTRACT_MISMATCH")
+                quota = await app.api.quota(account_alias)
+        except RecruitmentSessionError:
+            raise
+        except (
+            StandaloneApiError,
+            StandaloneAccountError,
+            ThreadsAPIError,
+            ThreadsCredentialError,
+        ) as error:
+            raise RecruitmentSessionError(_error_code(error)) from None
+        except Exception:  # noqa: BLE001 — never expose runtime or response details.
+            raise RecruitmentSessionError("SESSION_FAILED") from None
+
+        publishing_status = _quota_status(quota, reply=False)
+        reply_status = _quota_status(quota, reply=True)
+        status = (
+            "OBSERVED"
+            if publishing_status == "available" and reply_status == "available"
+            else "STOP"
+        )
+        return RecruitmentSessionResult(
+            RecruitmentSessionMode.PREFLIGHT,
+            status,
+            credential_status="verified",
+            publishing_quota_status=publishing_status,
+            reply_quota_status=reply_status,
+        )
 
     def load_reply_draft(self, account_alias: str, path: Path) -> NurtureDraft:
         """Load one bounded local reply packet after validating its account context."""
@@ -386,11 +440,28 @@ def _error_code(error: object) -> str:
     )
 
 
+def _quota_status(quota: object, *, reply: bool) -> str:
+    if type(quota) is not PublishingQuota:
+        raise RecruitmentSessionError("THREADS_DOCUMENTATION_CONTRACT_MISMATCH")
+    usage, total = (quota.reply_usage, quota.reply_total) if reply else (quota.usage, quota.total)
+    if (
+        usage is None
+        or total is None
+        or type(usage) is not int
+        or type(total) is not int
+        or usage < 0
+        or total < 0
+    ):
+        return "unverified"
+    return "exhausted" if usage >= total else "available"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="run_recruitment")
     parser.add_argument("--account", required=True)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--validate", action="store_true")
+    mode.add_argument("--preflight", action="store_true")
     mode.add_argument("--observe", action="store_true")
     mode.add_argument("--review", action="store_true")
     mode.add_argument("--apply-reply-file")
@@ -412,6 +483,13 @@ def _build_parser() -> argparse.ArgumentParser:
 def _format_result(result: RecruitmentSessionResult) -> str:
     if result.mode is RecruitmentSessionMode.VALIDATE:
         return "recruitment-session mode=validate status=READY\n"
+    if result.mode is RecruitmentSessionMode.PREFLIGHT:
+        return (
+            "recruitment-session mode=preflight "
+            f"status={result.status} credential={result.credential_status} "
+            f"post_quota={result.publishing_quota_status} "
+            f"reply_quota={result.reply_quota_status}\n"
+        )
     receipt = result.receipt
     decisions = (
         "NO_ACTION"
@@ -598,7 +676,7 @@ def _inbound_thread_cap(raw: str | None) -> int | None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    mode_count = sum((args.validate, args.observe, args.review))
+    mode_count = sum((args.validate, args.preflight, args.observe, args.review))
     if (
         args.review_reply_file is not None or args.review_post_file is not None
     ) and not args.review:
@@ -623,6 +701,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 inbound_owner_username=inbound_owner,
                 inbound_thread_cap=inbound_cap,
             )
+        elif args.preflight:
+            if inbound_owner is not None or inbound_cap is not None:
+                raise RecruitmentSessionError("INBOUND_CONFIGURATION_NOT_APPLICABLE")
+            result = asyncio.run(session.preflight(args.account))
         elif args.observe:
             result = asyncio.run(
                 session.observe(
@@ -690,7 +772,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write("ERROR SESSION_FAILED\n")
         return 1
     sys.stdout.write(_format_result(result))
-    return 0
+    return 1 if result.mode is RecruitmentSessionMode.PREFLIGHT and result.status == "STOP" else 0
 
 
 __all__ = [
