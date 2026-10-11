@@ -18,6 +18,7 @@ from threads_platform.browser.contracts import (
     SessionExpired,
 )
 from threads_platform.locks.filesystem import FilesystemProcessLock
+from threads_platform.locks.process_lock import ProcessAlreadyRunning
 from threads_platform.standalone.accounts import LocalAccountStore
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 
@@ -28,9 +29,11 @@ class _FakeSession:
         *,
         feed_batch: tuple[str, ...] = (),
         browser_error: BrowserAdapterError | None = None,
+        thread_error: BrowserAdapterError | None = None,
     ) -> None:
         self.feed_batch = feed_batch
         self.browser_error = browser_error
+        self.thread_error = thread_error
         self.navigations: list[tuple[str, frozenset[str]]] = []
         self.profile_checks: list[tuple[str, int]] = []
         self.thread_checks: list[tuple[str, str]] = []
@@ -61,6 +64,8 @@ class _FakeSession:
 
     async def verify_thread_target(self, *, target_ref: str, author_username: str) -> None:
         self.thread_checks.append((target_ref, author_username))
+        if self.thread_error is not None:
+            raise self.thread_error
         if self.browser_error is not None:
             raise self.browser_error
 
@@ -143,6 +148,226 @@ def test_profile_thread_and_feed_reads_use_the_same_account_profile(tmp_path: Pa
     assert engine.sessions[0].profile_checks == [("/@synthetic", 8)]
     assert engine.sessions[1].thread_checks == [("/@synthetic/post/fake_1", "synthetic")]
     assert all(session.closed for session in engine.sessions)
+
+
+def test_interactive_thread_holds_account_lock_until_operator_ends_session(
+    tmp_path: Path,
+) -> None:
+    accounts = _add_account(tmp_path)
+    account = accounts.get("synthetic_account")
+    profile_directory = tmp_path / "profiles" / str(account.id)
+    profile_directory.mkdir(parents=True)
+    engine = _FakeEngine()
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+    prompts: list[str] = []
+    lock_path = tmp_path / "locks" / f"{account.id}.lock"
+
+    def end_session(prompt: str) -> None:
+        session = engine.sessions[0]
+        assert not session.closed
+        assert "target=/@synthetic/post/fake_1" in prompt
+        assert "author=@synthetic" in prompt
+        assert "identity=UNKNOWN_IDENTITY" in prompt
+        probe = FilesystemProcessLock(lock_path)
+        with pytest.raises(ProcessAlreadyRunning):
+            probe.acquire()
+        prompts.append(prompt)
+
+    result = asyncio.run(
+        runtime.open_thread_interactive(
+            "synthetic_account",
+            "/@synthetic/post/fake_1",
+            wait_for_operator=end_session,
+        )
+    )
+
+    assert result.target_kind == "THREAD"
+    assert result.target_ref == "/@synthetic/post/fake_1"
+    assert result.recognized
+    assert len(prompts) == 1
+    assert engine.requests[0].profile_directory == profile_directory
+    assert engine.requests[0].headless is False
+    assert engine.requests[0].proxy_credentials is None
+    assert engine.sessions[0].navigations == [
+        (
+            "https://www.threads.com/@synthetic/post/fake_1",
+            frozenset({"https://www.threads.com"}),
+        )
+    ]
+    assert engine.sessions[0].thread_checks == [
+        ("/@synthetic/post/fake_1", "synthetic"),
+        ("/@synthetic/post/fake_1", "synthetic"),
+    ]
+    assert engine.sessions[0].closed
+
+    probe = FilesystemProcessLock(lock_path)
+    probe.acquire()
+    probe.release()
+
+
+def test_interactive_thread_keeps_synthetic_alias_profiles_and_sessions_isolated(
+    tmp_path: Path,
+) -> None:
+    accounts = _add_account(tmp_path, "first_account")
+    second_account = accounts.add("second_account")
+    first = accounts.get("first_account")
+    first_profile = tmp_path / "profiles" / str(first.id)
+    second_profile = tmp_path / "profiles" / str(second_account.id)
+    first_profile.mkdir(parents=True)
+    second_profile.mkdir(parents=True)
+    engine = _FakeEngine()
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+
+    asyncio.run(
+        runtime.open_thread_interactive(
+            "first_account",
+            "/@synthetic/post/fake_1",
+            wait_for_operator=lambda _: None,
+        )
+    )
+    asyncio.run(
+        runtime.open_thread_interactive(
+            "second_account",
+            "/@synthetic/post/fake_1",
+            wait_for_operator=lambda _: None,
+        )
+    )
+
+    assert [request.profile_directory for request in engine.requests] == [
+        first_profile,
+        second_profile,
+    ]
+    assert engine.sessions[0] is not engine.sessions[1]
+    assert all(session.closed for session in engine.sessions)
+
+
+@pytest.mark.parametrize(
+    ("session", "expected_code"),
+    [
+        (_FakeSession(browser_error=ChallengeDetected()), "CHALLENGE_REQUIRED"),
+        (_FakeSession(browser_error=SessionExpired()), "SESSION_EXPIRED"),
+        (
+            _FakeSession(thread_error=BrowserAdapterError("BROWSER_CONTRACT_MISMATCH")),
+            "BROWSER_CONTRACT_MISMATCH",
+        ),
+    ],
+)
+def test_interactive_thread_fails_closed_before_handoff_on_unverified_target(
+    tmp_path: Path,
+    session: _FakeSession,
+    expected_code: str,
+) -> None:
+    accounts = _add_account(tmp_path)
+    account = accounts.get("synthetic_account")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+    engine = _FakeEngine(lambda: session)
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+    prompts: list[str] = []
+
+    with pytest.raises(StandaloneRuntimeError) as caught:
+        asyncio.run(
+            runtime.open_thread_interactive(
+                "synthetic_account",
+                "/@synthetic/post/fake_1",
+                wait_for_operator=prompts.append,
+            )
+        )
+
+    assert caught.value.code == expected_code
+    assert prompts == []
+    assert session.closed
+    probe = FilesystemProcessLock(tmp_path / "locks" / f"{account.id}.lock")
+    probe.acquire()
+    probe.release()
+
+
+def test_interactive_thread_timeout_closes_session_and_releases_account_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accounts = _add_account(tmp_path)
+    account = accounts.get("synthetic_account")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+
+    class _SlowSession(_FakeSession):
+        async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
+            await asyncio.sleep(0.05)
+
+    engine = _FakeEngine(_SlowSession)
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+    prompts: list[str] = []
+    monkeypatch.setattr(runtime_module, "_BROWSER_READ_TIMEOUT_SECONDS", 0.005)
+
+    with pytest.raises(StandaloneRuntimeError) as caught:
+        asyncio.run(
+            runtime.open_thread_interactive(
+                "synthetic_account",
+                "/@synthetic/post/fake_1",
+                wait_for_operator=prompts.append,
+            )
+        )
+
+    assert caught.value.code == "BROWSER_NAVIGATION_TIMEOUT"
+    assert prompts == []
+    assert engine.sessions[0].closed
+    probe = FilesystemProcessLock(tmp_path / "locks" / f"{account.id}.lock")
+    probe.acquire()
+    probe.release()
+
+
+def test_interactive_thread_cancellation_closes_session_and_releases_account_lock(
+    tmp_path: Path,
+) -> None:
+    accounts = _add_account(tmp_path)
+    account = accounts.get("synthetic_account")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+    engine = _FakeEngine()
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+
+    def cancel_session(_: str) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(
+            runtime.open_thread_interactive(
+                "synthetic_account",
+                "/@synthetic/post/fake_1",
+                wait_for_operator=cancel_session,
+            )
+        )
+
+    assert engine.sessions[0].closed
+    probe = FilesystemProcessLock(tmp_path / "locks" / f"{account.id}.lock")
+    probe.acquire()
+    probe.release()
+
+
+def test_interactive_thread_reports_browser_crash_after_operator_handoff(
+    tmp_path: Path,
+) -> None:
+    accounts = _add_account(tmp_path)
+    account = accounts.get("synthetic_account")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+    engine = _FakeEngine()
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+
+    def crash_session(_: str) -> None:
+        engine.sessions[0].browser_error = BrowserAdapterError("BROWSER_PROCESS_CRASHED")
+
+    with pytest.raises(StandaloneRuntimeError) as caught:
+        asyncio.run(
+            runtime.open_thread_interactive(
+                "synthetic_account",
+                "/@synthetic/post/fake_1",
+                wait_for_operator=crash_session,
+            )
+        )
+
+    assert caught.value.code == "BROWSER_PROCESS_CRASHED"
+    assert engine.sessions[0].closed
+    probe = FilesystemProcessLock(tmp_path / "locks" / f"{account.id}.lock")
+    probe.acquire()
+    probe.release()
 
 
 @pytest.mark.parametrize(
@@ -309,6 +534,65 @@ def test_browser_cli_runs_only_requested_synthetic_operations(
     assert len(prompts) == 1
     assert "Log in to Threads manually" in prompts[0]
     assert len(engine.requests) == 4
+
+
+def test_browser_cli_interactive_thread_is_explicit_and_reports_unknown_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import threads_platform.standalone.__main__ as cli
+
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(tmp_path))
+    engine = _FakeEngine()
+    prompts: list[str] = []
+    monkeypatch.setattr(runtime_module, "PlaywrightBrowserEngine", lambda: engine)
+    original_open_thread_interactive = LocalRuntime.open_thread_interactive
+
+    async def open_thread_interactive(
+        runtime: LocalRuntime,
+        alias: str,
+        thread_ref: str,
+    ) -> object:
+        return await original_open_thread_interactive(
+            runtime,
+            alias,
+            thread_ref,
+            wait_for_operator=prompts.append,
+        )
+
+    monkeypatch.setattr(LocalRuntime, "open_thread_interactive", open_thread_interactive)
+
+    with pytest.raises(SystemExit):
+        cli._build_parser().parse_args(
+            ["browser", "open-thread", "synthetic_account", "/@synthetic/post/fake_1"]
+        )
+
+    assert cli.main(["account", "add", "synthetic_account"]) == 0
+    account = LocalAccountStore(tmp_path).get("synthetic_account")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+
+    assert (
+        cli.main(
+            [
+                "browser",
+                "open-thread",
+                "synthetic_account",
+                "/@synthetic/post/fake_1",
+                "--interactive",
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "browser session closed target=/@synthetic/post/fake_1" in output
+    assert "identity=UNKNOWN_IDENTITY" in output
+    assert len(prompts) == 1
+    assert "target recognized target=/@synthetic/post/fake_1" in prompts[0]
+    assert "identity=UNKNOWN_IDENTITY" in prompts[0]
+    assert engine.sessions[0].closed
+    assert len(engine.requests) == 1
 
 
 def test_wheel_smoke_browser_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
