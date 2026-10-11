@@ -29,6 +29,7 @@ _FRESH_TEXT = (
     "SYNTHETIC TARGET F: Career question? Which interview project should an intern highlight?"
 )
 _FAKE_REPLY = "Which project best shows the skills you used and what you learned?"
+_SYNTHETIC_NOW = datetime(2001, 1, 1, 12, tzinfo=UTC)
 
 
 def _load_demo_module():
@@ -46,9 +47,8 @@ def _setup(root: Path, **api_options: object):
     accounts = LocalAccountStore(root)
     account = accounts.add("demo")
     assert account.credential_ref is None
-    now = datetime.now(UTC)
-    api = demo._SyntheticReadOnlyApi(now, **api_options)
-    timing = demo._SyntheticTiming(now)
+    api = demo._SyntheticReadOnlyApi(datetime.now(UTC), **api_options)
+    timing = demo._SyntheticTiming(_SYNTHETIC_NOW)
     return demo, accounts, api, timing
 
 
@@ -83,10 +83,12 @@ def test_watch_cooldown_blocks_w_and_fresh_candidate_stays_exactly_bound(
     demo, accounts, api, timing = _setup(tmp_path / "synthetic-root")
     captured_shortlists: list[NurtureShortlistResult] = []
     captured_previews = []
+    captured_times: list[datetime | None] = []
     original_shortlist = RecruitmentSession.shortlist
     original_create = demo.create_human_reply_preview
 
     async def capture_shortlist(session, *args: object, **kwargs: object):
+        captured_times.append(kwargs.get("now"))
         result = await original_shortlist(session, *args, **kwargs)  # type: ignore[arg-type]
         captured_shortlists.append(result)
         return result
@@ -110,6 +112,8 @@ def test_watch_cooldown_blocks_w_and_fresh_candidate_stays_exactly_bound(
     assert "SELECTED_CANDIDATE=F status=ELIGIBLE action=REVIEW_CANDIDATE" in output
     assert "PROPOSAL_STATUS=PROPOSED_FOR_HUMAN_REVIEW" in output
     assert len(captured_shortlists) == 1
+    assert captured_times == [_SYNTHETIC_NOW]
+    assert captured_times[0] != datetime.now(UTC)
     shortlist, selection, preview = captured_previews[0]
     selected = shortlist.candidates[selection - 1]
     assert selected.text == _FRESH_TEXT
@@ -209,10 +213,157 @@ def test_no_eligible_candidate_never_calls_fake_generator(
     monkeypatch.setattr(demo, "create_human_reply_preview", forbidden)
     result, output = _run(demo, tmp_path / "synthetic-root", accounts, api, timing)
 
-    assert result.status == "COMPLETED"
+    assert result.status == "STOP"
+    assert result.reason == "NO_ELIGIBLE_F"
     assert not result.proposal_created
     assert "NO_ELIGIBLE_CANDIDATE=YES" in output
+    assert "JOURNEY_STATUS=STOP reason=NO_ELIGIBLE_F" in output
     assert "NOT_APPROVED_FOR_SENDING" in output and "NOT_SENT" in output
+    assert api.remote_mutations == 0
+    _assert_no_reply_persisted(tmp_path / "synthetic-root")
+
+
+def test_no_eligible_candidate_is_nonzero_at_script_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    demo = _load_demo_module()
+    original_api = demo._SyntheticReadOnlyApi
+
+    def without_fresh_candidate(now: datetime):
+        return original_api(now, include_fresh_candidate=False)
+
+    async def forbidden(*_args: object, **_kwargs: object):
+        raise AssertionError("proposal generation must not run")
+
+    monkeypatch.setattr(demo, "_SyntheticReadOnlyApi", without_fresh_candidate)
+    monkeypatch.setattr(demo, "create_human_reply_preview", forbidden)
+    output, errors = io.StringIO(), io.StringIO()
+    exit_code = demo.main(
+        ["--scripted"],
+        input_stream=io.StringIO(),
+        output_stream=output,
+        error_stream=errors,
+        environment={},
+    )
+
+    assert exit_code == 1
+    assert "JOURNEY_STATUS=STOP" in output.getvalue()
+    assert "remote_mutations=0" in output.getvalue()
+    assert errors.getvalue() == ""
+
+
+@pytest.mark.parametrize(
+    ("input_text", "reason"),
+    [
+        ("1\n", "TARGET_OR_ELIGIBILITY_CHANGED"),
+        ("invalid\n", "INVALID_SELECTION"),
+        ("99\n", "INVALID_SELECTION"),
+    ],
+)
+def test_ineligible_or_invalid_selection_is_nonzero_at_script_entrypoint(
+    input_text: str,
+    reason: str,
+) -> None:
+    demo = _load_demo_module()
+
+    class _PrivateTty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    output, errors = _PrivateTty(), _PrivateTty()
+    exit_code = demo.main(
+        ["--interactive"],
+        input_stream=_PrivateTty(input_text),
+        output_stream=output,
+        error_stream=errors,
+        environment={},
+    )
+
+    assert exit_code == 1
+    assert f"JOURNEY_STATUS=STOP reason={reason}" in output.getvalue()
+    assert "JOURNEY_STATUS=STOP remote_mutations=0" in output.getvalue()
+    assert "NOT_APPROVED_FOR_SENDING" in output.getvalue()
+    assert "NOT_SENT" in output.getvalue()
+    assert errors.getvalue() == ""
+
+
+@pytest.mark.parametrize("change", ["missing", "duplicate", "eligible"])
+def test_watched_candidate_cooldown_must_be_present_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    demo, accounts, api, timing = _setup(tmp_path / "synthetic-root")
+    original_shortlist = RecruitmentSession.shortlist
+
+    async def alter_shortlist(session, *args: object, **kwargs: object):
+        result = await original_shortlist(session, *args, **kwargs)  # type: ignore[arg-type]
+        watched = next(item for item in result.candidates if item.text == _WATCHED_TEXT)
+        candidates = list(result.candidates)
+        watched_index = candidates.index(watched)
+        if change == "missing":
+            candidates.pop(watched_index)
+        elif change == "duplicate":
+            candidates.append(watched)
+        else:
+            candidates[watched_index] = dataclasses.replace(
+                watched,
+                status="ELIGIBLE",
+                action_hint="REVIEW_CANDIDATE",
+            )
+        return dataclasses.replace(result, candidates=tuple(candidates))
+
+    async def forbidden(*_args: object, **_kwargs: object):
+        raise AssertionError("proposal generation must not run without confirmed W cooldown")
+
+    monkeypatch.setattr(RecruitmentSession, "shortlist", alter_shortlist)
+    monkeypatch.setattr(demo, "create_human_reply_preview", forbidden)
+    result, output = _run(demo, tmp_path / "synthetic-root", accounts, api, timing)
+
+    assert result.status == "STOP"
+    assert result.reason == "WATCHED_COOLDOWN_NOT_CONFIRMED"
+    assert not result.proposal_created
+    assert "CANDIDATE_W=STOP reason=COOLDOWN_NOT_CONFIRMED" in output
+    assert "remote_mutations=0" in output
+    assert api.remote_mutations == 0
+    _assert_no_reply_persisted(tmp_path / "synthetic-root")
+
+
+@pytest.mark.parametrize("change", ["fingerprint", "target"])
+def test_journey_stops_if_selected_target_changes_before_proposal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    demo, accounts, api, timing = _setup(tmp_path / "synthetic-root")
+    original_select = demo._select_candidate
+
+    def tamper_then_select(shortlist, selection, displayed_candidates):
+        candidate = shortlist.candidates[selection - 1]
+        if change == "fingerprint":
+            candidate = dataclasses.replace(
+                candidate,
+                fingerprint=hashlib.sha256(b"replacement").hexdigest(),
+            )
+        else:
+            candidate = dataclasses.replace(candidate, text=_WATCHED_TEXT)
+        candidates = list(shortlist.candidates)
+        candidates[selection - 1] = candidate
+        changed_shortlist = dataclasses.replace(shortlist, candidates=tuple(candidates))
+        return original_select(changed_shortlist, selection, displayed_candidates)
+
+    async def forbidden(*_args: object, **_kwargs: object):
+        raise AssertionError("proposal generation must not run after target change")
+
+    monkeypatch.setattr(demo, "_select_candidate", tamper_then_select)
+    monkeypatch.setattr(demo, "create_human_reply_preview", forbidden)
+    result, output = _run(demo, tmp_path / "synthetic-root", accounts, api, timing)
+
+    assert result.status == "STOP"
+    assert result.reason == "TARGET_OR_ELIGIBILITY_CHANGED"
+    assert not result.proposal_created
+    assert "JOURNEY_STATUS=STOP reason=TARGET_OR_ELIGIBILITY_CHANGED" in output
+    assert "remote_mutations=0" in output
     assert api.remote_mutations == 0
 
 
@@ -277,6 +428,7 @@ def test_ctrl_c_and_invalid_selection_never_create_proposal(tmp_path: Path) -> N
     )
     assert result.editorial_disposition == "DISCARDED"
     assert result.proposal_created
+    assert result.status == "COMPLETED"
     assert "INPUT_CANCELLED=YES" in output
     assert "NOT_APPROVED_FOR_SENDING" in output and "NOT_SENT" in output
     _assert_no_reply_persisted(tmp_path / "synthetic-root")
@@ -293,8 +445,76 @@ def test_ctrl_c_and_invalid_selection_never_create_proposal(tmp_path: Path) -> N
         input_stream=io.StringIO("invalid\n"),
     )
     assert not result.proposal_created
+    assert result.status == "STOP"
+    assert result.reason == "INVALID_SELECTION"
     assert "SELECTION_REJECTED=INVALID_SELECTION" in output
     assert "NOT_APPROVED_FOR_SENDING" in output and "NOT_SENT" in output
+
+    third_root = tmp_path / "watched-root"
+    demo, accounts, api, timing = _setup(third_root)
+    result, output = _run(
+        demo,
+        third_root,
+        accounts,
+        api,
+        timing,
+        mode="interactive",
+        input_stream=io.StringIO("1\n"),
+    )
+    assert result.status == "STOP"
+    assert result.reason == "TARGET_OR_ELIGIBILITY_CHANGED"
+    assert not result.proposal_created
+    assert "JOURNEY_STATUS=STOP reason=TARGET_OR_ELIGIBILITY_CHANGED" in output
+    assert "remote_mutations=0" in output
+
+
+@pytest.mark.parametrize(
+    ("input_text", "reason"),
+    [("", "SELECTION_CANCELLED"), ("\n", "SELECTION_CANCELLED"), ("99\n", "INVALID_SELECTION")],
+)
+def test_cancelled_or_out_of_range_selection_stops_before_proposal(
+    tmp_path: Path,
+    input_text: str,
+    reason: str,
+) -> None:
+    demo, accounts, api, timing = _setup(tmp_path / "synthetic-root")
+    result, output = _run(
+        demo,
+        tmp_path / "synthetic-root",
+        accounts,
+        api,
+        timing,
+        mode="interactive",
+        input_stream=io.StringIO(input_text),
+    )
+    assert result.status == "STOP"
+    assert result.reason == reason
+    assert not result.proposal_created
+    assert "JOURNEY_STATUS=STOP" in output
+    assert "remote_mutations=0" in output
+
+
+def test_ctrl_c_during_candidate_selection_stops_before_proposal(tmp_path: Path) -> None:
+    demo, accounts, api, timing = _setup(tmp_path / "synthetic-root")
+
+    class _InterruptingInput(io.StringIO):
+        def readline(self, size: int = -1) -> str:
+            raise KeyboardInterrupt
+
+    result, output = _run(
+        demo,
+        tmp_path / "synthetic-root",
+        accounts,
+        api,
+        timing,
+        mode="interactive",
+        input_stream=_InterruptingInput(),
+    )
+    assert result.status == "STOP"
+    assert result.reason == "SELECTION_CANCELLED"
+    assert not result.proposal_created
+    assert "JOURNEY_STATUS=STOP reason=SELECTION_CANCELLED" in output
+    assert "remote_mutations=0" in output
 
 
 def test_invalid_editor_action_discards_and_does_not_persist(tmp_path: Path) -> None:

@@ -498,15 +498,20 @@ uv run --locked python scripts/demo_recruitment_journey.py --interactive
 The interactive command rejects CI, pytest, and streams without a TTY before creating the
 temporary account root or fake API. It performs one existing foreground watch cycle with a fake
 clock and no real wait, then calls the existing fresh shortlist policy against the same fake API,
-account, temporary root, and Nurture v1 state. The watched synthetic candidate W is shown as
-`COOLDOWN / OBSERVE_ONLY` and cannot enter proposal generation. New synthetic candidate F is
-selected only when the fresh policy returns `ELIGIBLE / REVIEW_CANDIDATE`. The demo carries the
-same candidate object and fingerprint through `create_human_reply_preview` and the existing
-`HumanReplyEditorialSession` and quality advisory.
+account, temporary root, and Nurture v1 state. Before it offers F, it requires the fresh shortlist
+to contain exactly one synthetic W with `COOLDOWN / OBSERVE_ONLY`; a missing, duplicate, or
+reclassified W stops the journey. New synthetic candidate F is selected only when the fresh policy
+returns `ELIGIBLE / REVIEW_CANDIDATE`. Shortlist timestamps use the injected fixed synthetic clock;
+fake discovery timestamps are aligned to that clock while the W fingerprint remains bound to its
+stable synthetic remote ID. The demo carries the same candidate object and fingerprint through
+`create_human_reply_preview` and the existing `HumanReplyEditorialSession` and quality advisory.
 
 In interactive mode choose the displayed candidate number, then use `E` to edit, `K` to keep in
-the current process session, or `D` to discard. A blank selection, invalid selection, EOF, Ctrl+C,
-invalid action, or rejected edit stops safely. The scripted path uses only fixed synthetic input;
+the current process session, or `D` to discard. No eligible F, a W or invalid selection, target
+change, blank selection, EOF, or Ctrl+C during candidate selection reports `JOURNEY_STATUS=STOP`
+and exits nonzero before proposal generation. After a valid proposal reaches the editor, `D` is a
+completed discard; it still ends `NOT_APPROVED_FOR_SENDING` and `NOT_SENT`. Invalid editor input
+discards safely. The scripted path uses only fixed synthetic input;
 it edits a deliberately low-information answer, displays the updated advisory, and keeps the
 answer in memory until the process exits.
 
@@ -520,8 +525,9 @@ answer is not consent, an approval token, or a send action.
 | AO-05A acceptance | Synthetic evidence |
 | --- | --- |
 | Fake watch completes without credential or wall-clock waiting and writes the existing receipt/state | `tests/test_recruitment_journey.py::test_watch_cooldown_blocks_w_and_fresh_candidate_stays_exactly_bound`; one-command source demo |
-| Fresh shortlist suppresses watched W via existing cooldown and offers F only when eligible | `test_watch_cooldown_blocks_w_and_fresh_candidate_stays_exactly_bound`; `test_no_eligible_candidate_never_calls_fake_generator` |
-| Target replacement, fingerprint change, and ineligible selection are rejected before proposal | `test_displayed_fingerprint_detects_replaced_or_changed_target`; watched-candidate proposal rejection in `test_watch_cooldown_blocks_w_and_fresh_candidate_stays_exactly_bound` |
+| Fresh shortlist requires exactly one W with `COOLDOWN / OBSERVE_ONLY`, offers F only when eligible, and returns STOP/nonzero when no F exists | `test_watch_cooldown_blocks_w_and_fresh_candidate_stays_exactly_bound`; `test_watched_candidate_cooldown_must_be_present_exactly_once`; `test_no_eligible_candidate_never_calls_fake_generator`; `test_no_eligible_candidate_is_nonzero_at_script_entrypoint` |
+| Wrong/ineligible selection, target replacement, and fingerprint change return STOP before proposal | `test_displayed_fingerprint_detects_replaced_or_changed_target`; `test_journey_stops_if_selected_target_changes_before_proposal`; `test_ctrl_c_and_invalid_selection_never_create_proposal`; `test_cancelled_or_out_of_range_selection_stops_before_proposal`; `test_ctrl_c_during_candidate_selection_stops_before_proposal`; `test_ineligible_or_invalid_selection_is_nonzero_at_script_entrypoint` |
+| Fresh shortlist receives the injected fixed synthetic time, not wall clock | `test_watch_cooldown_blocks_w_and_fresh_candidate_stays_exactly_bound` |
 | Preflight, watch read, and fresh shortlist failures stop without later proposal work | `test_watch_preflight_or_fresh_shortlist_failure_stops_safely` |
 | Edit, quality advisory, keep, discard, cancel, invalid selection, and no persistence/mutation | `test_interactive_keep_discard_and_quality_advisory_are_session_only`; `test_ctrl_c_and_invalid_selection_never_create_proposal`; source demo persistence guard |
 | Interactive CI, GITHUB_ACTIONS, pytest, and redirected-stream rejection precedes setup | `test_interactive_guard_rejects_unsafe_context_before_root_account_or_api` |

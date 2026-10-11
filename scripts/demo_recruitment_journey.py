@@ -66,6 +66,7 @@ _EDITED_REPLIES = {
     _FRESH_TEXT: "Which project best shows the skills you used, the choices you made, and what you learned?",
 }
 _LOW_INFORMATION_REPLY = "i dont know"
+_SYNTHETIC_SHORTLIST_TIME = datetime(2001, 1, 1, 12, tzinfo=UTC)
 _EMPTY_PAGE = DiscoveryPage((), None, False)
 
 
@@ -203,7 +204,11 @@ class _SyntheticReadOnlyApi:
         self.read_calls += 1
         return ReplyPage((), None, False)
 
-    def start_fresh_shortlist(self) -> None:
+    def start_fresh_shortlist(self, now: datetime) -> None:
+        # Keep the fake discovery timestamps aligned with the injected shortlist clock.
+        # The observed W fingerprint remains stable because it is bound to its remote ID.
+        self.watch_thread = _thread("ao05a_synthetic_watch_w", _WATCHED_TEXT, now)
+        self.fresh_thread = _thread("ao05a_synthetic_fresh_f", _FRESH_TEXT, now)
         self.phase = "shortlist"
         self._keyword_result_returned = False
 
@@ -324,9 +329,10 @@ def run_journey(
             f"receipt_bytes={receipt_bytes} state_bytes={state_bytes} fake_wait_seconds=0"
         )
 
-        api.start_fresh_shortlist()
+        shortlist_now = timing.utc_now()
+        api.start_fresh_shortlist(shortlist_now)
         try:
-            shortlist = asyncio.run(session.shortlist("demo", now=datetime.now(UTC), limit=5))
+            shortlist = asyncio.run(session.shortlist("demo", now=shortlist_now, limit=5))
         except RecruitmentSessionError as error:
             emit(f"FRESH_SHORTLIST=STOP reason={error.code}")
             return _result(
@@ -354,6 +360,31 @@ def run_journey(
                 "SHORTLIST_STOP",
             )
 
+        watched_candidates = tuple(
+            candidate for candidate in shortlist.candidates if candidate.text == _WATCHED_TEXT
+        )
+        if (
+            len(watched_candidates) != 1
+            or watched_candidates[0].status != "COOLDOWN"
+            or watched_candidates[0].action_hint != "OBSERVE_ONLY"
+        ):
+            emit("CANDIDATE_W=STOP reason=COOLDOWN_NOT_CONFIRMED")
+            emit("JOURNEY_STATUS=STOP reason=WATCHED_COOLDOWN_NOT_CONFIRMED")
+            emit("APPROVAL_STATUS=NOT_APPROVED_FOR_SENDING DELIVERY_STATUS=NOT_SENT")
+            emit("DRAFT_PERSISTED=NO remote_mutations=0")
+            _assert_no_private_persistence(root, api, ())
+            return _result(
+                root,
+                accounts,
+                watch,
+                api,
+                shortlist,
+                "DISCARDED",
+                False,
+                len(shortlist.candidates),
+                "WATCHED_COOLDOWN_NOT_CONFIRMED",
+            )
+
         emit(f"FRESH_SHORTLIST=READY candidate_count={len(shortlist.candidates)}")
         displayed_candidates = tuple(
             (candidate, candidate.fingerprint) for candidate in shortlist.candidates
@@ -366,13 +397,18 @@ def run_journey(
                 f"reasons={','.join(candidate.reason_codes) or 'NONE'} "
                 f"status={candidate.status} action={candidate.action_hint}"
             )
-            if label == "W" and candidate.status == "COOLDOWN":
+            if label == "W":
                 emit("CANDIDATE_W=COOLDOWN — NO PROPOSAL")
-            if label == "F" and candidate.status == "ELIGIBLE":
+            if (
+                label == "F"
+                and candidate.status == "ELIGIBLE"
+                and candidate.action_hint == "REVIEW_CANDIDATE"
+            ):
                 fresh_selection = index
 
         if fresh_selection is None:
             emit("NO_ELIGIBLE_CANDIDATE=YES")
+            emit("JOURNEY_STATUS=STOP reason=NO_ELIGIBLE_F")
             emit("APPROVAL_STATUS=NOT_APPROVED_FOR_SENDING DELIVERY_STATUS=NOT_SENT")
             emit("DRAFT_PERSISTED=NO remote_mutations=0")
             _assert_no_private_persistence(root, api, ())
@@ -385,18 +421,19 @@ def run_journey(
                 "DISCARDED",
                 False,
                 len(shortlist.candidates),
-                None,
+                "NO_ELIGIBLE_F",
             )
 
         if editor_mode == "scripted":
             selected_index = fresh_selection
         else:
-            emit("Select candidate number (eligible only; blank=discard):")
+            emit("Select candidate number (eligible only; blank=stop):")
             try:
                 raw_selection = _read_bounded_line(input_stream, _MAX_ACTION_CHARS)
                 selected_index = _parse_selection(raw_selection, len(shortlist.candidates))
             except _InputLineTooLong, ValueError:
                 emit("SELECTION_REJECTED=INVALID_SELECTION")
+                emit("JOURNEY_STATUS=STOP reason=INVALID_SELECTION")
                 emit("APPROVAL_STATUS=NOT_APPROVED_FOR_SENDING DELIVERY_STATUS=NOT_SENT")
                 emit("DRAFT_PERSISTED=NO remote_mutations=0")
                 _assert_no_private_persistence(root, api, ())
@@ -409,10 +446,11 @@ def run_journey(
                     "DISCARDED",
                     False,
                     len(shortlist.candidates),
-                    None,
+                    "INVALID_SELECTION",
                 )
             except KeyboardInterrupt:
                 emit("SELECTION_CANCELLED=YES")
+                emit("JOURNEY_STATUS=STOP reason=SELECTION_CANCELLED")
                 emit("APPROVAL_STATUS=NOT_APPROVED_FOR_SENDING DELIVERY_STATUS=NOT_SENT")
                 emit("DRAFT_PERSISTED=NO remote_mutations=0")
                 _assert_no_private_persistence(root, api, ())
@@ -425,10 +463,11 @@ def run_journey(
                     "DISCARDED",
                     False,
                     len(shortlist.candidates),
-                    None,
+                    "SELECTION_CANCELLED",
                 )
             if selected_index is None:
                 emit("SELECTION_CANCELLED=YES")
+                emit("JOURNEY_STATUS=STOP reason=SELECTION_CANCELLED")
                 emit("APPROVAL_STATUS=NOT_APPROVED_FOR_SENDING DELIVERY_STATUS=NOT_SENT")
                 emit("DRAFT_PERSISTED=NO remote_mutations=0")
                 _assert_no_private_persistence(root, api, ())
@@ -441,13 +480,14 @@ def run_journey(
                     "DISCARDED",
                     False,
                     len(shortlist.candidates),
-                    None,
+                    "SELECTION_CANCELLED",
                 )
 
         try:
             candidate = _select_candidate(shortlist, selected_index, displayed_candidates)
         except ValueError:
             emit("SELECTION_REJECTED=TARGET_OR_ELIGIBILITY_CHANGED")
+            emit("JOURNEY_STATUS=STOP reason=TARGET_OR_ELIGIBILITY_CHANGED")
             emit("APPROVAL_STATUS=NOT_APPROVED_FOR_SENDING DELIVERY_STATUS=NOT_SENT")
             emit("DRAFT_PERSISTED=NO remote_mutations=0")
             _assert_no_private_persistence(root, api, ())
@@ -460,11 +500,12 @@ def run_journey(
                 "DISCARDED",
                 False,
                 len(shortlist.candidates),
-                None,
+                "TARGET_OR_ELIGIBILITY_CHANGED",
             )
         selected_label = _candidate_label(candidate)
         if selected_label != "F":
             emit("SELECTION_REJECTED=WATCHED_CANDIDATE_NOT_DRAFTABLE")
+            emit("JOURNEY_STATUS=STOP reason=WATCHED_CANDIDATE_NOT_DRAFTABLE")
             emit("APPROVAL_STATUS=NOT_APPROVED_FOR_SENDING DELIVERY_STATUS=NOT_SENT")
             emit("DRAFT_PERSISTED=NO remote_mutations=0")
             _assert_no_private_persistence(root, api, ())
@@ -477,7 +518,7 @@ def run_journey(
                 "DISCARDED",
                 False,
                 len(shortlist.candidates),
-                None,
+                "WATCHED_CANDIDATE_NOT_DRAFTABLE",
             )
 
         generator = _FakeReplyGenerator()
@@ -491,6 +532,7 @@ def run_journey(
             )
         except ReplyProposalError as error:
             emit(f"PROPOSAL=STOP reason={error.code}")
+            emit("JOURNEY_STATUS=STOP reason=PROPOSAL_STOP")
             emit("APPROVAL_STATUS=NOT_APPROVED_FOR_SENDING DELIVERY_STATUS=NOT_SENT")
             emit("DRAFT_PERSISTED=NO remote_mutations=0")
             _assert_no_private_persistence(root, api, ())
@@ -503,7 +545,7 @@ def run_journey(
                 "DISCARDED",
                 False,
                 len(shortlist.candidates),
-                None,
+                "PROPOSAL_STOP",
             )
         if (
             preview.candidate is not candidate
@@ -813,9 +855,8 @@ def run_demo(
         error_stream.flush()
         return 2
 
-    now = datetime.now(UTC)
-    api = _SyntheticReadOnlyApi(now)
-    timing = _SyntheticTiming(now)
+    api = _SyntheticReadOnlyApi(datetime.now(UTC))
+    timing = _SyntheticTiming(_SYNTHETIC_SHORTLIST_TIME)
     with tempfile.TemporaryDirectory(prefix="threads-standalone-ao05a-") as temporary_root:
         root = Path(temporary_root).resolve(strict=True)
         accounts = LocalAccountStore(root)
