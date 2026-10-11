@@ -73,6 +73,7 @@ class _SyntheticTiming(WatchTiming):
         self.fake_wait_seconds += int(seconds)
         self._monotonic += seconds
         self._now += timedelta(seconds=seconds)
+        await asyncio.sleep(0)
 
 
 class _SyntheticApiRuntime:

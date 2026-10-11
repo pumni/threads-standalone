@@ -144,6 +144,7 @@ class _TraceTiming:
     async def sleep(self, seconds: float) -> None:
         self.monotonic_value += seconds
         self.now += timedelta(seconds=seconds)
+        await asyncio.sleep(0)
 
 
 def test_watch_coordinator_retained_tracemalloc_stays_bounded_for_1000_cycles(
