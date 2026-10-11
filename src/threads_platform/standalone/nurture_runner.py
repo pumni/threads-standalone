@@ -248,6 +248,7 @@ class NurtureRunner:
         content_candidate: ContentCandidateV1 | None = None,
         mutations: LocalThreadsMutationRuntime | None = None,
         inbound_config: AccountNurtureInboundConfig | None = None,
+        preview_only: bool = False,
     ) -> NurtureRunV1:
         return (
             await self.run_with_selection(
@@ -260,6 +261,7 @@ class NurtureRunner:
                 content_candidate=content_candidate,
                 mutations=mutations,
                 inbound_config=inbound_config,
+                preview_only=preview_only,
             )
         ).receipt
 
@@ -275,12 +277,15 @@ class NurtureRunner:
         content_candidate: ContentCandidateV1 | None = None,
         mutations: LocalThreadsMutationRuntime | None = None,
         inbound_config: AccountNurtureInboundConfig | None = None,
+        preview_only: bool = False,
     ) -> NurtureRunResult:
         if type(account) is not LocalAccount or type(account.id) is not UUID:
             raise NurtureRunnerError("RUN_FAILED")
         if type(preset) is not NurturePresetV1:
             raise NurtureRunnerError("PRESET_NOT_FOUND")
         if type(apply_requested) is not bool:
+            raise NurtureRunnerError("RUN_FAILED")
+        if type(preview_only) is not bool:
             raise NurtureRunnerError("RUN_FAILED")
         if draft is not None and type(draft) is not NurtureDraft:
             raise NurtureRunnerError("INVALID_NURTURE_DRAFT")
@@ -296,17 +301,24 @@ class NurtureRunner:
         provided_inputs = sum(item is not None for item in (draft, quote_draft, content_candidate))
         if provided_inputs > 1:
             raise NurtureRunnerError("NURTURE_INPUT_CONFLICT")
+        if preview_only and (
+            apply_requested
+            or draft is None
+            or quote_draft is not None
+            or content_candidate is not None
+        ):
+            raise NurtureRunnerError("INVALID_NURTURE_DRAFT")
         if quote_draft is not None and not apply_requested:
             raise NurtureRunnerError("INVALID_NURTURE_QUOTE_DRAFT")
         if quote_draft is not None and not nurture_quote_allowed(preset):
             raise NurtureRunnerError("NURTURE_QUOTE_APPLY_DISABLED")
         expects_mutations = (
-            draft is not None
+            (draft is not None and not preview_only)
             or quote_draft is not None
             or (content_candidate is not None and apply_requested)
         )
         if (expects_mutations != (mutations is not None)) or (
-            draft is not None and not apply_requested
+            draft is not None and not (apply_requested or preview_only)
         ):
             raise NurtureRunnerError("INVALID_NURTURE_DRAFT")
 
@@ -330,6 +342,7 @@ class NurtureRunner:
                         content_candidate=content_candidate,
                         mutations=mutations,
                         inbound_config=inbound_config,
+                        preview_only=preview_only,
                     )
                 except KeyboardInterrupt:
                     raise NurtureRunnerInterrupted(run_id) from None
@@ -353,6 +366,7 @@ class NurtureRunner:
         content_candidate: ContentCandidateV1 | None,
         mutations: LocalThreadsMutationRuntime | None,
         inbound_config: AccountNurtureInboundConfig | None,
+        preview_only: bool,
     ) -> NurtureRunResult:
         run_id = scope.receipt.id
         stage = "selection"
@@ -382,6 +396,7 @@ class NurtureRunner:
                             apply_requested,
                             draft,
                             own_content_requested=content_candidate is not None,
+                            preview_only=preview_only,
                         )
                     )
                     engagement_decision = decision
@@ -397,6 +412,13 @@ class NurtureRunner:
                         decision_codes=(decision,),
                     )
                     selected_fingerprint = chosen.fingerprint
+                    if preview_only:
+                        return NurtureRunResult(
+                            scope.finish("SUCCESS", now=now),
+                            selected_fingerprint,
+                            inbound_status=selection.inbound_status,
+                            preview=selection.preview,
+                        )
                     if quote_draft is not None:
                         stage = "quote"
                         return await self._apply_quote(
@@ -1029,11 +1051,12 @@ def _selection_decision(
     draft: NurtureDraft | None,
     *,
     own_content_requested: bool = False,
+    preview_only: bool = False,
 ) -> str:
     if candidate is None:
         return "NO_ACTION"
     if draft is not None:
-        return "REPLY_APPLY"
+        return "REPLY_REVIEW_ONLY" if preview_only else "REPLY_APPLY"
     if apply_requested and not own_content_requested:
         return "REPLY_RECOMMENDED_NO_DRAFT"
     if isinstance(candidate, NurtureInboundCandidate):
