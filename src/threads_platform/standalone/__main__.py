@@ -36,6 +36,11 @@ from threads_platform.standalone.accounts import (
 )
 from threads_platform.standalone.api import StandaloneApiError, bind_env_credential
 from threads_platform.standalone.app import build_standalone_app
+from threads_platform.standalone.manual_opportunities import (
+    ManualOpportunityError,
+    run_manual_list_cli,
+    run_manual_review_cli,
+)
 from threads_platform.standalone.mutations import (
     CarouselManifest,
     LocalOperationStore,
@@ -751,6 +756,21 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_insights_parser = nurture_insights_commands.add_parser("refresh")
     refresh_insights_parser.add_argument("alias")
     refresh_insights_parser.add_argument("--preset", required=True)
+
+    recruitment_parser = commands.add_parser("recruitment")
+    recruitment_commands = recruitment_parser.add_subparsers(
+        dest="recruitment_command", required=True
+    )
+    manual_review_parser = recruitment_commands.add_parser("manual-review")
+    manual_review_parser.add_argument("alias")
+    manual_review_parser.add_argument("--targets-file", required=True)
+    manual_review_parser.add_argument("--select", type=int, required=True)
+    manual_review_parser.add_argument("--draft-file", required=True)
+    manual_review_parser.add_argument("--context-file")
+    manual_review_parser.add_argument("--confirm-target")
+    manual_list_parser = recruitment_commands.add_parser("manual-list")
+    manual_list_parser.add_argument("alias")
+    manual_list_parser.add_argument("--targets-file", required=True)
     return parser
 
 
@@ -863,6 +883,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "nurture":
             return _handle_nurture_command(args)
 
+        if args.command == "recruitment":
+            if args.recruitment_command == "manual-list":
+                return run_manual_list_cli(
+                    args.alias,
+                    Path(args.targets_file),
+                    account_store_factory=lambda: LocalAccountStore(resolve_standalone_data_root()),
+                )
+            return run_manual_review_cli(
+                args.alias,
+                Path(args.targets_file),
+                args.select,
+                Path(args.draft_file),
+                None if args.context_file is None else Path(args.context_file),
+                account_store_factory=lambda: LocalAccountStore(resolve_standalone_data_root()),
+                confirm_target=args.confirm_target,
+            )
+
         root = resolve_standalone_data_root()
         store = LocalAccountStore(root)
         if args.command == "account":
@@ -929,6 +966,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.write(asyncio.run(_run_api_command(args, root, store)))
         return 0
     except (
+        ManualOpportunityError,
         StandaloneAccountError,
         StandaloneApiError,
         ThreadsCredentialError,
