@@ -39,6 +39,7 @@ _PENDING_STATUS = "HANDOFF_UNRESOLVED"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_DOCUMENT_BYTES = 16 * 1024
 _MAX_EVENTS = 16
+_MAX_ACCOUNT_RECORDS = 1_024
 _NAMESPACE = "manual_recruitment_v1"
 _DOCUMENT_KEYS = frozenset({"version", "account_uuid", "target_fingerprint", "events"})
 _EVENT_KEYS = frozenset(
@@ -55,6 +56,7 @@ _EVENT_KEYS = frozenset(
 _LEGACY_EVENT_KEYS = frozenset(
     {"event_id", "draft_sha256", "recorded_at", "operator_declaration", "verification"}
 )
+_LOCK_LEASE_AUTHORITY = object()
 
 
 class ManualOutcomeError(Exception):
@@ -111,6 +113,48 @@ class ManualOutcomeRecord:
     @property
     def blocks_handoff(self) -> bool:
         return self.latest.status == _PENDING_STATUS or self.latest.status in _BLOCKING_OUTCOMES
+
+
+class ManualOutcomeLockLease:
+    """Opaque proof that the shared account lock is active for one data root."""
+
+    __slots__ = ("_account_id", "_active", "_authority", "_lock", "_lock_path", "_root")
+
+    def __init__(
+        self,
+        *,
+        authority: object,
+        account_id: UUID,
+        root: Path,
+        lock_path: Path,
+        lock: FilesystemProcessLock,
+    ) -> None:
+        if authority is not _LOCK_LEASE_AUTHORITY:
+            raise ValueError("invalid account lock lease")
+        self._account_id = account_id
+        self._active = True
+        self._authority = authority
+        self._lock = lock
+        self._lock_path = lock_path
+        self._root = root
+
+    def assert_active(self, account_id: UUID, root: Path) -> None:
+        expected_path = root / _NAMESPACE / "locks" / f"{account_id}.lock"
+        if (
+            type(self) is not ManualOutcomeLockLease
+            or type(account_id) is not UUID
+            or account_id.version != 4
+            or self._authority is not _LOCK_LEASE_AUTHORITY
+            or not self._active
+            or not self._lock.held
+            or self._account_id != account_id
+            or self._root != root
+            or self._lock_path != expected_path
+        ):
+            raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+
+    def deactivate(self) -> None:
+        self._active = False
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -183,7 +227,80 @@ class ManualOutcomeStore:
 
     def read(self, account_id: UUID, target_url: str) -> ManualOutcomeRecord | None:
         fingerprint = self.target_fingerprint(account_id, target_url)
-        root = self._existing_root()
+        return self._read_fingerprint(self._existing_root(), account_id, fingerprint)
+
+    def read_under_account_lock(
+        self,
+        account_id: UUID,
+        target_url: str,
+        *,
+        lock_lease: ManualOutcomeLockLease,
+    ) -> ManualOutcomeRecord | None:
+        if type(account_id) is not UUID or account_id.version != 4:
+            raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+        fingerprint = self.target_fingerprint(account_id, target_url)
+        root = self._required_root()
+        self._assert_lock_lease(lock_lease, account_id, root)
+        return self._read_fingerprint(root, account_id, fingerprint)
+
+    def read_account_under_account_lock(
+        self,
+        account_id: UUID,
+        *,
+        lock_lease: ManualOutcomeLockLease,
+    ) -> tuple[ManualOutcomeRecord, ...]:
+        """Load every bounded S4 record and event history for one account."""
+
+        if type(account_id) is not UUID or account_id.version != 4:
+            raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+        root = self._required_root()
+        self._assert_lock_lease(lock_lease, account_id, root)
+        namespace = self._directory(root, _NAMESPACE, create=False)
+        if namespace is None:
+            return ()
+        records_directory = self._directory(namespace, "records", create=False)
+        if records_directory is None:
+            return ()
+        account_directory = self._directory(records_directory, str(account_id), create=False)
+        if account_directory is None:
+            return ()
+
+        records: list[ManualOutcomeRecord] = []
+        try:
+            for path in account_directory.iterdir():
+                if len(records) >= _MAX_ACCOUNT_RECORDS:
+                    raise ManualOutcomeError("MANUAL_OUTCOME_LIMIT_REACHED")
+                if path.suffix != ".json" or _SHA256.fullmatch(path.stem) is None:
+                    raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+                if not self._regular_file(path, account_directory, allow_missing=False):
+                    raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+                record = self._read_fingerprint(root, account_id, path.stem)
+                if record is None:
+                    raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+                records.append(record)
+        except ManualOutcomeError:
+            raise
+        except OSError:
+            raise ManualOutcomeError("MANUAL_OUTCOME_INVALID") from None
+        records.sort(key=lambda item: item.target_fingerprint)
+        return tuple(records)
+
+    @staticmethod
+    def _assert_lock_lease(
+        lock_lease: ManualOutcomeLockLease,
+        account_id: UUID,
+        root: Path,
+    ) -> None:
+        if type(lock_lease) is not ManualOutcomeLockLease:
+            raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+        lock_lease.assert_active(account_id, root)
+
+    def _read_fingerprint(
+        self,
+        root: Path | None,
+        account_id: UUID,
+        fingerprint: str,
+    ) -> ManualOutcomeRecord | None:
         if root is None:
             return None
         namespace = self._directory(root, _NAMESPACE, create=False)
@@ -217,6 +334,34 @@ class ManualOutcomeStore:
 
     @contextmanager
     def account_lock(self, account_id: UUID) -> Generator[None]:
+        with self._locked_account(account_id):
+            yield
+
+    @contextmanager
+    def account_lock_lease(
+        self,
+        account_id: UUID,
+    ) -> Generator[ManualOutcomeLockLease]:
+        if type(account_id) is not UUID or account_id.version != 4:
+            raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+        with self._locked_account(account_id) as (root, lock, lock_path):
+            lease = ManualOutcomeLockLease(
+                authority=_LOCK_LEASE_AUTHORITY,
+                account_id=account_id,
+                root=root,
+                lock_path=lock_path,
+                lock=lock,
+            )
+            try:
+                yield lease
+            finally:
+                lease.deactivate()
+
+    @contextmanager
+    def _locked_account(
+        self,
+        account_id: UUID,
+    ) -> Generator[tuple[Path, FilesystemProcessLock, Path]]:
         if account_id.version != 4:
             raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
         root = self._required_root()
@@ -236,13 +381,91 @@ class ManualOutcomeStore:
             raise ManualOutcomeError("MANUAL_OUTCOME_INVALID") from None
         try:
             self._regular_file(lock_path, lock_directory, allow_missing=False, max_bytes=1)
-            yield
+            yield root, lock, lock_path
         finally:
             if lock.held:
                 try:
                     lock.release()
                 except OSError:
                     raise ManualOutcomeError("MANUAL_OUTCOME_INVALID") from None
+
+    def reserve_approved_handoff_under_account_lock(
+        self,
+        account_id: UUID,
+        target_url: str,
+        draft_sha256: str,
+        attempt_id: str,
+        recorded_at: datetime,
+        expected_record: ManualOutcomeRecord | None,
+        expected_account_records: tuple[ManualOutcomeRecord, ...],
+        *,
+        lock_lease: ManualOutcomeLockLease,
+    ) -> ManualOutcomeEvent:
+        """Append the one approved S4 v1 reservation without reacquiring the lock."""
+
+        if type(account_id) is not UUID or account_id.version != 4:
+            raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+        fingerprint = self.target_fingerprint(account_id, target_url)
+        if (
+            _SHA256.fullmatch(draft_sha256) is None
+            or not self._valid_attempt_id(attempt_id)
+            or type(recorded_at) is not datetime
+            or recorded_at.tzinfo is None
+            or recorded_at.utcoffset() != UTC.utcoffset(recorded_at)
+        ):
+            raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+        if (
+            (expected_record is not None and type(expected_record) is not ManualOutcomeRecord)
+            or type(expected_account_records) is not tuple
+            or any(type(record) is not ManualOutcomeRecord for record in expected_account_records)
+        ):
+            raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+
+        root = self._required_root()
+        self._assert_lock_lease(lock_lease, account_id, root)
+        current_records = self.read_account_under_account_lock(
+            account_id,
+            lock_lease=lock_lease,
+        )
+        if current_records != expected_account_records:
+            raise ManualOutcomeError("MANUAL_OUTCOME_APPROVAL_MISMATCH")
+        current = next(
+            (record for record in current_records if record.target_fingerprint == fingerprint),
+            None,
+        )
+        if current != expected_record:
+            raise ManualOutcomeError("MANUAL_OUTCOME_APPROVAL_MISMATCH")
+        if any(
+            attempt_id in {event.event_id, event.attempt_id}
+            for record in current_records
+            for event in record.events
+        ):
+            raise ManualOutcomeError("MANUAL_OUTCOME_ATTEMPT_INVALID")
+        if current is not None:
+            if current.blocks_handoff or current.latest.status != "ABORTED_NOT_SENT":
+                raise ManualOutcomeError("MANUAL_OUTCOME_BLOCKED")
+            if len(current.events) > _MAX_EVENTS - 2:
+                raise ManualOutcomeError("MANUAL_OUTCOME_LIMIT_REACHED")
+            events = current.events
+        else:
+            events = ()
+
+        event = ManualOutcomeEvent(
+            event_id=attempt_id,
+            attempt_id=attempt_id,
+            draft_sha256=draft_sha256,
+            recorded_at=recorded_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            status="HANDOFF_UNRESOLVED",
+            source="SOFTWARE_HANDOFF",
+            verification="UNVERIFIED",
+        )
+        record = ManualOutcomeRecord(
+            account_uuid=str(account_id),
+            target_fingerprint=fingerprint,
+            events=(*events, event),
+        )
+        self._write(record, lock_lease=lock_lease)
+        return event
 
     def begin_handoff(
         self,
@@ -582,8 +805,15 @@ class ManualOutcomeStore:
             events=tuple(events),
         )
 
-    def _write(self, record: ManualOutcomeRecord) -> None:
+    def _write(
+        self,
+        record: ManualOutcomeRecord,
+        *,
+        lock_lease: ManualOutcomeLockLease | None = None,
+    ) -> None:
         root = self._required_root()
+        if lock_lease is not None:
+            self._assert_lock_lease(lock_lease, UUID(record.account_uuid), root)
         self._ensure_outside_checkout(root / _NAMESPACE)
         namespace = self._directory(root, _NAMESPACE, create=True)
         assert namespace is not None
