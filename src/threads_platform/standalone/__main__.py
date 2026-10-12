@@ -96,6 +96,11 @@ from threads_platform.standalone.opportunity_queue import (
     run_opportunity_select_cli,
     run_opportunity_skip_cli,
 )
+from threads_platform.standalone.recruitment_content_cli import (
+    RecruitmentContentCliError,
+    run_recruitment_content_cli,
+)
+from threads_platform.standalone.recruitment_content_planner import RecruitmentContentPlannerError
 from threads_platform.standalone.recruitment_qualification import (
     RecruitmentQualificationError,
     run_opportunity_rank_cli,
@@ -856,6 +861,19 @@ def _build_parser() -> argparse.ArgumentParser:
     opportunity_draft_parser.add_argument("alias")
     opportunity_draft_parser.add_argument("--id", required=True)
     opportunity_draft_parser.add_argument("--facts-file")
+
+    content_add_parser = recruitment_commands.add_parser("content-add")
+    content_add_parser.add_argument("alias")
+    content_add_parser.add_argument("--text-file", required=True)
+    content_add_parser.add_argument("--scheduled-utc", required=True)
+    content_add_parser.add_argument("--assert-rights", action="store_true")
+    content_add_parser.add_argument("--assert-consent", action="store_true")
+    for content_command in ("content-list", "content-due", "content-upcoming"):
+        recruitment_commands.add_parser(content_command).add_argument("alias")
+    for content_command in ("content-show", "content-approve", "content-reject"):
+        content_parser = recruitment_commands.add_parser(content_command)
+        content_parser.add_argument("alias")
+        content_parser.add_argument("--id", required=True)
     return parser
 
 
@@ -904,6 +922,17 @@ def _run_browser_command(args: argparse.Namespace, root: Path, store: LocalAccou
 
 
 def _handle_recruitment_command(args: argparse.Namespace) -> int:
+    if args.recruitment_command.startswith("content-"):
+        return run_recruitment_content_cli(
+            args.recruitment_command,
+            args.alias,
+            packet_id=getattr(args, "id", None),
+            text_file=None if getattr(args, "text_file", None) is None else Path(args.text_file),
+            scheduled_utc=getattr(args, "scheduled_utc", None),
+            rights_asserted=getattr(args, "assert_rights", False),
+            consent_asserted=getattr(args, "assert_consent", False),
+            data_root_factory=resolve_standalone_data_root,
+        )
     if args.recruitment_command == "opportunity-draft":
         return run_opportunity_draft_cli(
             args.alias,
@@ -1145,6 +1174,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         OpportunityQueueError,
         ManualOpportunityError,
         ManualOutcomeError,
+        RecruitmentContentCliError,
+        RecruitmentContentPlannerError,
         StandaloneAccountError,
         StandaloneApiError,
         ThreadsCredentialError,
