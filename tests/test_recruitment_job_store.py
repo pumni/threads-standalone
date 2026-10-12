@@ -1153,6 +1153,77 @@ def test_contact_embedded_in_requirement_is_withheld_from_json_and_csv_after_raw
     assert contact_placeholder not in json.dumps(retained_archive, ensure_ascii=False)
 
 
+def test_contact_in_multi_role_ambiguous_span_is_cleared_but_safe_spans_remain(
+    tmp_path: Path,
+) -> None:
+    store, root = _store(tmp_path, RetentionPolicy(raw_text_days=1, derived_vacancy_days=2))
+    body = "Cần tuyển sales, kế toán; lương 8tr; yêu cầu: liên hệ [SYNTHETIC_PHONE_001]"
+    observation = _observation(body=body)
+    extraction = _extract(observation)
+    assert extraction is not None
+    assert len(extraction.records) == 2
+    safe_salary_spans = [[span.start, span.end] for span in extraction.records[0].salary.raw.spans]
+    assert safe_salary_spans
+    assert all(
+        "8tr" in body[start:end] or "8" == body[start:end] for start, end in safe_salary_spans
+    )
+
+    _record(store, observation)
+
+    revision = _revisions(_post(_read_archive(root)))[0]
+    vacancy_revisions = revision["vacancy_revisions"]
+    assert isinstance(vacancy_revisions, list)
+    assert len(vacancy_revisions) == 2
+    for vacancy_revision in vacancy_revisions:
+        assert isinstance(vacancy_revision, dict)
+        fields = vacancy_revision["fields"]
+        assert isinstance(fields, dict)
+        requirement = fields["requirements"]
+        assert isinstance(requirement, dict)
+        assert requirement["state"] == EvidenceState.AMBIGUOUS.value
+        assert requirement["value"] is None
+        assert requirement["raw_value"] is None
+        assert requirement["spans"] == []
+
+        salary = fields["salary"]
+        assert isinstance(salary, dict)
+        salary_raw = salary["raw"]
+        assert isinstance(salary_raw, dict)
+        assert salary_raw["state"] == EvidenceState.AMBIGUOUS.value
+        assert salary_raw["spans"] == safe_salary_spans
+        assert all(
+            "SYNTHETIC_PHONE_001" not in body[start:end] for start, end in salary_raw["spans"]
+        )
+
+    raw_expiry = _BASE + timedelta(days=1)
+    output_json = store.export_json(
+        _ACCOUNT_ONE,
+        fields=(ExportField.REQUIREMENTS,),
+        confirmed=True,
+        now_utc=raw_expiry,
+    )
+    output_csv = store.export_csv(
+        _ACCOUNT_ONE,
+        fields=(ExportField.REQUIREMENTS,),
+        confirmed=True,
+        now_utc=raw_expiry,
+    )
+    exported_requirements = json.loads(output_json)["records"]
+    assert len(exported_requirements) == 2
+    assert all(record[ExportField.REQUIREMENTS.value] is None for record in exported_requirements)
+    assert list(csv.reader(io.StringIO(output_csv))) == [
+        [ExportField.REQUIREMENTS.value],
+        [""],
+        [""],
+    ]
+    assert "SYNTHETIC_PHONE_001" not in output_json + output_csv
+
+    retained_archive = _read_archive(root)
+    retained_revision = _revisions(_post(retained_archive))[0]
+    assert retained_revision["observed_text"] is None
+    assert "SYNTHETIC_PHONE_001" not in json.dumps(retained_archive, ensure_ascii=False)
+
+
 def test_export_rejects_non_string_field_values_with_fixed_code(tmp_path: Path) -> None:
     store, root = _store(tmp_path)
     for export in (store.export_json, store.export_csv):

@@ -1099,6 +1099,9 @@ def _encode_evidence(evidence: FieldEvidence[object], source_text: str) -> dict[
         if span.start < 0 or span.end <= span.start or span.end > len(source_text):
             raise RecruitmentJobStoreError(StoreErrorCode.INVALID_INPUT)
         spans.append([span.start, span.end])
+    contact_in_spans = any(
+        _contains_contact_content(source_text[start:end]) for start, end in spans
+    )
     if evidence.state is EvidenceState.SOURCE_SPAN:
         if evidence.value is None or not spans:
             raise RecruitmentJobStoreError(StoreErrorCode.INVALID_INPUT)
@@ -1109,7 +1112,7 @@ def _encode_evidence(evidence: FieldEvidence[object], source_text: str) -> dict[
         if (
             _contains_contact_content(evidence.value)
             or _contains_contact_content(evidence.raw_value)
-            or any(_contains_contact_content(source_text[start:end]) for start, end in spans)
+            or contact_in_spans
         ):
             return {
                 "state": EvidenceState.AMBIGUOUS.value,
@@ -1123,6 +1126,8 @@ def _encode_evidence(evidence: FieldEvidence[object], source_text: str) -> dict[
     elif evidence.state is EvidenceState.AMBIGUOUS:
         if evidence.value is not None or evidence.raw_value is not None:
             raise RecruitmentJobStoreError(StoreErrorCode.INVALID_INPUT)
+        if contact_in_spans:
+            spans = []
     return {
         "state": evidence.state.value,
         "value": _json_value(evidence.value),
