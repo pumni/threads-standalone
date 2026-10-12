@@ -385,7 +385,7 @@ def _required_string(args: object, name: str, missing_code: str) -> str:
 def _required_path(args: object, name: str, missing_code: str) -> Path:
     value = _required_string(args, name, missing_code)
     path = Path(value)
-    if not path.is_absolute() or ".." in path.parts:
+    if not path.is_absolute() or ".." in path.parts or ".." in re.split(r"[\\/]", value):
         raise BrowserJobsCliError("PATH_INVALID")
     return path
 

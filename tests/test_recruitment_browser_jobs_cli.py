@@ -515,7 +515,8 @@ def test_fixture_cycle_and_post_count_caps_are_enforced(tmp_path: Path) -> None:
         cli_module._load_fixture(too_many_posts)
 
 
-def test_oversize_and_traversal_fixture_paths_are_rejected(tmp_path: Path) -> None:
+@pytest.mark.parametrize("separator", ["\\", "/"])
+def test_oversize_and_traversal_fixture_paths_are_rejected(tmp_path: Path, separator: str) -> None:
     private_parent, fixture_dir = _private_paths(tmp_path)
     oversize = _write_raw_fixture(
         fixture_dir,
@@ -527,7 +528,7 @@ def test_oversize_and_traversal_fixture_paths_are_rejected(tmp_path: Path) -> No
 
     traversal = fixture_dir / "missing.json"
     args = _args(private_parent / "root", traversal)
-    args.fixture_file = f"{fixture_dir}\\..\\missing.json"
+    args.fixture_file = f"{fixture_dir}{separator}..{separator}missing.json"
     code, output, errors = _invoke(
         args,
         clock=_Clock(),
