@@ -83,9 +83,9 @@ The hosted workflow must pass on Windows and Ubuntu: locked uv sync, runtime dep
 | --- | --- |
 | Local Windows locked quality gates (Python 3.14.7) | **PASS**: `uv sync --locked`, runtime tree audit, Ruff lint/format, Pyright, build, synthetic shortlist demo; pytest `1266 passed, 6 skipped` |
 | Isolated installed-wheel smoke, artifact version `0.1.0` | **PASS** outside checkout with empty `PYTHONPATH`, installed CLI `--help`, site-packages assertion and full pytest `1260 passed, 12 skipped` |
-| Hosted Windows QA | **PENDING** hosted check |
-| Hosted Ubuntu QA | **PENDING** hosted check |
-| Full-history Gitleaks | **PENDING** hosted check |
+| Hosted Windows QA | **PASS** on initial S5 code/test head [`7f603da`](https://github.com/pumni/threads-standalone/commit/7f603da6f3012b93bd4ce48bb6bdde3052bcf097); [job](https://github.com/pumni/threads-standalone/actions/runs/38195225741/job/114636282225) |
+| Hosted Ubuntu QA | **PASS** on initial S5 code/test head [`7f603da`](https://github.com/pumni/threads-standalone/commit/7f603da6f3012b93bd4ce48bb6bdde3052bcf097); [job](https://github.com/pumni/threads-standalone/actions/runs/38195225741/job/114636282004) |
+| Full-history Gitleaks | **PASS** on initial S5 code/test head [`7f603da`](https://github.com/pumni/threads-standalone/commit/7f603da6f3012b93bd4ce48bb6bdde3052bcf097); [job](https://github.com/pumni/threads-standalone/actions/runs/38195225741/job/114636282248) |
 | Local test skip review | Six symlink tests skipped for Windows privilege; wheel run also skips six source-only demo tests not packaged in the wheel |
 | Live Threads UAT | **NOT RUN**; no live account, browser, API, or customer data used for S5 |
 | Local data-root and account-owner/security review | **PENDING** separate operator approval |
@@ -96,3 +96,5 @@ The hosted workflow must pass on Windows and Ubuntu: locked uv sync, runtime dep
 | Coordinator UAT issues #18 and #46 | **PENDING** separate review |
 
 All gates above are required before calling this production-ready or planning customer rollout. A passing synthetic suite or installed wheel is not platform authorization or live UAT.
+
+The hosted results above identify the exact commit checked. For any newer PR head, use the live check status on [PR #56](https://github.com/pumni/threads-standalone/pull/56); do not infer a pass from an earlier head.
