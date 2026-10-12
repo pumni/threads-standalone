@@ -222,6 +222,19 @@ class ContactFields:
     application_url: FieldEvidence[str]
 
 
+@dataclass(frozen=True, slots=True)
+class _VacancyFieldEvidence:
+    employer: FieldEvidence[str]
+    location: LocationFields
+    work_mode: FieldEvidence[str]
+    schedule: FieldEvidence[str]
+    salary: SalaryFields
+    experience: FieldEvidence[str]
+    requirements: FieldEvidence[tuple[str, ...]]
+    benefits: FieldEvidence[tuple[str, ...]]
+    contacts: ContactFields
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class RecruitmentJobPostV1:
     schema_version: Literal[1]
@@ -297,6 +310,13 @@ class _RoleOccurrence:
     category: str
     span: SourceSpan
     location_anchor: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RoleReference:
+    key: str
+    start: int
+    end: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -660,11 +680,13 @@ def extract_vietnamese_vacancies(
             text=text,
             view=view,
             role=role,
+            role_index=role_index,
+            roles=accepted_roles,
             completeness=observation.text_completeness,
             policy=policy,
             reason_codes=tuple(reason_codes),
         )
-        for role in accepted_roles
+        for role_index, role in enumerate(accepted_roles)
     )
     fields_ambiguous = any(record.confidence is Confidence.MEDIUM for record in records)
     confidence = (
@@ -952,6 +974,111 @@ def _resolve_duplicate_roles(
     return tuple(accepted), ambiguous
 
 
+def _role_reference_mentions(view: _MappedText) -> tuple[_RoleReference, ...]:
+    candidates: list[_RoleReference] = []
+    for key, _label, _category, aliases in _ROLE_ALIASES:
+        for alias in aliases:
+            for match in _phrase_pattern(alias).finditer(view.value):
+                candidates.append(_RoleReference(key, match.start(), match.end()))
+    candidates.sort(
+        key=lambda mention: (-(mention.end - mention.start), mention.start, mention.key)
+    )
+    accepted: list[_RoleReference] = []
+    for candidate in candidates:
+        if any(
+            candidate.start < existing.end and existing.start < candidate.end
+            for existing in accepted
+        ):
+            continue
+        accepted.append(candidate)
+    return tuple(sorted(accepted, key=lambda mention: (mention.start, mention.end, mention.key)))
+
+
+def _role_scope_views(
+    view: _MappedText,
+    role_index: int,
+    roles: tuple[_RoleOccurrence, ...],
+) -> tuple[_MappedText, _MappedText]:
+    mentions = _role_reference_mentions(view)
+    own_ranges: list[tuple[int, int]] = []
+    ambiguous_ranges: list[tuple[int, int]] = []
+    separators = re.compile(r"[,;|\r\n]+|(?<![tTpPqQ])[.!?](?=\s|$)")
+    clause_start = 0
+    clauses: list[tuple[int, int]] = []
+    for match in separators.finditer(view.value):
+        if clause_start < match.start():
+            clauses.append((clause_start, match.start()))
+        clause_start = match.end()
+    if clause_start < len(view.value):
+        clauses.append((clause_start, len(view.value)))
+
+    for start, end in clauses:
+        clause_mentions = tuple(
+            mention for mention in mentions if start <= mention.start and mention.end <= end
+        )
+        keys = {mention.key for mention in clause_mentions}
+        assigned_index: int | None = None
+        uncertain_indices: set[int] = set()
+        if len(keys) == 1:
+            key = next(iter(keys))
+            candidates = [index for index, role in enumerate(roles) if role.key == key]
+            if len(candidates) == 1:
+                assigned_index = candidates[0]
+            elif candidates:
+                anchor = _location_anchor_in_range(view, start, end)
+                anchored = [
+                    index
+                    for index in candidates
+                    if roles[index].location_anchor == anchor and anchor is not None
+                ]
+                if len(anchored) == 1:
+                    assigned_index = anchored[0]
+                else:
+                    uncertain_indices.update(candidates)
+            else:
+                uncertain_indices.update(range(len(roles)))
+        elif keys:
+            uncertain_indices.update(index for index, role in enumerate(roles) if role.key in keys)
+        else:
+            uncertain_indices.update(range(len(roles)))
+
+        interval = (start, end)
+        if assigned_index == role_index:
+            own_ranges.append(interval)
+        elif role_index in uncertain_indices:
+            ambiguous_ranges.append(interval)
+
+    return _masked_view(view, own_ranges), _masked_view(view, ambiguous_ranges)
+
+
+def _location_anchor_in_range(view: _MappedText, start: int, end: int) -> str | None:
+    location_parts = [
+        f"city:{city}"
+        for city, aliases in _CITY_ALIASES
+        for alias in aliases
+        for _match in _phrase_pattern(alias).finditer(view.value, start, end)
+    ]
+    district_pattern = re.compile(r"(?<!\w)(?:q\.?|quận)\s*(?P<number>\d{1,2})(?!\w)")
+    location_parts.extend(
+        f"district:{int(match.group('number'))}"
+        for match in district_pattern.finditer(view.value, start, end)
+    )
+    if not location_parts:
+        return None
+    return "+".join(sorted(set(location_parts)))
+
+
+def _masked_view(
+    view: _MappedText,
+    ranges: list[tuple[int, int]],
+) -> _MappedText:
+    kept = bytearray(len(view.value))
+    for start, end in ranges:
+        kept[start:end] = b"\x01" * (end - start)
+    value = "".join(character if kept[index] else " " for index, character in enumerate(view.value))
+    return _MappedText(value, view.source_ranges)
+
+
 def _inside_role_segment(
     role_span: SourceSpan,
     cue: tuple[int, int],
@@ -1020,12 +1147,117 @@ def _resolve_evidence[T](
     return FieldEvidence(first.state, first.value, first.raw_value, spans)
 
 
+def _extract_vacancy_fields(
+    text: str,
+    view: _MappedText,
+    completeness: TextCompleteness,
+    source: ObservationSource,
+) -> _VacancyFieldEvidence:
+    return _VacancyFieldEvidence(
+        employer=_employer_evidence(text, view, completeness),
+        location=_location_evidence(text, view, completeness),
+        work_mode=_alias_evidence(text, view, _WORK_MODE_ALIASES, completeness),
+        schedule=_schedule_evidence(text, view, completeness),
+        salary=_salary_evidence(text, view, completeness),
+        experience=_experience_evidence(text, view, completeness),
+        requirements=_labelled_list_evidence(text, view, "yêu cầu", "yeu cau", completeness),
+        benefits=_benefits_evidence(text, view, completeness),
+        contacts=_contact_evidence(text, view, completeness, source),
+    )
+
+
+def _mark_unscoped_evidence_ambiguous[T](
+    scoped: FieldEvidence[T],
+    unscoped: FieldEvidence[object],
+) -> FieldEvidence[T]:
+    if not unscoped.spans:
+        return scoped
+    spans = tuple(dict.fromkeys((*scoped.spans, *unscoped.spans)))
+    return _ambiguous(spans)
+
+
+def _merge_salary_evidence(
+    scoped: SalaryFields,
+    unscoped: SalaryFields,
+) -> SalaryFields:
+    unscoped_spans = tuple(
+        dict.fromkeys(
+            span
+            for evidence in (
+                unscoped.raw,
+                unscoped.amount_min,
+                unscoped.amount_max,
+                unscoped.currency,
+                unscoped.pay_period,
+                unscoped.commission,
+            )
+            for span in evidence.spans
+        )
+    )
+    if not unscoped_spans:
+        return scoped
+
+    def merge[T](
+        scoped_item: FieldEvidence[T],
+        unscoped_item: FieldEvidence[object],
+    ) -> FieldEvidence[T]:
+        if scoped_item.state is EvidenceState.ABSENT and not unscoped_item.spans:
+            return scoped_item
+        return _ambiguous(tuple(dict.fromkeys((*scoped_item.spans, *unscoped_spans))))
+
+    return SalaryFields(
+        raw=_ambiguous(tuple(dict.fromkeys((*scoped.raw.spans, *unscoped_spans)))),
+        amount_min=merge(scoped.amount_min, unscoped.amount_min),
+        amount_max=merge(scoped.amount_max, unscoped.amount_max),
+        currency=merge(scoped.currency, unscoped.currency),
+        pay_period=merge(scoped.pay_period, unscoped.pay_period),
+        commission=merge(scoped.commission, unscoped.commission),
+    )
+
+
+def _merge_vacancy_fields(
+    scoped: _VacancyFieldEvidence,
+    unscoped: _VacancyFieldEvidence,
+) -> _VacancyFieldEvidence:
+    return _VacancyFieldEvidence(
+        employer=_mark_unscoped_evidence_ambiguous(scoped.employer, unscoped.employer),
+        location=LocationFields(
+            raw=_mark_unscoped_evidence_ambiguous(scoped.location.raw, unscoped.location.raw),
+            address=_mark_unscoped_evidence_ambiguous(
+                scoped.location.address, unscoped.location.address
+            ),
+            district=_mark_unscoped_evidence_ambiguous(
+                scoped.location.district, unscoped.location.district
+            ),
+            province_city=_mark_unscoped_evidence_ambiguous(
+                scoped.location.province_city, unscoped.location.province_city
+            ),
+        ),
+        work_mode=_mark_unscoped_evidence_ambiguous(scoped.work_mode, unscoped.work_mode),
+        schedule=_mark_unscoped_evidence_ambiguous(scoped.schedule, unscoped.schedule),
+        salary=_merge_salary_evidence(scoped.salary, unscoped.salary),
+        experience=_mark_unscoped_evidence_ambiguous(scoped.experience, unscoped.experience),
+        requirements=_mark_unscoped_evidence_ambiguous(scoped.requirements, unscoped.requirements),
+        benefits=_mark_unscoped_evidence_ambiguous(scoped.benefits, unscoped.benefits),
+        contacts=ContactFields(
+            phone=_mark_unscoped_evidence_ambiguous(scoped.contacts.phone, unscoped.contacts.phone),
+            zalo=_mark_unscoped_evidence_ambiguous(scoped.contacts.zalo, unscoped.contacts.zalo),
+            email=_mark_unscoped_evidence_ambiguous(scoped.contacts.email, unscoped.contacts.email),
+            application_url=_mark_unscoped_evidence_ambiguous(
+                scoped.contacts.application_url, unscoped.contacts.application_url
+            ),
+        ),
+    )
+
+
 def _build_record(
     *,
     observation: PostObservation,
     text: str,
     view: _MappedText,
     role: _RoleOccurrence,
+    role_index: int,
+    roles: tuple[_RoleOccurrence, ...],
     completeness: TextCompleteness,
     policy: ExtractionPolicy,
     reason_codes: tuple[ReasonCode, ...],
@@ -1040,15 +1272,24 @@ def _build_record(
     vacancy_id = _opaque_id("vac", (*post_identity_key, role_anchor))
 
     headcount = _headcount_for_role(text, role.span, completeness)
-    employer = _employer_evidence(text, view, completeness)
-    location = _location_evidence(text, view, completeness)
-    work_mode = _alias_evidence(text, view, _WORK_MODE_ALIASES, completeness)
-    schedule = _schedule_evidence(text, view, completeness)
-    salary = _salary_evidence(text, view, completeness)
-    experience = _experience_evidence(text, view, completeness)
-    requirements = _labelled_list_evidence(text, view, "yêu cầu", "yeu cau", completeness)
-    benefits = _benefits_evidence(text, view, completeness)
-    contacts = _contact_evidence(text, view, completeness, observation.source)
+    if len(roles) == 1:
+        fields = _extract_vacancy_fields(text, view, completeness, observation.source)
+    else:
+        scoped_view, unscoped_view = _role_scope_views(view, role_index, roles)
+        scoped_fields = _extract_vacancy_fields(text, scoped_view, completeness, observation.source)
+        unscoped_fields = _extract_vacancy_fields(
+            text, unscoped_view, completeness, observation.source
+        )
+        fields = _merge_vacancy_fields(scoped_fields, unscoped_fields)
+    employer = fields.employer
+    location = fields.location
+    work_mode = fields.work_mode
+    schedule = fields.schedule
+    salary = fields.salary
+    experience = fields.experience
+    requirements = fields.requirements
+    benefits = fields.benefits
+    contacts = fields.contacts
 
     content_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     vacancy_revision_id = _opaque_id(
@@ -1103,7 +1344,11 @@ def _build_record(
         classification=VacancyClassification.RECRUITER_VACANCY,
         extraction_version=EXTRACTION_VERSION,
         confidence=Confidence.MEDIUM
-        if completeness is not TextCompleteness.COMPLETE or fields_ambiguous
+        if (
+            completeness is not TextCompleteness.COMPLETE
+            or fields_ambiguous
+            or role.location_anchor is not None
+        )
         else Confidence.HIGH,
         employer=employer,
         role_title=role_title,
@@ -1654,13 +1899,20 @@ def _contact_evidence(
         blocked = _ambiguous()
         return ContactFields(blocked, blocked, blocked, blocked)
 
-    phone_pattern = re.compile(
+    placeholder = (
+        r"\[(?:synthetic|fake)_(?:phone|contact)_"
+        r"(?:\d{1,3}|(?:test|sample|placeholder)(?:_[a-z0-9]{1,3})?)\]"
+    )
+    phone_label = (
         r"(?<!\w)(?:sđt|sdt|số\s+điện\s+thoại|so\s+dien\s+thoai|điện\s+thoại|"
         r"dien\s+thoai|phone|hotline)\s*[:：-]?\s*"
-        r"(?P<value>\[(?:synthetic|fake)[^\]]{1,40}\]|\+?\d[\d\s().-]{5,20})"
     )
-    zalo_pattern = re.compile(
-        r"(?<!\w)zalo\s*[:：-]?\s*(?P<value>\[(?:synthetic|fake)[^\]]{1,40}\]|\+?\d[\d\s().-]{5,20})"
+    unverified_contact = r"(?:\+?\d[\d\s().-]{5,20}|\[(?:synthetic|fake)[^\]]{1,40}\])"
+    phone_pattern = re.compile(phone_label + rf"(?P<value>{placeholder})")
+    unverified_phone_pattern = re.compile(phone_label + rf"(?P<value>{unverified_contact})")
+    zalo_pattern = re.compile(rf"(?<!\w)zalo\s*[:：-]?\s*(?P<value>{placeholder})")
+    unverified_zalo_pattern = re.compile(
+        rf"(?<!\w)zalo\s*[:：-]?\s*(?P<value>{unverified_contact})"
     )
     email_pattern = re.compile(
         r"(?<![\w.+-])(?P<value>[a-z0-9._%+-]+@[a-z0-9.-]+\.(?:invalid|example))(?!\w)"
@@ -1669,12 +1921,29 @@ def _contact_evidence(
         r"(?<!\w)(?:ứng\s+tuyển|ung\s+tuyen|apply|nộp\s+hồ\s+sơ|nop\s+ho\s+so)\s*[:：-]?\s*"
         r"(?P<value>https?://[^\s<>]+\.invalid[^\s<>]*)"
     )
+    phone = _contact_kind_evidence(text, view, phone_pattern, completeness)
+    if _has_unverified_contact(view, unverified_phone_pattern, phone_pattern):
+        phone = _ambiguous()
+
+    zalo = _contact_kind_evidence(text, view, zalo_pattern, completeness)
+    if _has_unverified_contact(view, unverified_zalo_pattern, zalo_pattern):
+        zalo = _ambiguous()
+
     return ContactFields(
-        _contact_kind_evidence(text, view, phone_pattern, completeness),
-        _contact_kind_evidence(text, view, zalo_pattern, completeness),
+        phone,
+        zalo,
         _contact_kind_evidence(text, view, email_pattern, completeness),
         _contact_kind_evidence(text, view, url_pattern, completeness),
     )
+
+
+def _has_unverified_contact(
+    view: _MappedText,
+    pattern: re.Pattern[str],
+    verified_pattern: re.Pattern[str],
+) -> bool:
+    verified_spans = {match.span("value") for match in verified_pattern.finditer(view.value)}
+    return any(match.span("value") not in verified_spans for match in pattern.finditer(view.value))
 
 
 def _contact_kind_evidence(

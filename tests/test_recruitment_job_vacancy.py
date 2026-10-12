@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import fields
 
 import pytest
@@ -224,6 +225,51 @@ def test_distinct_role_headcounts_are_not_added_together() -> None:
     assert len(by_anchor) == 2
     assert by_anchor["role-v1:sales"].headcount.value == 2
     assert by_anchor["role-v1:accounting"].headcount.value == 1
+
+
+def test_multi_role_fields_are_scoped_to_explicit_role_mentions() -> None:
+    text = "Cần tuyển sales và kế toán; Lương sales 8tr/tháng; sales tại Hà Nội; kế toán tại TP.HCM"
+    result = extract_vietnamese_vacancies(_fixture(text))
+    by_anchor = {record.role_anchor: record for record in result.records}
+
+    sales = by_anchor["role-v1:sales"]
+    accounting = by_anchor["role-v1:accounting"]
+    assert sales.salary.amount_min.value == 8_000_000
+    assert sales.location.province_city.value == "Hà Nội"
+    assert accounting.salary.raw.state is EvidenceState.ABSENT
+    assert accounting.location.province_city.value == "TP.HCM"
+    _assert_spans_match(text, sales.salary.raw)
+    _assert_spans_match(text, sales.location.province_city)
+    _assert_spans_match(text, accounting.location.province_city)
+
+
+def test_unscoped_multi_role_fields_remain_ambiguous() -> None:
+    text = "Cần tuyển sales và kế toán; lương 8tr/tháng; tại Hà Nội"
+    result = extract_vietnamese_vacancies(_fixture(text))
+
+    assert result.status is ExtractionStatus.PARTIAL
+    assert len(result.records) == 2
+    for record in result.records:
+        assert record.salary.raw.state is EvidenceState.AMBIGUOUS
+        assert record.salary.raw.value is None
+        assert record.salary.amount_min.state is EvidenceState.AMBIGUOUS
+        assert record.salary.amount_min.value is None
+        assert record.location.province_city.state is EvidenceState.AMBIGUOUS
+        assert record.location.province_city.value is None
+
+
+def test_multi_role_scoping_preserves_decomposed_unicode_source_spans() -> None:
+    text = unicodedata.normalize(
+        "NFD",
+        "Cần tuyển sales và kế toán; Lương sales 8tr/tháng; kế toán tại Hà Nội",
+    )
+    result = extract_vietnamese_vacancies(_fixture(text))
+    by_anchor = {record.role_anchor: record for record in result.records}
+
+    assert by_anchor["role-v1:sales"].salary.amount_min.value == 8_000_000
+    assert by_anchor["role-v1:accounting"].location.province_city.value == "Hà Nội"
+    _assert_spans_match(text, by_anchor["role-v1:sales"].salary.raw)
+    _assert_spans_match(text, by_anchor["role-v1:accounting"].location.province_city)
 
 
 def test_repeated_same_title_without_distinguishing_evidence_gets_no_ids() -> None:
@@ -489,6 +535,31 @@ def test_phone_without_zalo_label_is_not_marked_as_zalo() -> None:
 
     assert record.contacts.phone.state is EvidenceState.SOURCE_SPAN
     assert record.contacts.zalo.state is EvidenceState.ABSENT
+
+
+def test_synthetic_source_does_not_authorize_numeric_contact_values() -> None:
+    text = "Cần tuyển sales; SĐT: 000-000-0000; Zalo: 000-000-0000"
+    result = extract_vietnamese_vacancies(_fixture(text))
+    record = result.records[0]
+
+    for contact in (record.contacts.phone, record.contacts.zalo):
+        assert contact.state is EvidenceState.AMBIGUOUS
+        assert contact.value is None
+        assert contact.raw_value is None
+        assert contact.spans == ()
+    assert "000-000-0000" not in repr(result)
+    assert "000-000-0000" not in repr(record)
+
+
+def test_synthetic_contact_placeholder_cannot_embed_a_phone_number() -> None:
+    text = "Cần tuyển sales; SĐT: [SYNTHETIC_PHONE_0000000000]"
+    record = extract_vietnamese_vacancies(_fixture(text)).records[0]
+
+    assert record.contacts.phone.state is EvidenceState.AMBIGUOUS
+    assert record.contacts.phone.value is None
+    assert record.contacts.phone.raw_value is None
+    assert record.contacts.phone.spans == ()
+    assert "0000000000" not in repr(record)
 
 
 def test_operator_contact_text_is_never_copied_to_result_or_repr() -> None:

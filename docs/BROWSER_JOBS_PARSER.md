@@ -79,7 +79,9 @@ Each record uses schema version `1` and contains:
 | Work and schedule | Explicit remote/onsite mode, shift, full-time, or part-time phrases. |
 | Salary | Exact raw salary phrase; numeric bounds, explicit currency, period, and commission semantics only when supported. |
 | Experience, requirements, benefits | Recognized experience phrase; text after `yêu cầu:`; and explicit benefit phrases or items after `phúc lợi:`. |
-| Contacts | Phone, Zalo, email, and application URL are separate fields. Extraction is limited to synthetic fixture input; operator-supplied contacts remain `AMBIGUOUS` with no copied value. Fixture contacts must be fake placeholders, email domains must be `.invalid` or `.example`, and application URLs must use `.invalid`. No live contact use is authorized. |
+| Contacts | Phone, Zalo, email, and application URL are separate fields. Extraction is limited to synthetic fixture input; operator-supplied contacts remain `AMBIGUOUS` with no copied value. Phone and Zalo values require a verifiable placeholder such as `[SYNTHETIC_PHONE_001]` or `[FAKE_CONTACT_001]`; numeric values or malformed synthetic tokens following a phone/Zalo label remain `AMBIGUOUS` without returning the value, raw text, or source span, even in a synthetic fixture. Email domains must be `.invalid` or `.example`, and application URLs must use `.invalid`. No live contact use is authorized. |
+
+When a post contains multiple recognized roles, field evidence is scoped by the role named in the same delimited clause. A clause that names multiple roles, or a field mention with no role reference, does not get copied to each vacancy: the affected field is `AMBIGUOUS` with no value. A field explicitly scoped to another role is not inherited by this role. This conservative rule applies to employer, location, work mode, schedule, salary, experience, requirements, benefits, and contacts.
 
 Salary rules are intentionally narrow:
 
