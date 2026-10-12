@@ -35,6 +35,11 @@ class SessionExpired(BrowserAdapterError):
         super().__init__("SESSION_EXPIRED")
 
 
+class BrowserSessionMismatch(BrowserAdapterError):
+    def __init__(self) -> None:
+        super().__init__("BROWSER_SESSION_MISMATCH")
+
+
 class ChallengeDetected(BrowserAdapterError):
     def __init__(self) -> None:
         super().__init__("CHALLENGE_REQUIRED")
