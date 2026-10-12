@@ -2,17 +2,17 @@
 
 > **Phiên bản tài liệu:** 2026-10-12. **Đối tượng:** operator dùng CLI cục bộ trên Windows.
 >
-> **Đọc trước:** Micro-slice S1–S5 cung cấp quy trình offline để operator nhập permalink, xem shortlist, tự viết draft và duyệt target. S2 search/conversation chỉ dùng fixture synthetic; **không có tìm kiếm/thu thập Threads thật bằng browser**. S4 handoff có thể mở browser thật tới đúng URL sau xác nhận `OPEN`, nhưng chưa chạy live UAT. Không có browser auto-fill hoặc auto-send. Không hiểu tài liệu/test synthetic là sự cho phép của Meta hay bằng chứng đã qua App Review.
+> **Đọc trước:** Micro-slice S1–S6 cung cấp quy trình offline để operator nhập permalink, lưu shortlist riêng theo account, tự viết draft và duyệt target. S2 search/conversation chỉ dùng fixture synthetic; **không có tìm kiếm/thu thập Threads thật bằng browser**. S4 handoff có thể mở browser thật tới đúng URL sau xác nhận `OPEN`, nhưng chưa chạy live UAT. Không có browser auto-fill hoặc auto-send. Không hiểu tài liệu/test synthetic là sự cho phép của Meta hay bằng chứng đã qua App Review.
 >
-> Kế hoạch: [GitHub issue #47](https://github.com/pumni/threads-standalone/issues/47), S5: [issue #55](https://github.com/pumni/threads-standalone/issues/55). Release gate: [runbook](docs/BROWSER_MVP_RELEASE_READINESS.md). Giới hạn live/UAT: [issue #18](https://github.com/pumni/threads-standalone/issues/18) và [#46](https://github.com/pumni/threads-standalone/issues/46).
+> Kế hoạch: [GitHub issue #47](https://github.com/pumni/threads-standalone/issues/47), S5: [issue #55](https://github.com/pumni/threads-standalone/issues/55), S6: [issue #58](https://github.com/pumni/threads-standalone/issues/58). Release gate: [runbook](docs/BROWSER_MVP_RELEASE_READINESS.md). Giới hạn live/UAT: [issue #18](https://github.com/pumni/threads-standalone/issues/18) và [#46](https://github.com/pumni/threads-standalone/issues/46).
 
 ## 1. Threads Standalone dùng để làm gì?
 
-Threads Standalone là công cụ chạy **cục bộ trên máy tính**. Workflow S1–S5 tập trung vào permalink do operator cung cấp, shortlist/draft riêng tư, exact-target browser handoff có xác nhận và journal outcome local. Các lệnh API/Nurture/mutation đã có là luồng riêng, có thể gọi API hoặc tạo remote effect khi operator chạy với quyền phù hợp.
+Threads Standalone là công cụ chạy **cục bộ trên máy tính**. Workflow S1–S6 tập trung vào permalink do operator cung cấp, queue riêng theo account, shortlist/draft riêng tư, exact-target browser handoff có xác nhận và journal outcome local. Các lệnh API/Nurture/mutation đã có là luồng riêng, có thể gọi API hoặc tạo remote effect khi operator chạy với quyền phù hợp.
 
 **Nguyên tắc:** Mỗi tài khoản phải thuộc sở hữu khách hàng hoặc được ủy quyền hợp pháp; người dùng chịu trách nhiệm kiểm tra nội dung và đích gửi. Không tạo tương tác giả, spam hoặc dùng phần mềm vượt challenge/CAPTCHA. Các hoạt động đọc/ghi tự động trên website chỉ được kích hoạt khi nền tảng cho phép hành vi tương ứng.
 
-### Trạng thái hiện tại sau Micro-slice 5
+### Trạng thái hiện tại sau Micro-slice 6
 
 | Chức năng | Trạng thái |
 | --- | --- |
@@ -22,10 +22,12 @@ Threads Standalone là công cụ chạy **cục bộ trên máy tính**. Workfl
 | S3: `manual-list` rồi `manual-review` | **CLI offline đã nối**; danh sách canonical/dedup trước khi chọn; draft/context chỉ in trong private TTY |
 | S4: `manual-handoff`, `manual-status`, `manual-record` | **Có; synthetic-tested**; exact target/SHA, xác nhận `OPEN`/`RECORD`, journal `UNVERIFIED`, không auto-fill/send |
 | S5: integrated CLI flow, installed-wheel smoke, docs/runbook | **Synthetic-only**; không mở Chromium thật hoặc gọi network/API trong test |
+| S6: `opportunity-import`, `opportunity-list`, `opportunity-select` | **Local queue theo account; synthetic-only**; context do operator nhập, S3 review dùng exact target, không đọc Threads |
+| Queue maintenance: `opportunity-skip`, `opportunity-remove` | **Local-only**; remove yêu cầu `DELETE` và bị chặn khi S4 handoff còn `HANDOFF_UNRESOLVED` |
 | Đọc/ghi Threads bằng official API và Nurture | **Lệnh riêng đã có**; có thể truy cập API hoặc tạo remote effect tùy lệnh, credentials và quyền |
-| Browser tự điền/gửi reply, tự động engagement | **Không có trong S1–S5**; không hứa khả năng hoặc quyền sử dụng |
+| Browser tự điền/gửi reply, tự động engagement | **Không có trong S1–S6**; không hứa khả năng hoặc quyền sử dụng |
 
-S1–S5 **synthetic-ready, chưa production-ready**. Meta Terms/compliance permission cho automated browser reads/actions, App Review cho capability API cần review riêng. Live Threads UAT, kiểm tra root/profile/account thật và các issue #18/#46 chưa được thực hiện trong checkpoint này.
+S1–S6 **synthetic/local-only, chưa production-ready**. Queue operations không khởi chạy browser, không import Playwright runtime, không gọi API và không tạo remote effect. Meta Terms/compliance permission cho automated browser reads/actions, App Review cho capability API cần review riêng. Live Threads UAT, kiểm tra root/profile/account thật và các issue #18/#46 chưa được thực hiện trong checkpoint này.
 
 ### Trạng thái Micro-slice 2 — synthetic-only
 
@@ -41,7 +43,7 @@ S1–S5 **synthetic-ready, chưa production-ready**. Meta Terms/compliance permi
 - Lệnh riêng `threads-local recruitment manual-list` hiển thị shortlist canonical đánh số từ 1 và ánh xạ URL trùng trên `stderr` của terminal riêng tư. Có thể xem danh sách trước khi tạo draft hoặc chọn mục. Dedup giữ nguyên hoa/thường của post ID; khác biệt username và query tracking được chuẩn hóa theo S2.
 - Operator phải chỉ định `--select` (đánh số từ 1) trong `manual-review`. Author chỉ được suy ra từ permalink và luôn là **chưa xác minh**; URL không tạo nội dung bài, điểm liên quan, remote ID hay trạng thái API/Nurture.
 - Draft do operator tự viết/chỉnh sửa trong file UTF-8, tối đa 500 ký tự; không có AI. Context tùy chọn cũng do operator cung cấp và luôn có mức đầy đủ `UNKNOWN`. Review hiển thị hash SHA-256 và `NOT_SENT`.
-- CLI chỉ chạy trong terminal riêng tư tương tác; từ chối CI và luồng có stdout/stderr/stdin chuyển hướng. Shortlist, draft, context và URL chỉ được in ở `stderr` terminal sau khi kiểm tra TTY. Lệnh không gọi API/browser và không ghi queue, receipt, journal hay Nurture state.
+- CLI S3 chỉ chạy trong terminal riêng tư tương tác; từ chối CI và luồng có stdout/stderr/stdin chuyển hướng. Shortlist, draft, context và URL chỉ được in ở `stderr` terminal sau khi kiểm tra TTY. `manual-list`/`manual-review` không gọi API/browser và không ghi queue, receipt, journal hay Nurture state.
 - S3 synthetic-tested; **chưa live-verified**. `manual-list` và `manual-review` offline không đồng nghĩa với quyền lấy dữ liệu Threads. S1 browser handoff là thao tác network riêng, chỉ dùng sau phê duyệt live riêng theo #18/#46 và operator phải tự xác minh actor/target.
 
 ### Trạng thái Micro-slice 4–5 — synthetic-only
@@ -50,6 +52,14 @@ S1–S5 **synthetic-ready, chưa production-ready**. Meta Terms/compliance permi
 - Handoff chỉ điều hướng đến một target đã duyệt. Không mở composer, tự điền draft hoặc nhấn Send. Browser đóng bình thường, crash, Ctrl+C hay EOF không chứng minh đã/ chưa gửi. `UNKNOWN_IDENTITY` luôn được hiển thị vì phần mềm không xác thực actor đang đăng nhập.
 - `manual-status` chỉ đọc journal local. `manual-record` yêu cầu attempt ID đang pending, SHA không đổi và nhập đúng `RECORD`; các outcome `ABORTED_NOT_SENT`, `AMBIGUOUS`, `OPERATOR_REPORTED_SENT_UNVERIFIED` đều mang `UNVERIFIED`. Chỉ `ABORTED_NOT_SENT` mới cho phép handoff sau; hai outcome còn lại chặn thử lại.
 - S5 thêm integrated CLI synthetic test chạy với fake browser engine và temporary root; wheel smoke kiểm tra import từ site-packages ngoài checkout. **Không có live Threads login, browser, API, gửi reply hay dữ liệu khách hàng trong test.** Kết quả synthetic không phải live UAT hoặc xác nhận quyền nền tảng.
+
+### Trạng thái Micro-slice 6 — private opportunity queue, offline-only
+
+- `opportunity-import ALIAS --targets-file PATH` lưu 1–20 permalink operator chọn vào queue JSON v1 riêng theo account dưới `THREADS_LOCAL_DATA_ROOT`. Có thể thêm một file context chung cho batch bằng `--context-file`; `--context-completeness UNKNOWN|PARTIAL|COMPLETE` là xác nhận của operator, không phải kết luận tự động. Không có file URL hợp lệ (0 dòng), quá 20 dòng, URL sai host/path, UTF-8 sai hoặc file quá lớn sẽ bị từ chối.
+- URL canonical dùng S2 `normalize_manual_permalink`; tracking query trong allowlist được loại bỏ. Import trùng trong file hoặc đã có trong queue không tạo item thứ hai. Tối đa 20 item active/account; queue giữ tối đa 40 item gồm cả `SKIPPED`, nên hãy xóa item cũ khi cần thêm chỗ.
+- `opportunity-list ALIAS` hiển thị ID, state, canonical target, context provenance/completeness và nội dung context trên private TTY. `opportunity-select ALIAS --id ID` chọn một item chính xác; có thể thay context bằng `--context-file` và xác nhận lại completeness. Thêm `--draft-file PATH --confirm-target URL` để chạy cùng S3 review, in preview/hash ở private TTY. Draft vẫn do operator quản lý trong file và không được lưu vào queue.
+- State ban đầu là `NEEDS_CONTEXT`; state `READY` chỉ khi operator cung cấp context và chọn completeness `COMPLETE`. `opportunity-skip ALIAS --id ID [--reason-file PATH]` chuyển sang `SKIPPED` và giải phóng active capacity. `opportunity-remove ALIAS --id ID` yêu cầu gõ `DELETE`; lệnh không xóa S4 journal và dừng nếu target còn `HANDOFF_UNRESOLVED`.
+- Queue file được kiểm tra schema/path, ghi atomic và khóa theo account. Tất cả queue commands yêu cầu private interactive TTY, chỉ in dữ liệu riêng tư ở `stderr`, không gọi network/API, không khởi động browser/Playwright và không gửi reply. URL không chứng minh tác giả; identity vẫn `UNKNOWN_IDENTITY`/`UNVERIFIED`.
 
 ## 2. Yêu cầu máy tính
 
@@ -227,6 +237,30 @@ Bỏ `--context-file` nếu không có context. `--select` bắt buộc là số
 
 SHA này gắn với account UUID + canonical target URL + draft cuối. Context không thuộc hash, và software không xác thực actor nên identity cũng không thuộc hash. Thay account, target hoặc draft yêu cầu review lại. `manual-list`/`manual-review` chỉ chạy offline: không search, mở browser, gọi API, gửi reply hoặc ghi queue/draft/state.
 
+#### S6: Lưu shortlist và tiếp tục review sau khi chạy lại CLI
+
+S6 thêm queue cục bộ riêng theo account. Dùng file/alias synthetic hiện có trong ví dụ và một private PowerShell terminal:
+
+```powershell
+$contextFile = Join-Path $inputRoot 'context.txt'
+[System.IO.File]::WriteAllText($contextFile, 'Synthetic operator-observed context.', $utf8NoBom)
+uv run --locked threads-local recruitment opportunity-import synthetic `
+  --targets-file $targetsFile `
+  --context-file $contextFile
+uv run --locked threads-local recruitment opportunity-list synthetic
+$opportunityId = Read-Host 'Nhập ID chính xác từ opportunity-list'
+uv run --locked threads-local recruitment opportunity-select synthetic `
+  --id $opportunityId `
+  --confirm-target 'https://www.threads.com/@synthetic/post/fake_02' `
+  --context-file $contextFile `
+  --context-completeness COMPLETE `
+  --draft-file $draftFile
+```
+
+Import và list canonicalize/deduplicate offline, không tìm post. Khi list, chọn đúng ID; `--confirm-target` phải đúng URL canonical đang duyệt. Context là dữ liệu do operator quan sát/nhập. `COMPLETE` chỉ là operator assertion; app không kiểm tra độ đầy đủ hay danh tính tác giả. Draft chỉ đọc để tạo S3 review, không được lưu trong queue. SHA vẫn bind account UUID + exact canonical target + draft; context không nằm trong SHA như semantics S3 hiện có.
+
+Queue tối đa 20 item active/account và giữ tối đa 40 item tổng cộng. `opportunity-skip` đánh dấu `SKIPPED`; `opportunity-remove` yêu cầu gõ `DELETE`, giữ nguyên mọi journal S4, và không xóa target khi outcome còn `HANDOFF_UNRESOLVED`. Mọi queue command cần TTY riêng tư, không pipe/redirect. S6 không gọi API, mở browser, khởi động Playwright hoặc tạo remote effect. Nếu sau này có GO riêng cho S4, vẫn dùng lệnh S4 hiện có với URL exact và SHA vừa review; queue select tự nó không phải handoff.
+
 ### 4. Yêu cầu exact browser handoff sau phê duyệt riêng
 
 > **Không chạy lệnh này trong test, sample dry run, CI hoặc checkpoint synthetic.** Lệnh mở headed Chromium và điều hướng qua mạng tới target thật nếu operator đưa URL thật. Chỉ dùng sau phê duyệt live riêng cho account, target và nội dung, và chỉ khi hoạt động đó được nền tảng cho phép.
@@ -310,7 +344,7 @@ S5 local result trên Windows/Python 3.14.7: locked Ruff, format, Pyright, full 
 
 ## 11. Trạng thái App Review và đường nâng cấp
 
-**Hiện tại:** S1–S5 chỉ đạt synthetic readiness, chưa production-ready. Tài liệu này không cấp quyền tự động thu thập dữ liệu hoặc điều khiển website. Cần xác minh riêng điều khoản nền tảng và phê duyệt compliance trước automated browser reads/actions; official API capability cần App Review/permission tương ứng. Live UAT và issues #18/#46 vẫn là gate riêng. Lịch sử chuyển mã nguồn và quyết định license công khai cũng chưa được giải quyết: xem [PROVENANCE_DECISION.md](docs/PROVENANCE_DECISION.md); không suy ra quyền tái sử dụng từ việc repository public.
+**Hiện tại:** S1–S6 chỉ đạt synthetic/local readiness, chưa production-ready. Tài liệu này không cấp quyền tự động thu thập dữ liệu hoặc điều khiển website. Cần xác minh riêng điều khoản nền tảng và phê duyệt compliance trước automated browser reads/actions; official API capability cần App Review/permission tương ứng. Live UAT và issues #18/#46 vẫn là gate riêng. Lịch sử chuyển mã nguồn và quyết định license công khai cũng chưa được giải quyết: xem [PROVENANCE_DECISION.md](docs/PROVENANCE_DECISION.md); không suy ra quyền tái sử dụng từ việc repository public.
 
 Tài liệu tham khảo: [Meta Terms](https://www.facebook.com/terms/) · [Playwright persistent context](https://playwright.dev/python/docs/api/class-browsertype) · [Playwright locators](https://playwright.dev/python/docs/locators) · [README dự án](README.md).
 
