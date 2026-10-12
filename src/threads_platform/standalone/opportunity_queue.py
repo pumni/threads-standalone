@@ -34,7 +34,11 @@ from threads_platform.standalone.manual_opportunities import (
     private_review_terminal_available,
     render_manual_draft_review,
 )
-from threads_platform.standalone.manual_outcomes import ManualOutcomeError, ManualOutcomeStore
+from threads_platform.standalone.manual_outcomes import (
+    ManualOutcomeError,
+    ManualOutcomeLockLease,
+    ManualOutcomeStore,
+)
 
 OpportunityState = Literal["NEEDS_CONTEXT", "READY", "SKIPPED"]
 ContextCompleteness = Literal["UNKNOWN", "PARTIAL", "COMPLETE"]
@@ -247,6 +251,30 @@ class OpportunityQueueStore:
                 else "OPPORTUNITY_QUEUE_INVALID"
             )
             raise OpportunityQueueError(code) from None
+
+    def read_under_account_lock(
+        self,
+        account_id: UUID,
+        *,
+        lock_lease: ManualOutcomeLockLease,
+    ) -> OpportunityQueue:
+        """Read the current queue through an active S4-compatible account lock."""
+
+        if type(account_id) is not UUID or account_id.version != 4:
+            raise OpportunityQueueError("OPPORTUNITY_QUEUE_INVALID")
+        root = self._required_root()
+        if type(lock_lease) is not ManualOutcomeLockLease:
+            raise OpportunityQueueError("OPPORTUNITY_QUEUE_INVALID")
+        try:
+            lock_lease.assert_active(account_id, root)
+        except ManualOutcomeError as error:
+            code = (
+                "OPPORTUNITY_QUEUE_BUSY"
+                if error.code == "MANUAL_OUTCOME_BUSY"
+                else "OPPORTUNITY_QUEUE_INVALID"
+            )
+            raise OpportunityQueueError(code) from None
+        return self._read_unlocked(root, account_id)
 
     def list(self, account_id: UUID) -> OpportunityQueue:
         with self.account_lock(account_id):
