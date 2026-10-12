@@ -46,8 +46,10 @@ _SAFE_TRACKING_QUERY_KEYS = frozenset(
         "xmt",
     }
 )
-_SEARCH_CANDIDATE_KEYS = frozenset({"href", "author_username", "text_excerpt"})
-_CONVERSATION_CANDIDATE_KEYS = frozenset({"href", "author_username", "text_excerpt", "parent_ref"})
+_SEARCH_CANDIDATE_KEYS = frozenset({"href", "author_username", "text_excerpt", "content_truncated"})
+_CONVERSATION_CANDIDATE_KEYS = frozenset(
+    {"href", "author_username", "text_excerpt", "parent_ref", "content_truncated"}
+)
 
 
 def normalize_search_query(query: object) -> str:
@@ -103,8 +105,9 @@ def normalize_search_candidates(
                 candidate,
                 allowed_keys=_SEARCH_CANDIDATE_KEYS,
             )
+            content_truncated = _candidate_content_truncated(candidate)
             previous = candidates.get(reference)
-            normalized = (author, excerpt, excerpt_truncated)
+            normalized = (author, excerpt, excerpt_truncated or content_truncated)
             if previous is not None and previous != normalized:
                 raise UnsupportedUIState()
             candidates.setdefault(reference, normalized)
@@ -170,7 +173,12 @@ def normalize_conversation_candidates(
         if reference == root_ref and parent_ref is not None:
             raise UnsupportedUIState()
 
-        normalized = (author, excerpt, excerpt_truncated, parent_ref)
+        normalized = (
+            author,
+            excerpt,
+            excerpt_truncated or _candidate_content_truncated(candidate),
+            parent_ref,
+        )
         previous = records.get(reference)
         if previous is not None and previous != normalized:
             raise UnsupportedUIState()
@@ -329,6 +337,15 @@ def _normalize_candidate(
         raise UnsupportedUIState()
     excerpt, excerpt_truncated = _normalize_excerpt(candidate.get("text_excerpt"))
     return target[0], target[1], excerpt, excerpt_truncated
+
+
+def _candidate_content_truncated(candidate: object) -> bool:
+    if not _is_candidate_mapping(candidate):
+        raise UnsupportedUIState()
+    value = candidate.get("content_truncated", False)
+    if type(value) is not bool:
+        raise UnsupportedUIState()
+    return value
 
 
 def _normalize_excerpt(value: object) -> tuple[str | None, bool]:
