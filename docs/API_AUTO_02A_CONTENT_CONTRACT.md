@@ -61,6 +61,34 @@ The contract has no storage, queue, scheduler, browser, HTTP, API client, or
 mutation dependency. All identifiers used as target evidence are digests. Raw
 target IDs must not be added to this packet or its representation.
 
+## Known bootstrap limitation — tracked by #135
+
+The accepted planner and this content contract are not yet connected into an
+end-to-end bootstrap. Calling `plan_cycle(scope, candidates, None, now=...)`
+returns `OBSERVE_ONLY / DRAFT_UNAVAILABLE` without an `ActionProposal`, while
+`prepare_packet(...)` requires an `ActionProposal` to create the first review
+packet. The `_proposal(...)` helper in the unit tests constructs a synthetic
+proposal to test content validation; it does not demonstrate a wired product
+flow from observation to operator review.
+
+Until [the design gate in issue #135](https://github.com/pumni/threads-standalone/issues/135)
+is reviewed and accepted, #74B must not manufacture an `ActionProposal`, treat a
+bare fingerprint or digest as an exact target, or treat `ApprovalInput` as
+operator consent or durable approval. The #135 design must specify a pure,
+fully evidenced, unapproved `ReviewIntent` for an eligible candidate, including
+account UUID, API actor, source/provenance, target/root/parent/context digests,
+verified permission and quota evidence, policy revision, and freshness. It must
+define the path from that intent to an operator-authored review packet, explicit
+TTY consent stored privately and bound to the exact packet revision, and fresh
+official-API target reacquisition compared with that immutable approval before
+any later guarded #76 dispatch proposal. The accepted planner must remain
+fail-closed during that design.
+
+Persistent #74B storage and approval implementation is blocked until the
+coordinator reviews and accepts this interface through #135. This section
+documents the current integration gap; it does not change planner behavior or
+authorize bootstrap, persistence, or dispatch implementation.
+
 ## Requirements for the separately reviewed #74B store
 
 Before persistent approval or queueing is implemented, #74B must define and
