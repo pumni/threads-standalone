@@ -236,6 +236,7 @@ class ApprovedPacketSummary:
     candidate_fingerprint: str = field(repr=False)
     action: ActionKind
     target_sha256: str = field(repr=False)
+    context_sha256: str = field(repr=False)
     content_sha256: str = field(repr=False)
     packet_revision_sha256: str = field(repr=False)
     policy_sha256: str = field(repr=False)
@@ -374,6 +375,11 @@ def plan_cycle(
         and type(approved_packet_summary) is not ApprovedPacketSummary
     ):
         return CyclePlan(PlanDecision.STOP, (), (PlanReason.INVALID_SCOPE,))
+    if approved_packet_summary is not None and not any(
+        candidate.fingerprint == approved_packet_summary.candidate_fingerprint
+        for candidate in candidates
+    ):
+        return CyclePlan(PlanDecision.STOP, (), (PlanReason.TARGET_NOT_REACQUIRED,))
     if not scope.enabled:
         return CyclePlan(PlanDecision.OBSERVE_ONLY, (), (PlanReason.NOT_ELIGIBLE,))
     if not candidates:
@@ -382,11 +388,6 @@ def plan_cycle(
     conflict = _binding_conflict(candidates)
     if conflict is not None:
         return CyclePlan(PlanDecision.STOP, (), (conflict,))
-    if approved_packet_summary is not None and not any(
-        candidate.fingerprint == approved_packet_summary.candidate_fingerprint
-        for candidate in candidates
-    ):
-        return CyclePlan(PlanDecision.STOP, (), (PlanReason.TARGET_NOT_REACQUIRED,))
 
     ordered = tuple(
         candidate
@@ -428,6 +429,7 @@ def plan_cycle(
                     candidate,
                     approved_packet_summary,
                     _target_digest(scope, candidate),
+                    _context_digest(candidate),
                     now,
                 )
                 if packet_failure is not None:
@@ -531,7 +533,9 @@ def plan_cycle(
                 )
             )
             continue
-        packet_failure = _packet_failure(scope, candidate, packet, target_digest, now)
+        packet_failure = _packet_failure(
+            scope, candidate, packet, target_digest, context_digest, now
+        )
         if packet_failure is not None:
             return CyclePlan(
                 PlanDecision.STOP,
@@ -813,6 +817,7 @@ def _packet_failure(
     candidate: ObservedCandidate,
     packet: ApprovedPacketSummary,
     target_digest: str,
+    context_digest: str,
     now: datetime,
 ) -> PlanReason | None:
     if (
@@ -820,11 +825,13 @@ def _packet_failure(
         or packet.action is not candidate.action
         or packet.candidate_fingerprint != candidate.fingerprint
         or packet.target_sha256 != target_digest
+        or packet.context_sha256 != context_digest
         or packet.policy_sha256 != scope.policy_sha256
     ):
         return PlanReason.APPROVAL_TARGET_MISMATCH
     if (
         not _is_sha256(packet.target_sha256)
+        or not _is_sha256(packet.context_sha256)
         or not _is_sha256(packet.content_sha256)
         or not _is_sha256(packet.packet_revision_sha256)
         or not _is_utc(packet.expires_at)
@@ -909,7 +916,6 @@ def _context_digest(candidate: ObservedCandidate) -> str:
         "root": binding.root_id,
         "parent": binding.parent_id,
         "context_evidence": binding.context_evidence_sha256,
-        "observed_at": binding.observed_at.isoformat(),
         "completeness": binding.completeness.value,
         "actor_verified": binding.actor_verified,
         "source_verified": binding.source_verified,

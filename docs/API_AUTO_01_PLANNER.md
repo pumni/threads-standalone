@@ -40,19 +40,25 @@ reconstruct a target. A changed target or context fails the packet digest
 comparison and stops the cycle.
 
 `target_sha256` and `context_sha256` are equality checks over the private,
-ephemeral binding. They do not store or recover its remote IDs and are not a
-private target-reference store. If future API reads cannot reacquire the exact
-target with the required permissions, implementation of a minimized private
+ephemeral binding and observed context evidence. Both must match the approved
+packet before a proposal is returned. Observation timestamps are checked for
+freshness separately and are excluded from the context digest, so rereading the
+same context later does not invalidate approval. If a packet's candidate is
+absent after restart, the planner returns `STOP / TARGET_NOT_REACQUIRED`.
+These digests do not store or recover remote IDs and are not a private
+target-reference store. If future API reads cannot reacquire the exact target
+with the required permissions, implementation of a minimized private
 target-reference store requires a separate design and review.
 
 ## Content, approval, and dispatch boundary
 
 An `ApprovedPacketSummary` contains only account/action/fingerprint bindings,
-hashes, and an expiry. It contains no final text. Even when its exact evidence
-matches, this planner emits `NEEDS_REVIEW` with `dispatchable=False`. Missing
-packet content produces `OBSERVE_ONLY` with `DRAFT_UNAVAILABLE`; the planner
-never invents generic reply text. `ContentSource` and `ActionDispatcher` are
-Protocol seams only and are not called or implemented in this slice.
+target and context hashes, content hashes, and an expiry. It contains no final
+text. Even when its exact evidence matches, this planner emits `NEEDS_REVIEW`
+with `dispatchable=False`. Missing packet content produces `OBSERVE_ONLY` with
+`DRAFT_UNAVAILABLE`; the planner never invents generic reply text.
+`ContentSource` and `ActionDispatcher` are Protocol seams only and are not
+called or implemented in this slice.
 
 Every remote ID, account UUID, fingerprint, context hash, and content hash is
 excluded from DTO representations. The planner has no journal or persistence

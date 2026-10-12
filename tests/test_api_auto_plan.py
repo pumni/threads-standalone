@@ -27,6 +27,7 @@ from threads_platform.standalone.api_auto_plan import (
     QuotaSnapshot,
     TargetKind,
     VerifiedTargetBinding,
+    _context_digest,
     _target_digest,
     plan_cycle,
 )
@@ -201,6 +202,7 @@ def _packet(
         candidate_fingerprint=candidate.fingerprint,
         action=action or candidate.action,
         target_sha256=target_sha256 or _target_digest(scope, candidate),
+        context_sha256=_context_digest(candidate),
         content_sha256=_sha("synthetic-final-content"),
         packet_revision_sha256=_sha("synthetic-packet-revision"),
         policy_sha256=policy_sha256 or scope.policy_sha256,
@@ -227,6 +229,18 @@ def test_empty_cycle_is_observe_only() -> None:
     plan = plan_cycle(_scope(), (), now=NOW)
 
     assert plan.decision is PlanDecision.OBSERVE_ONLY
+    assert plan.items == ()
+
+
+def test_empty_cycle_with_approved_packet_stops_when_target_was_not_reacquired() -> None:
+    candidate = _reply_candidate("restart-empty")
+    scope = _scope()
+    packet = _packet(candidate, scope)
+
+    plan = plan_cycle(scope, (), packet, now=NOW)
+
+    assert plan.decision is PlanDecision.STOP
+    assert plan.reason_codes == (PlanReason.TARGET_NOT_REACQUIRED,)
     assert plan.items == ()
 
 
@@ -539,6 +553,44 @@ def test_unmatched_approved_packet_means_exact_target_was_not_reacquired() -> No
     assert plan.reason_codes == (PlanReason.TARGET_NOT_REACQUIRED,)
 
 
+def test_changed_context_stops_even_when_approved_target_is_unchanged() -> None:
+    candidate = _reply_candidate("context-changed")
+    scope = _scope()
+    packet = _packet(candidate, scope)
+    changed_binding = replace(
+        candidate.binding,
+        context_evidence_sha256=_sha("changed-context-evidence"),
+    )
+    changed_candidate = replace(candidate, binding=changed_binding)
+
+    plan = plan_cycle(scope, (changed_candidate,), packet, now=NOW)
+
+    assert _target_digest(scope, candidate) == _target_digest(scope, changed_candidate)
+    assert _context_digest(candidate) != _context_digest(changed_candidate)
+    assert plan.decision is PlanDecision.STOP
+    assert plan.reason_codes == (PlanReason.APPROVAL_TARGET_MISMATCH,)
+    assert all(item.proposal is None for item in plan.items)
+
+
+def test_reobserving_same_context_at_new_time_preserves_approved_context_digest() -> None:
+    candidate = _reply_candidate("context-reobserved")
+    scope = _scope()
+    packet = _packet(candidate, scope)
+    later_observation = NOW - timedelta(seconds=30)
+    reobserved_candidate = replace(
+        candidate,
+        observed_at=later_observation,
+        binding=replace(candidate.binding, observed_at=later_observation),
+    )
+
+    assert _context_digest(candidate) == _context_digest(reobserved_candidate)
+    plan = plan_cycle(scope, (reobserved_candidate,), packet, now=NOW)
+
+    assert plan.decision is PlanDecision.NEEDS_REVIEW
+    assert plan.items[0].proposal is not None
+    assert plan.items[0].proposal.context_sha256 == packet.context_sha256
+
+
 def test_missing_content_is_observe_only_and_no_generic_reply_is_created() -> None:
     candidate = _reply_candidate()
     plan = plan_cycle(_scope(), (candidate,), now=NOW)
@@ -576,6 +628,7 @@ def test_all_rendered_representations_redact_ids_fingerprints_and_content_hashes
         packet.content_sha256,
         packet.packet_revision_sha256,
         candidate.binding.context_evidence_sha256,
+        packet.context_sha256,
     ):
         assert private_value not in rendered
 
