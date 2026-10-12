@@ -96,6 +96,20 @@ from threads_platform.standalone.opportunity_queue import (
     run_opportunity_select_cli,
     run_opportunity_skip_cli,
 )
+from threads_platform.standalone.recruitment_content_cli import (
+    RecruitmentContentCliError,
+    run_recruitment_content_cli,
+)
+from threads_platform.standalone.recruitment_content_planner import RecruitmentContentPlannerError
+from threads_platform.standalone.recruitment_qualification import (
+    RecruitmentQualificationError,
+    run_opportunity_rank_cli,
+)
+from threads_platform.standalone.recruitment_reply_assistant import (
+    RecruitmentReplyAssistantError,
+    run_opportunity_draft_cli,
+)
+from threads_platform.standalone.recruitment_reply_proposal import ReplyProposalError
 from threads_platform.standalone.recurrences import (
     LocalRecurrenceRunner,
     LocalRecurrenceStore,
@@ -840,6 +854,31 @@ def _build_parser() -> argparse.ArgumentParser:
     opportunity_remove_parser = recruitment_commands.add_parser("opportunity-remove")
     opportunity_remove_parser.add_argument("alias")
     opportunity_remove_parser.add_argument("--id", required=True)
+    opportunity_rank_parser = recruitment_commands.add_parser("opportunity-rank")
+    opportunity_rank_parser.add_argument("alias")
+    opportunity_rank_parser.add_argument("--limit", type=int, default=10)
+    opportunity_draft_parser = recruitment_commands.add_parser("opportunity-draft")
+    opportunity_draft_parser.add_argument("alias")
+    opportunity_draft_parser.add_argument("--id", required=True)
+    opportunity_draft_parser.add_argument("--facts-file")
+
+    content_add_parser = recruitment_commands.add_parser("content-add")
+    content_add_parser.add_argument("alias")
+    content_add_parser.add_argument("--text-file", required=True)
+    content_add_parser.add_argument("--scheduled-utc", required=True)
+    content_add_parser.add_argument("--assert-rights", action="store_true")
+    content_add_parser.add_argument("--assert-consent", action="store_true")
+    for content_command in (
+        "content-list",
+        "content-due",
+        "content-upcoming",
+        "content-calendar-export",
+    ):
+        recruitment_commands.add_parser(content_command).add_argument("alias")
+    for content_command in ("content-show", "content-approve", "content-reject"):
+        content_parser = recruitment_commands.add_parser(content_command)
+        content_parser.add_argument("alias")
+        content_parser.add_argument("--id", required=True)
     return parser
 
 
@@ -888,6 +927,30 @@ def _run_browser_command(args: argparse.Namespace, root: Path, store: LocalAccou
 
 
 def _handle_recruitment_command(args: argparse.Namespace) -> int:
+    if args.recruitment_command.startswith("content-"):
+        return run_recruitment_content_cli(
+            args.recruitment_command,
+            args.alias,
+            packet_id=getattr(args, "id", None),
+            text_file=None if getattr(args, "text_file", None) is None else Path(args.text_file),
+            scheduled_utc=getattr(args, "scheduled_utc", None),
+            rights_asserted=getattr(args, "assert_rights", False),
+            consent_asserted=getattr(args, "assert_consent", False),
+            data_root_factory=resolve_standalone_data_root,
+        )
+    if args.recruitment_command == "opportunity-draft":
+        return run_opportunity_draft_cli(
+            args.alias,
+            args.id,
+            facts_file=None if args.facts_file is None else Path(args.facts_file),
+            data_root_factory=resolve_standalone_data_root,
+        )
+    if args.recruitment_command == "opportunity-rank":
+        return run_opportunity_rank_cli(
+            args.alias,
+            limit=args.limit,
+            data_root_factory=resolve_standalone_data_root,
+        )
     if args.recruitment_command == "opportunity-import":
         return run_opportunity_import_cli(
             args.alias,
@@ -1110,9 +1173,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"ERROR {error.code}\n")
         return 130 if error.code.endswith("INTERRUPTED") else 1
     except (
+        RecruitmentReplyAssistantError,
+        ReplyProposalError,
+        RecruitmentQualificationError,
         OpportunityQueueError,
         ManualOpportunityError,
         ManualOutcomeError,
+        RecruitmentContentCliError,
+        RecruitmentContentPlannerError,
         StandaloneAccountError,
         StandaloneApiError,
         ThreadsCredentialError,
