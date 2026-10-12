@@ -118,6 +118,9 @@ def test_manual_handoff_uses_exact_s3_approval_and_existing_s1_runtime(
     monkeypatch.setattr(
         cli, "_run_reply_command", lambda *_args, **_kwargs: pytest.fail("reply path")
     )
+    # This test supplies fake TTY streams and a fake browser engine.
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
 
     target_url = _target()
     approval_sha = _approval(
