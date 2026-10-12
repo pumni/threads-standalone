@@ -441,6 +441,8 @@ class ManualOutcomeStore:
             for event in record.events
         ):
             raise ManualOutcomeError("MANUAL_OUTCOME_ATTEMPT_INVALID")
+        if current is None and len(current_records) >= _MAX_ACCOUNT_RECORDS:
+            raise ManualOutcomeError("MANUAL_OUTCOME_LIMIT_REACHED")
         if current is not None:
             if current.blocks_handoff or current.latest.status != "ABORTED_NOT_SENT":
                 raise ManualOutcomeError("MANUAL_OUTCOME_BLOCKED")

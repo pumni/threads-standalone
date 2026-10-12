@@ -13,6 +13,7 @@ from playwright import sync_api as playwright_sync
 
 import threads_platform.standalone.recruitment_atomic_handoff as atomic_handoff
 from threads_platform.locks.filesystem import FilesystemProcessLock, ProcessAlreadyRunning
+from threads_platform.standalone import manual_outcomes
 from threads_platform.standalone.manual_opportunities import load_manual_opportunities
 from threads_platform.standalone.manual_outcomes import (
     ManualOutcomeError,
@@ -279,6 +280,104 @@ async def test_fresh_full_aborted_s4_history_allows_one_new_exact_reservation(
     assert current.events[: len(previous.events)] == previous.events
     assert current.latest.attempt_id == receipt.attempt_id == ATTEMPT_A
     assert current.latest.event_id == receipt.event_id == ATTEMPT_A
+    assert current.latest.status == "HANDOFF_UNRESOLVED"
+
+
+@pytest.mark.asyncio
+async def test_new_target_is_rejected_at_account_record_capacity_without_journal_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root(tmp_path)
+    monkeypatch.setattr(manual_outcomes, "_MAX_ACCOUNT_RECORDS", 2)
+    store = ManualOutcomeStore(root)
+    existing_records = (
+        _seed_legacy_abort(
+            store,
+            ACCOUNT_A,
+            "https://www.threads.com/@synthetic/post/S9B2B456",
+            event_id="423e4567-e89b-42d3-a456-426614174010",
+        ),
+        _seed_legacy_abort(
+            store,
+            ACCOUNT_A,
+            "https://www.threads.com/@synthetic/post/S9B2B789",
+            event_id="423e4567-e89b-42d3-a456-426614174011",
+        ),
+    )
+    _, selected, session, approval = await _approved(root)
+    target_fingerprint = store.target_fingerprint(ACCOUNT_A, selected.target_url)
+    target_path = (
+        root / "manual_recruitment_v1" / "records" / str(ACCOUNT_A) / f"{target_fingerprint}.json"
+    )
+    assert not target_path.exists()
+
+    with store.account_lock_lease(ACCOUNT_A) as lease:
+        snapshot = store.read_account_under_account_lock(ACCOUNT_A, lock_lease=lease)
+        assert snapshot == existing_records
+        with pytest.raises(ManualOutcomeError) as writer_error:
+            store.reserve_approved_handoff_under_account_lock(
+                ACCOUNT_A,
+                selected.target_url,
+                approval.draft_sha256,
+                approval.attempt_id,
+                datetime.fromtimestamp(NOW + 1, UTC),
+                None,
+                snapshot,
+                lock_lease=lease,
+            )
+        assert writer_error.value.code == "MANUAL_OUTCOME_LIMIT_REACHED"
+        assert store.read_account_under_account_lock(ACCOUNT_A, lock_lease=lease) == snapshot
+
+    _patch_clock(monkeypatch)
+    with pytest.raises(atomic_handoff.AtomicHandoffError) as transaction_error:
+        atomic_handoff.reserve_exact_approved_handoff(
+            ACCOUNT_A,
+            approval,
+            session,
+            data_root=root,
+        )
+    assert transaction_error.value.code == "ATOMIC_HANDOFF_LIMIT_REACHED"
+    assert (
+        tuple(
+            store.read(ACCOUNT_A, target)
+            for target in (
+                "https://www.threads.com/@synthetic/post/S9B2B456",
+                "https://www.threads.com/@synthetic/post/S9B2B789",
+            )
+        )
+        == existing_records
+    )
+    assert store.read(ACCOUNT_A, selected.target_url) is None
+    assert not target_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_existing_aborted_target_remains_appendable_at_account_record_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root(tmp_path)
+    monkeypatch.setattr(manual_outcomes, "_MAX_ACCOUNT_RECORDS", 1)
+    store = ManualOutcomeStore(root)
+    previous = _seed_legacy_abort(store, ACCOUNT_A)
+    _, selected, session, approval = await _approved(root, current_record=previous)
+    _patch_clock(monkeypatch)
+
+    receipt = atomic_handoff.reserve_exact_approved_handoff(
+        ACCOUNT_A,
+        approval,
+        session,
+        data_root=root,
+    )
+
+    with store.account_lock_lease(ACCOUNT_A) as lease:
+        records = store.read_account_under_account_lock(ACCOUNT_A, lock_lease=lease)
+    current = store.read(ACCOUNT_A, selected.target_url)
+    assert len(records) == 1
+    assert current is not None
+    assert current.events[:-1] == previous.events
+    assert current.latest.attempt_id == receipt.attempt_id == ATTEMPT_A
     assert current.latest.status == "HANDOFF_UNRESOLVED"
 
 
