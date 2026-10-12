@@ -287,7 +287,9 @@ def build_browser_opportunity_proposals(
 def _normalize_search_result(result: object) -> tuple[_SearchObservation, ...]:
     if not isinstance(result, BrowserSearchResultV1):
         raise BrowserOpportunityBridgeError("BRIDGE_INVALID_RESULT")
-    if result.result_version != 1 or result.source != "SYNTHETIC_FIXTURE":
+    if type(result.result_version) is not int or result.result_version != 1:
+        raise BrowserOpportunityBridgeError("BRIDGE_INVALID_RESULT")
+    if result.source != "SYNTHETIC_FIXTURE":
         raise BrowserOpportunityBridgeError("BRIDGE_INVALID_PROVENANCE")
     try:
         normalized_query = normalize_search_query(result.query)
@@ -378,6 +380,8 @@ def _normalize_conversation_result(
     requested_target: str,
 ) -> _ConversationEvidence:
     if not isinstance(result, BrowserConversationResultV1):
+        raise BrowserOpportunityBridgeError("BRIDGE_INVALID_RESULT")
+    if type(result.result_version) is not int or result.result_version != 1:
         raise BrowserOpportunityBridgeError("BRIDGE_INVALID_RESULT")
     if result.source != "SYNTHETIC_FIXTURE":
         raise BrowserOpportunityBridgeError("BRIDGE_INVALID_PROVENANCE")

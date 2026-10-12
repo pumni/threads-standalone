@@ -423,6 +423,58 @@ def test_nested_parent_evidence_is_preserved_from_synthetic_reader() -> None:
     assert all(
         row.author_identity_status == "UNVERIFIED" for row in proposal.conversation_observations
     )
+    assert conversation.result_version == 1
+    assert [
+        (
+            row.target_permalink,
+            row.author_marker,
+            row.excerpt,
+            row.position,
+            row.parent_permalink,
+            row.truncated,
+        )
+        for row in proposal.conversation_observations
+    ] == [
+        (
+            row.thread_ref,
+            row.author_username,
+            row.text_excerpt,
+            row.position,
+            row.parent_ref,
+            row.truncated,
+        )
+        for row in conversation.observations
+    ]
+
+
+def test_mutated_conversation_version_fails_before_proposal() -> None:
+    search = _search_result((_post("author", "root_1", text="Root text"),))
+    conversation = _conversation_result((_post("author", "root_1", text="Root text"),))
+    conversation.result_version = cast(Literal[1], 2)
+    sink = BoundedMemoryProposalSink()
+
+    with pytest.raises(BrowserOpportunityBridgeError) as error:
+        batch = _build(
+            search,
+            conversations=(AccountScopedConversationResult(_ACCOUNT_ONE, _ROOT, conversation),),
+        )
+        sink.add(batch)
+
+    assert error.value.code == "BRIDGE_INVALID_RESULT"
+    assert sink.by_account == {}
+
+
+def test_mutated_search_version_fails_before_proposal() -> None:
+    search = _search_result((_post("author", "root_1"),))
+    search.result_version = cast(Literal[1], 2)
+    sink = BoundedMemoryProposalSink()
+
+    with pytest.raises(BrowserOpportunityBridgeError) as error:
+        batch = _build(search)
+        sink.add(batch)
+
+    assert error.value.code == "BRIDGE_INVALID_RESULT"
+    assert sink.by_account == {}
 
 
 def test_truncated_excerpt_is_preserved_and_downgrades_context() -> None:
