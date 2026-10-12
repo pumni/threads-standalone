@@ -11,7 +11,7 @@ import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import Literal, TextIO
 from urllib.parse import urlsplit
 
 from threads_platform.browser.contracts import BrowserContractError
@@ -85,6 +85,7 @@ class ManualDraftReview:
     relative_thread_ref: str
     context: str | None
     context_provenance: str
+    context_completeness: Literal["UNKNOWN", "PARTIAL", "COMPLETE"]
     draft: str
     draft_sha256: str
 
@@ -276,6 +277,8 @@ def build_manual_draft_review(
     opportunity: ManualOpportunity,
     draft: str,
     context: str | None,
+    *,
+    context_completeness: Literal["UNKNOWN", "PARTIAL", "COMPLETE"] = "UNKNOWN",
 ) -> ManualDraftReview:
     relative_ref = s1_relative_thread_ref(opportunity.target_url)
     identity = json.dumps(
@@ -290,6 +293,7 @@ def build_manual_draft_review(
         relative_thread_ref=relative_ref,
         context=context,
         context_provenance="OPERATOR_SUPPLIED" if context is not None else "NONE",
+        context_completeness=context_completeness,
         draft=draft,
         draft_sha256=hashlib.sha256(identity).hexdigest(),
     )
@@ -298,10 +302,17 @@ def build_manual_draft_review(
 def _render_private_review(
     intake: ManualOpportunityIntake,
     review: ManualDraftReview,
+    *,
+    queue_persistence: bool = False,
 ) -> str:
+    persistence_note = (
+        "This queue item was read or updated locally; no API, browser, or remote action was used."
+        if queue_persistence
+        else "No API, browser, queue persistence, or remote action was used."
+    )
     lines = [
         "MANUAL OPPORTUNITY REVIEW — PRIVATE LOCAL TERMINAL",
-        "No API, browser, queue persistence, or remote action was used.",
+        persistence_note,
         f"account alias: {review.account_alias}",
         f"account UUID: {review.account_id}",
         "actor identity: UNKNOWN_IDENTITY",
@@ -318,12 +329,15 @@ def _render_private_review(
             if candidate is review.opportunity and review.context is not None
             else "NEEDS_CONTEXT"
         )
+        context_completeness = (
+            review.context_completeness if candidate is review.opportunity else "UNKNOWN"
+        )
         lines.append(
             f"  {index}. input_position={candidate.input_position} "
             f"source_line={candidate.source_line} status={status} "
             f"provenance=MANUAL_URL target={candidate.target_url} "
             f"permalink_author={candidate.author_username} author_identity=UNVERIFIED "
-            "context_completeness=UNKNOWN"
+            f"context_completeness={context_completeness}"
         )
     for duplicate in intake.duplicates:
         lines.append(
@@ -338,7 +352,7 @@ def _render_private_review(
             + "(identity unverified)",
             f"target provenance: MANUAL_URL input_position={review.opportunity.input_position}",
             f"context provenance: {review.context_provenance}",
-            "context completeness: UNKNOWN",
+            f"context completeness: {review.context_completeness}",
             "operator context: "
             + (
                 "<not supplied>"
@@ -355,6 +369,17 @@ def _render_private_review(
         )
     )
     return "\n".join(lines) + "\n"
+
+
+def render_manual_draft_review(
+    intake: ManualOpportunityIntake,
+    review: ManualDraftReview,
+    *,
+    queue_persistence: bool = False,
+) -> str:
+    """Render the same private S3 review for file and queued opportunities."""
+
+    return _render_private_review(intake, review, queue_persistence=queue_persistence)
 
 
 def _render_private_shortlist(intake: ManualOpportunityIntake) -> str:
@@ -445,6 +470,6 @@ def run_manual_review_cli(
         draft,
         context,
     )
-    private_stderr.write(_render_private_review(intake, review))
+    private_stderr.write(render_manual_draft_review(intake, review))
     private_stderr.flush()
     return 0

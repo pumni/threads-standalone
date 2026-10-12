@@ -88,6 +88,14 @@ from threads_platform.standalone.nurture_runner import (
     NurtureRunResult,
 )
 from threads_platform.standalone.nurture_store import NurtureStore
+from threads_platform.standalone.opportunity_queue import (
+    OpportunityQueueError,
+    run_opportunity_import_cli,
+    run_opportunity_list_cli,
+    run_opportunity_remove_cli,
+    run_opportunity_select_cli,
+    run_opportunity_skip_cli,
+)
 from threads_platform.standalone.recurrences import (
     LocalRecurrenceRunner,
     LocalRecurrenceStore,
@@ -806,6 +814,32 @@ def _build_parser() -> argparse.ArgumentParser:
     manual_status_parser.add_argument("--targets-file", required=True)
     manual_status_parser.add_argument("--select", type=int, required=True)
     manual_status_parser.add_argument("--confirm-target", required=True)
+
+    opportunity_import_parser = recruitment_commands.add_parser("opportunity-import")
+    opportunity_import_parser.add_argument("alias")
+    opportunity_import_parser.add_argument("--targets-file", required=True)
+    opportunity_import_parser.add_argument("--context-file")
+    opportunity_import_parser.add_argument(
+        "--context-completeness", choices=("UNKNOWN", "PARTIAL", "COMPLETE")
+    )
+    opportunity_list_parser = recruitment_commands.add_parser("opportunity-list")
+    opportunity_list_parser.add_argument("alias")
+    opportunity_select_parser = recruitment_commands.add_parser("opportunity-select")
+    opportunity_select_parser.add_argument("alias")
+    opportunity_select_parser.add_argument("--id", required=True)
+    opportunity_select_parser.add_argument("--confirm-target")
+    opportunity_select_parser.add_argument("--context-file")
+    opportunity_select_parser.add_argument(
+        "--context-completeness", choices=("UNKNOWN", "PARTIAL", "COMPLETE")
+    )
+    opportunity_select_parser.add_argument("--draft-file")
+    opportunity_skip_parser = recruitment_commands.add_parser("opportunity-skip")
+    opportunity_skip_parser.add_argument("alias")
+    opportunity_skip_parser.add_argument("--id", required=True)
+    opportunity_skip_parser.add_argument("--reason-file")
+    opportunity_remove_parser = recruitment_commands.add_parser("opportunity-remove")
+    opportunity_remove_parser.add_argument("alias")
+    opportunity_remove_parser.add_argument("--id", required=True)
     return parser
 
 
@@ -854,6 +888,42 @@ def _run_browser_command(args: argparse.Namespace, root: Path, store: LocalAccou
 
 
 def _handle_recruitment_command(args: argparse.Namespace) -> int:
+    if args.recruitment_command == "opportunity-import":
+        return run_opportunity_import_cli(
+            args.alias,
+            Path(args.targets_file),
+            None if args.context_file is None else Path(args.context_file),
+            args.context_completeness,
+            data_root_factory=resolve_standalone_data_root,
+        )
+    if args.recruitment_command == "opportunity-list":
+        return run_opportunity_list_cli(
+            args.alias,
+            data_root_factory=resolve_standalone_data_root,
+        )
+    if args.recruitment_command == "opportunity-select":
+        return run_opportunity_select_cli(
+            args.alias,
+            args.id,
+            data_root_factory=resolve_standalone_data_root,
+            targets_confirmed=args.confirm_target,
+            draft_file=None if args.draft_file is None else Path(args.draft_file),
+            context_file=None if args.context_file is None else Path(args.context_file),
+            context_completeness=args.context_completeness,
+        )
+    if args.recruitment_command == "opportunity-skip":
+        return run_opportunity_skip_cli(
+            args.alias,
+            args.id,
+            None if args.reason_file is None else Path(args.reason_file),
+            data_root_factory=resolve_standalone_data_root,
+        )
+    if args.recruitment_command == "opportunity-remove":
+        return run_opportunity_remove_cli(
+            args.alias,
+            args.id,
+            data_root_factory=resolve_standalone_data_root,
+        )
     if args.recruitment_command == "manual-list":
         return run_manual_list_cli(
             args.alias,
@@ -1040,6 +1110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"ERROR {error.code}\n")
         return 130 if error.code.endswith("INTERRUPTED") else 1
     except (
+        OpportunityQueueError,
         ManualOpportunityError,
         ManualOutcomeError,
         StandaloneAccountError,
