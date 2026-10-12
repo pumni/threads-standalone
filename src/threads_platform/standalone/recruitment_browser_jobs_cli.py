@@ -22,7 +22,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TextIO, cast
+from typing import Protocol, TextIO, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -89,6 +89,12 @@ class BrowserJobsCliError(Exception):
 
     def __repr__(self) -> str:
         return f"BrowserJobsCliError({self.code!r})"
+
+
+class _MsvcrtConsole(Protocol):
+    def kbhit(self) -> bool: ...
+
+    def getwche(self) -> str: ...
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -205,16 +211,17 @@ class _ConsoleStopSignal:
         except ImportError:
             self._stopped = True
             return
+        console = cast(_MsvcrtConsole, msvcrt)
 
         deadline = time.monotonic() + seconds
         while not self._stopped:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
-            if not msvcrt.kbhit():
+            if not console.kbhit():
                 time.sleep(min(0.1, remaining))
                 continue
-            character = msvcrt.getwche()
+            character = console.getwche()
             if self._skip_extended_key:
                 self._skip_extended_key = False
             elif character in ("\x00", "\xe0"):
