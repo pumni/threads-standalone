@@ -5,6 +5,7 @@ import os
 import socket
 import subprocess
 import urllib.request
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -77,6 +78,20 @@ def _write_private_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
     if os.name != "nt":
         path.chmod(0o600)
+
+
+def _replace_packet_fields(
+    root: Path,
+    changes: dict[str, object],
+    account_id: UUID = _ACCOUNT_ONE,
+) -> bytes:
+    path = _queue_path(root, account_id)
+    document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    packets = cast(list[object], document["packets"])
+    packet = cast(dict[str, object], packets[0])
+    packets[0] = {**packet, **changes}
+    _write_private_json(path, document)
+    return path.read_bytes()
 
 
 def test_original_packet_is_versioned_private_and_never_marks_remote_publication(
@@ -371,6 +386,363 @@ def test_reject_is_explicit_terminal_editorial_state(tmp_path: Path) -> None:
     assert error.value.code == "CONTENT_PLANNER_REVIEW_INVALID"
 
 
+def test_review_snapshot_is_immutable_versioned_and_account_scoped(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first_packet = _create(
+        store,
+        private_notes="Keep the interview timeline specific.",
+        attachment=ContentAttachmentMetadataV1(
+            kind="IMAGE",
+            url="https://example.com/recruitment-card.png",
+            label="Recruitment card",
+            attribution="Created for this campaign",
+            rights_asserted=True,
+            consent_asserted=True,
+        ),
+    ).packet
+    first = store.get_review_snapshot(_ACCOUNT_ONE, first_packet.packet_id)
+    other_packet = _create(_store(tmp_path), _ACCOUNT_TWO).packet
+    other = store.get_review_snapshot(_ACCOUNT_TWO, other_packet.packet_id)
+
+    assert first.packet == first_packet
+    assert first.fingerprint.startswith("content-packet-v1:sha256:")
+    assert len(first.fingerprint.rsplit(":", maxsplit=1)[-1]) == 64
+    assert first.fingerprint != other.fingerprint
+    assert first.packet.account_uuid == _ACCOUNT_ONE
+    assert first.packet.attachment is not None
+    assert "Strong recruitment starts" not in repr(first)
+    with pytest.raises(FrozenInstanceError):
+        first.fingerprint = other.fingerprint  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("decision", "note", "expected_status"),
+    [
+        ("APPROVE", "Editorial check complete.", "READY_FOR_MANUAL_PUBLICATION"),
+        ("REJECT", "Needs a different recruitment focus.", "REJECTED"),
+    ],
+)
+def test_review_if_unchanged_applies_confirmed_decision_without_remote_publication(
+    tmp_path: Path,
+    decision: str,
+    note: str,
+    expected_status: str,
+) -> None:
+    store = _store(tmp_path)
+    packet = _create(store).packet
+    snapshot = store.get_review_snapshot(_ACCOUNT_ONE, packet.packet_id)
+
+    reviewed = store.review_if_unchanged(
+        _ACCOUNT_ONE,
+        packet.packet_id,
+        expected_fingerprint=snapshot.fingerprint,
+        expected_editorial_status="DRAFT",
+        decision=decision,  # type: ignore[arg-type]
+        note=note,
+    )
+
+    assert reviewed.editorial_status == expected_status
+    assert reviewed.review_note == note
+    assert reviewed.reviewed_at == _NOW
+    assert reviewed.remote_publication_status == "NOT_PUBLISHED_BY_PLANNER"
+    assert store.get_review_snapshot(_ACCOUNT_ONE, packet.packet_id).fingerprint != (
+        snapshot.fingerprint
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "with_attachment"),
+    [
+        ({"original_text": _TEXT + " A changed suffix."}, False),
+        ({"scheduled_at": "2026-10-15T09:30:00.000000Z"}, False),
+        ({"created_at": "2026-10-11T09:30:00.000000Z"}, False),
+        ({"updated_at": "2026-10-12T09:31:00.000000Z"}, False),
+        ({"private_notes": "A changed private planning note."}, False),
+        ({"rights_asserted": False}, False),
+        ({"consent_asserted": False}, False),
+        (
+            {
+                "editorial_status": "READY_FOR_MANUAL_PUBLICATION",
+                "updated_at": "2026-10-12T09:31:00.000000Z",
+                "reviewed_at": "2026-10-12T09:31:00.000000Z",
+            },
+            False,
+        ),
+        (
+            {
+                "attachment": {
+                    "kind": "IMAGE",
+                    "url": "https://example.com/updated-recruitment-card.png",
+                    "label": "Updated card",
+                    "attribution": "Created for this campaign",
+                    "rights_asserted": True,
+                    "consent_asserted": True,
+                    "rights_assertion_status": "UNVERIFIED_OPERATOR_ASSERTION",
+                }
+            },
+            True,
+        ),
+    ],
+)
+def test_packet_changes_after_snapshot_fail_stale_without_writing(
+    tmp_path: Path,
+    changes: dict[str, object],
+    with_attachment: bool,
+) -> None:
+    store = _store(tmp_path)
+    attachment = (
+        ContentAttachmentMetadataV1(
+            kind="IMAGE",
+            url="https://example.com/recruitment-card.png",
+            label="Recruitment card",
+            attribution="Created for this campaign",
+            rights_asserted=True,
+            consent_asserted=True,
+        )
+        if with_attachment
+        else None
+    )
+    packet = _create(
+        store,
+        attachment=attachment,
+        private_notes="Original private planning note.",
+    ).packet
+    snapshot = store.get_review_snapshot(_ACCOUNT_ONE, packet.packet_id)
+    current_bytes = _replace_packet_fields(tmp_path, changes)
+
+    with pytest.raises(RecruitmentContentPlannerError) as stale:
+        store.review_if_unchanged(
+            _ACCOUNT_ONE,
+            packet.packet_id,
+            expected_fingerprint=snapshot.fingerprint,
+            expected_editorial_status="DRAFT",
+            decision="APPROVE",
+        )
+
+    assert stale.value.code == "CONTENT_PLANNER_REVIEW_STALE"
+    assert current_bytes == _queue_path(tmp_path).read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("first_decision", "second_decision", "second_note"),
+    [
+        ("APPROVE", "REJECT", "Competing editorial decision."),
+        ("REJECT", "APPROVE", None),
+    ],
+)
+def test_competing_editorial_decisions_use_one_snapshot_and_reject_loser(
+    tmp_path: Path,
+    first_decision: str,
+    second_decision: str,
+    second_note: str | None,
+) -> None:
+    store = _store(tmp_path)
+    packet = _create(store).packet
+    snapshot = store.get_review_snapshot(_ACCOUNT_ONE, packet.packet_id)
+    first_note = "First editorial decision." if first_decision == "REJECT" else None
+
+    store.review_if_unchanged(
+        _ACCOUNT_ONE,
+        packet.packet_id,
+        expected_fingerprint=snapshot.fingerprint,
+        expected_editorial_status="DRAFT",
+        decision=first_decision,  # type: ignore[arg-type]
+        note=first_note,
+    )
+    after_winner = _queue_path(tmp_path).read_bytes()
+    with pytest.raises(RecruitmentContentPlannerError) as stale:
+        store.review_if_unchanged(
+            _ACCOUNT_ONE,
+            packet.packet_id,
+            expected_fingerprint=snapshot.fingerprint,
+            expected_editorial_status="DRAFT",
+            decision=second_decision,  # type: ignore[arg-type]
+            note=second_note,
+        )
+
+    assert stale.value.code == "CONTENT_PLANNER_REVIEW_STALE"
+    assert _queue_path(tmp_path).read_bytes() == after_winner
+
+
+def test_repeated_stale_approval_and_wrong_account_or_packet_never_write(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    packet = _create(store).packet
+    snapshot = store.get_review_snapshot(_ACCOUNT_ONE, packet.packet_id)
+    original = _queue_path(tmp_path).read_bytes()
+
+    for account_id, packet_id in (
+        (_ACCOUNT_TWO, packet.packet_id),
+        (_ACCOUNT_ONE, UUID("33333333-3333-4333-8333-333333333333")),
+    ):
+        with pytest.raises(RecruitmentContentPlannerError) as stale:
+            store.review_if_unchanged(
+                account_id,
+                packet_id,
+                expected_fingerprint=snapshot.fingerprint,
+                expected_editorial_status="DRAFT",
+                decision="APPROVE",
+            )
+        assert stale.value.code == "CONTENT_PLANNER_REVIEW_STALE"
+        assert _queue_path(tmp_path).read_bytes() == original
+
+    store.review_if_unchanged(
+        _ACCOUNT_ONE,
+        packet.packet_id,
+        expected_fingerprint=snapshot.fingerprint,
+        expected_editorial_status="DRAFT",
+        decision="APPROVE",
+    )
+    approved_bytes = _queue_path(tmp_path).read_bytes()
+    for _ in range(2):
+        with pytest.raises(RecruitmentContentPlannerError) as stale:
+            store.review_if_unchanged(
+                _ACCOUNT_ONE,
+                packet.packet_id,
+                expected_fingerprint=snapshot.fingerprint,
+                expected_editorial_status="DRAFT",
+                decision="APPROVE",
+            )
+        assert stale.value.code == "CONTENT_PLANNER_REVIEW_STALE"
+        assert _queue_path(tmp_path).read_bytes() == approved_bytes
+
+
+def test_review_if_unchanged_requires_expected_draft_and_valid_fingerprint(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    packet = _create(store).packet
+    snapshot = store.get_review_snapshot(_ACCOUNT_ONE, packet.packet_id)
+    original = _queue_path(tmp_path).read_bytes()
+
+    with pytest.raises(RecruitmentContentPlannerError) as invalid:
+        store.review_if_unchanged(
+            _ACCOUNT_ONE,
+            packet.packet_id,
+            expected_fingerprint="not-a-review-fingerprint",
+            expected_editorial_status="DRAFT",
+            decision="APPROVE",
+        )
+    assert invalid.value.code == "CONTENT_PLANNER_INVALID"
+
+    with pytest.raises(RecruitmentContentPlannerError) as stale:
+        store.review_if_unchanged(
+            _ACCOUNT_ONE,
+            packet.packet_id,
+            expected_fingerprint=snapshot.fingerprint,
+            expected_editorial_status="READY_FOR_MANUAL_PUBLICATION",
+            decision="APPROVE",
+        )
+    assert stale.value.code == "CONTENT_PLANNER_REVIEW_STALE"
+    assert _queue_path(tmp_path).read_bytes() == original
+
+
+def test_review_if_unchanged_lock_contention_does_not_reenter_lock(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    packet = _create(store).packet
+    snapshot = store.get_review_snapshot(_ACCOUNT_ONE, packet.packet_id)
+    original = _queue_path(tmp_path).read_bytes()
+
+    with (
+        store.account_lock(_ACCOUNT_ONE),
+        pytest.raises(RecruitmentContentPlannerError) as busy,
+    ):
+        store.review_if_unchanged(
+            _ACCOUNT_ONE,
+            packet.packet_id,
+            expected_fingerprint=snapshot.fingerprint,
+            expected_editorial_status="DRAFT",
+            decision="APPROVE",
+        )
+
+    assert busy.value.code == "CONTENT_PLANNER_BUSY"
+    assert _queue_path(tmp_path).read_bytes() == original
+
+
+def test_review_if_unchanged_write_failure_preserves_bytes_and_can_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    packet = _create(store).packet
+    snapshot = store.get_review_snapshot(_ACCOUNT_ONE, packet.packet_id)
+    original = _queue_path(tmp_path).read_bytes()
+
+    def fail_replace(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected local write failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(RecruitmentContentPlannerError) as error:
+        store.review_if_unchanged(
+            _ACCOUNT_ONE,
+            packet.packet_id,
+            expected_fingerprint=snapshot.fingerprint,
+            expected_editorial_status="DRAFT",
+            decision="APPROVE",
+        )
+
+    assert error.value.code == "CONTENT_PLANNER_STATE_INVALID"
+    assert _queue_path(tmp_path).read_bytes() == original
+    assert not list(_queue_path(tmp_path).parent.glob(".*.tmp"))
+    monkeypatch.undo()
+
+    reviewed = store.review_if_unchanged(
+        _ACCOUNT_ONE,
+        packet.packet_id,
+        expected_fingerprint=snapshot.fingerprint,
+        expected_editorial_status="DRAFT",
+        decision="APPROVE",
+    )
+    assert reviewed.editorial_status == "READY_FOR_MANUAL_PUBLICATION"
+
+
+def test_review_if_unchanged_fails_closed_on_malformed_or_symlinked_current_file(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    packet = _create(store).packet
+    snapshot = store.get_review_snapshot(_ACCOUNT_ONE, packet.packet_id)
+    target = _queue_path(tmp_path)
+    target.write_bytes(b"not valid JSON")
+    if os.name != "nt":
+        target.chmod(0o600)
+    malformed_bytes = target.read_bytes()
+
+    with pytest.raises(RecruitmentContentPlannerError) as malformed:
+        store.review_if_unchanged(
+            _ACCOUNT_ONE,
+            packet.packet_id,
+            expected_fingerprint=snapshot.fingerprint,
+            expected_editorial_status="DRAFT",
+            decision="APPROVE",
+        )
+    assert malformed.value.code == "CONTENT_PLANNER_REVIEW_STALE"
+    assert target.read_bytes() == malformed_bytes
+
+    outside = tmp_path / "outside-planner.json"
+    outside.write_text("{}", encoding="utf-8")
+    target.unlink()
+    try:
+        target.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlink creation is unavailable on this host")
+    outside_bytes = outside.read_bytes()
+
+    with pytest.raises(RecruitmentContentPlannerError) as symlinked:
+        store.review_if_unchanged(
+            _ACCOUNT_ONE,
+            packet.packet_id,
+            expected_fingerprint=snapshot.fingerprint,
+            expected_editorial_status="DRAFT",
+            decision="APPROVE",
+        )
+    assert symlinked.value.code == "CONTENT_PLANNER_REVIEW_STALE"
+    assert outside.read_bytes() == outside_bytes
+
+
 @pytest.mark.parametrize(
     "case",
     ["unknown_key", "bad_version", "wrong_account", "published"],
@@ -505,7 +877,14 @@ def test_local_planner_has_no_network_process_or_publish_side_effects(
     monkeypatch.setattr(urllib.request, "urlopen", forbidden)
     store = _store(tmp_path)
     packet = _create(store).packet
-    approved = store.approve(_ACCOUNT_ONE, packet.packet_id)
+    snapshot = store.get_review_snapshot(_ACCOUNT_ONE, packet.packet_id)
+    approved = store.review_if_unchanged(
+        _ACCOUNT_ONE,
+        packet.packet_id,
+        expected_fingerprint=snapshot.fingerprint,
+        expected_editorial_status="DRAFT",
+        decision="APPROVE",
+    )
     assert store.list(_ACCOUNT_ONE).packets[0] == approved
     assert len(store.due(_ACCOUNT_ONE)) == 0
     assert len(store.upcoming(_ACCOUNT_ONE)) == 1
