@@ -1109,6 +1109,64 @@ def test_contact_fields_never_appear_in_json_or_csv_and_repr_is_redacted(
     assert str(_ACCOUNT_ONE) not in repr(store.summary(_ACCOUNT_ONE))
 
 
+def test_contact_embedded_in_requirement_is_withheld_from_json_and_csv_after_raw_expiry(
+    tmp_path: Path,
+) -> None:
+    store, root = _store(tmp_path, RetentionPolicy(raw_text_days=1, derived_vacancy_days=2))
+    contact_placeholder = "[SYNTHETIC_PHONE_001]"
+    _record(
+        store,
+        _observation(body=f"Cần tuyển sales yêu cầu: liên hệ {contact_placeholder}"),
+    )
+
+    post = _post(_read_archive(root))
+    revision = _revisions(post)[0]
+    requirement = revision["vacancy_revisions"][0]["fields"]["requirements"]
+    assert requirement["state"] == EvidenceState.AMBIGUOUS.value
+    assert requirement["value"] is None
+    assert requirement["raw_value"] is None
+    assert requirement["spans"] == []
+
+    raw_expiry = _BASE + timedelta(days=1)
+    output_json = store.export_json(
+        _ACCOUNT_ONE,
+        fields=(ExportField.REQUIREMENTS,),
+        confirmed=True,
+        now_utc=raw_expiry,
+    )
+    output_csv = store.export_csv(
+        _ACCOUNT_ONE,
+        fields=(ExportField.REQUIREMENTS,),
+        confirmed=True,
+        now_utc=raw_expiry,
+    )
+    assert json.loads(output_json)["records"][0][ExportField.REQUIREMENTS.value] is None
+    assert list(csv.reader(io.StringIO(output_csv))) == [[ExportField.REQUIREMENTS.value], [""]]
+    assert contact_placeholder not in output_json + output_csv
+
+    retained_archive = _read_archive(root)
+    retained_post = _post(retained_archive)
+    retained_revision = _revisions(retained_post)[0]
+    retained_requirement = retained_revision["vacancy_revisions"][0]["fields"]["requirements"]
+    assert retained_revision["observed_text"] is None
+    assert retained_requirement["state"] == EvidenceState.AMBIGUOUS.value
+    assert contact_placeholder not in json.dumps(retained_archive, ensure_ascii=False)
+
+
+def test_export_rejects_non_string_field_values_with_fixed_code(tmp_path: Path) -> None:
+    store, root = _store(tmp_path)
+    for export in (store.export_json, store.export_csv):
+        with pytest.raises(RecruitmentJobStoreError) as error:
+            export(
+                _ACCOUNT_ONE,
+                fields=(123,),  # type: ignore[arg-type]
+                confirmed=True,
+                now_utc=_BASE,
+            )
+        assert error.value.code is StoreErrorCode.EXPORT_FIELD_INVALID
+    assert not (root / "job_vacancies_v1").exists()
+
+
 def test_store_has_no_browser_network_api_or_existing_journal_imports() -> None:
     source = ast.parse(Path(store_module.__file__).read_text(encoding="utf-8"))
     imports = {node.module for node in ast.walk(source) if isinstance(node, ast.ImportFrom)}

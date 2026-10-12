@@ -127,6 +127,11 @@ It keeps only the evidence state, whether safe placeholder evidence existed,
 and a bounded count. Generic status and repr output contain no post text,
 URL, account UUID, author label, or contact.
 
+For every non-contact field, evidence containing a phone-like value, approved
+synthetic contact placeholder, email, URL, or contact label is stored as
+AMBIGUOUS with no value, raw string, or source span. This keeps contact text
+out of derived fields and exports even after the source body expires.
+
 export_json and export_csv return local strings; they do not write to an
 arbitrary path. Each call requires an account UUID, an explicit field allowlist,
 confirmed=True, and an aware UTC clock. The allowlist excludes post text,
@@ -164,7 +169,8 @@ paths in the error.
 tests/test_recruitment_job_store.py covers the BJ-01 → BJ-02 → store bridge,
 account isolation, exact-permalink dedupe, repeated and conflicting
 observations, immutable revisions, partial/quote/image-only handling,
-evidence spans, contact rejection and redaction, export confirmation and CSV
+evidence spans, contact rejection and redaction including contact text embedded
+in derived fields, export confirmation and invalid-field handling, CSV
 injection, entry/text bounds, retention, deletion, locks, bad encodings/schema,
 unsafe paths, interrupted writes, and disk/replace failures. All fixture
 content is synthetic, all local data roots are newly created temporary paths,

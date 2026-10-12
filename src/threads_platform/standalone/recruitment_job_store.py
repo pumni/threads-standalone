@@ -70,7 +70,7 @@ _SYNTHETIC_AUTHOR_RE = re.compile(
     r"^(?:synthetic|fake)-[A-Za-z0-9._:-]{1,96}$|^\[(?:SYNTHETIC|FAKE)_AUTHOR_[0-9]{3}\]$"
 )
 _SAFE_CONTACT_PLACEHOLDER_RE = re.compile(
-    r"^\[(?:SYNTHETIC_(?:PHONE|CONTACT)|FAKE_CONTACT)_[0-9]{3}\]$"
+    r"\[(?:SYNTHETIC_(?:PHONE|CONTACT)|FAKE_CONTACT)_[0-9]{3}\]"
 )
 _PHONE_LIKE_RE = re.compile(r"(?<![\w])(?:\+?84|0)(?:[ \t().-]*\d){8,10}(?!\w)")
 _PHONE_PLACEHOLDER_DIGITS_RE = re.compile(
@@ -1106,6 +1106,17 @@ def _encode_evidence(evidence: FieldEvidence[object], source_text: str) -> dict[
             source_text[start:end] == evidence.raw_value for start, end in spans
         ):
             raise RecruitmentJobStoreError(StoreErrorCode.INVALID_INPUT)
+        if (
+            _contains_contact_content(evidence.value)
+            or _contains_contact_content(evidence.raw_value)
+            or any(_contains_contact_content(source_text[start:end]) for start, end in spans)
+        ):
+            return {
+                "state": EvidenceState.AMBIGUOUS.value,
+                "value": None,
+                "raw_value": None,
+                "spans": [],
+            }
     elif evidence.state is EvidenceState.ABSENT:
         if evidence.value is not None or evidence.raw_value is not None or spans:
             raise RecruitmentJobStoreError(StoreErrorCode.INVALID_INPUT)
@@ -1118,6 +1129,23 @@ def _encode_evidence(evidence: FieldEvidence[object], source_text: str) -> dict[
         "raw_value": evidence.raw_value,
         "spans": spans,
     }
+
+
+def _contains_contact_content(value: object) -> bool:
+    if isinstance(value, str):
+        return any(
+            pattern.search(value) is not None
+            for pattern in (
+                _PHONE_LIKE_RE,
+                _SAFE_CONTACT_PLACEHOLDER_RE,
+                _EMAIL_RE,
+                _URL_RE,
+                _CONTACT_LABEL_RE,
+            )
+        )
+    if type(value) in (tuple, list):
+        return any(_contains_contact_content(item) for item in cast(Sequence[object], value))
+    return False
 
 
 def _encode_contact_evidence(
@@ -1631,32 +1659,44 @@ def _parse_utc(value: object) -> datetime:
     return _require_utc(parsed)
 
 
+def _export_field_values(value: object) -> Sequence[object] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return None
+    return cast(Sequence[object], value)
+
+
 def _validate_export_request(
     fields: Sequence[ExportField | str],
     confirmed: bool,
     include_public_recruiter_contact: bool,
 ) -> tuple[ExportField, ...]:
+    field_values = _export_field_values(fields)
     if include_public_recruiter_contact is not False:
         raise RecruitmentJobStoreError(StoreErrorCode.CONTACT_EXPORT_BLOCKED)
     if confirmed is not True:
         raise RecruitmentJobStoreError(StoreErrorCode.EXPORT_CONFIRMATION_REQUIRED)
-    if not 1 <= len(fields) <= MAX_EXPORT_FIELDS:
+    if field_values is None or not 1 <= len(field_values) <= MAX_EXPORT_FIELDS:
         raise RecruitmentJobStoreError(StoreErrorCode.EXPORT_FIELD_INVALID)
     selected: list[ExportField] = []
-    for value in fields:
-        try:
-            item = value if type(value) is ExportField else ExportField(value)
-        except ValueError, TypeError:
-            if value.casefold() in {
-                "contact",
-                "contacts",
-                "phone",
-                "zalo",
-                "email",
-                "application_url",
-            }:
-                raise RecruitmentJobStoreError(StoreErrorCode.CONTACT_EXPORT_BLOCKED) from None
-            raise RecruitmentJobStoreError(StoreErrorCode.EXPORT_FIELD_INVALID) from None
+    for value in field_values:
+        if type(value) is ExportField:
+            item = value
+        elif type(value) is str:
+            try:
+                item = ExportField(value)
+            except ValueError:
+                if value.casefold() in {
+                    "contact",
+                    "contacts",
+                    "phone",
+                    "zalo",
+                    "email",
+                    "application_url",
+                }:
+                    raise RecruitmentJobStoreError(StoreErrorCode.CONTACT_EXPORT_BLOCKED) from None
+                raise RecruitmentJobStoreError(StoreErrorCode.EXPORT_FIELD_INVALID) from None
+        else:
+            raise RecruitmentJobStoreError(StoreErrorCode.EXPORT_FIELD_INVALID)
         if item in selected:
             raise RecruitmentJobStoreError(StoreErrorCode.EXPORT_FIELD_INVALID)
         selected.append(item)
