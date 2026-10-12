@@ -197,7 +197,7 @@ def load_manual_opportunities(path: Path) -> ManualOpportunityIntake:
         except BrowserContractError:
             raise ManualOpportunityError("MANUAL_TARGET_URL_INVALID") from None
 
-        target_key = normalized.thread_ref.casefold()
+        target_key = normalized.thread_ref
         prior_index = seen.get(target_key)
         if prior_index is not None:
             duplicates.append(
@@ -357,6 +357,50 @@ def _render_private_review(
     return "\n".join(lines) + "\n"
 
 
+def _render_private_shortlist(intake: ManualOpportunityIntake) -> str:
+    lines = ["MANUAL OPPORTUNITY SHORTLIST — PRIVATE LOCAL TERMINAL"]
+    for index, candidate in enumerate(intake.candidates, start=1):
+        lines.append(f"{index}. source_line={candidate.source_line} target={candidate.target_url}")
+    for duplicate in intake.duplicates:
+        lines.append(
+            f"duplicate source_line={duplicate.source_line} "
+            f"maps_to_selection={duplicate.shortlist_index} reason=DUPLICATE"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def run_manual_list_cli(
+    alias: str,
+    targets_file: Path,
+    *,
+    account_store_factory: Callable[[], LocalAccountStore],
+    stdin: TextIO | None = None,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> int:
+    """Show an offline shortlist on a private TTY without loading any draft."""
+
+    private_stdin = sys.stdin if stdin is None else stdin
+    private_stdout = sys.stdout if stdout is None else stdout
+    private_stderr = sys.stderr if stderr is None else stderr
+    env = os.environ if environment is None else environment
+    if not private_review_terminal_available(
+        stdin=private_stdin,
+        stdout=private_stdout,
+        stderr=private_stderr,
+        environment=env,
+    ):
+        raise ManualOpportunityError("PRIVATE_REVIEW_TERMINAL_REQUIRED")
+
+    store = account_store_factory()
+    store.get(alias)
+    intake = load_manual_opportunities(targets_file)
+    private_stderr.write(_render_private_shortlist(intake))
+    private_stderr.flush()
+    return 0
+
+
 def run_manual_review_cli(
     alias: str,
     targets_file: Path,
@@ -365,6 +409,7 @@ def run_manual_review_cli(
     context_file: Path | None,
     *,
     account_store_factory: Callable[[], LocalAccountStore],
+    confirm_target: str | None = None,
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
@@ -389,11 +434,14 @@ def run_manual_review_cli(
     intake = load_manual_opportunities(targets_file)
     if type(selection) is not int or not 1 <= selection <= len(intake.candidates):
         raise ManualOpportunityError("MANUAL_SELECTION_INVALID")
+    opportunity = intake.candidates[selection - 1]
+    if confirm_target is not None and confirm_target != opportunity.target_url:
+        raise ManualOpportunityError("MANUAL_TARGET_MISMATCH")
     draft = load_operator_draft(draft_file)
     context = load_operator_context(context_file)
     review = build_manual_draft_review(
         account,
-        intake.candidates[selection - 1],
+        opportunity,
         draft,
         context,
     )

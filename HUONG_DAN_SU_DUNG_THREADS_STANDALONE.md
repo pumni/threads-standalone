@@ -39,9 +39,10 @@ Threads Standalone là công cụ chạy **cục bộ trên máy tính**, giúp 
 ### Trạng thái Micro-slice 3 — offline manual review
 
 - Có lệnh `threads-local recruitment manual-review` để đọc tối đa 20 permalink operator nhập trong file local, chuẩn hóa bằng helper S2, bỏ trùng theo URL canonical và hiển thị shortlist theo thứ tự nhập.
-- Operator phải chỉ định `--select` (đánh số từ 1). Author chỉ được suy ra từ permalink và luôn là **chưa xác minh**; URL không tạo nội dung bài, điểm liên quan, remote ID hay trạng thái API/Nurture.
+- Lệnh riêng `threads-local recruitment manual-list` hiển thị shortlist canonical đánh số từ 1 và ánh xạ URL trùng trên `stderr` của terminal riêng tư. Có thể xem danh sách trước khi tạo draft hoặc chọn mục. Dedup giữ nguyên hoa/thường của post ID; khác biệt username và query tracking được chuẩn hóa theo S2.
+- Operator phải chỉ định `--select` (đánh số từ 1) trong `manual-review`. Author chỉ được suy ra từ permalink và luôn là **chưa xác minh**; URL không tạo nội dung bài, điểm liên quan, remote ID hay trạng thái API/Nurture.
 - Draft do operator tự viết/chỉnh sửa trong file UTF-8, tối đa 500 ký tự; không có AI. Context tùy chọn cũng do operator cung cấp và luôn có mức đầy đủ `UNKNOWN`. Review hiển thị hash SHA-256 và `NOT_SENT`.
-- CLI chỉ chạy trong terminal riêng tư tương tác; từ chối CI và luồng có stdout/stderr/stdin chuyển hướng. Draft, context và URL chỉ được in ở `stderr` terminal sau khi kiểm tra TTY. Lệnh không gọi API/browser và không ghi queue, receipt, journal hay Nurture state.
+- CLI chỉ chạy trong terminal riêng tư tương tác; từ chối CI và luồng có stdout/stderr/stdin chuyển hướng. Shortlist, draft, context và URL chỉ được in ở `stderr` terminal sau khi kiểm tra TTY. Lệnh không gọi API/browser và không ghi queue, receipt, journal hay Nurture state.
 - S3 synthetic-tested; **chưa live-verified**. S1 browser handoff là một lệnh riêng, chỉ dùng sau phê duyệt live riêng theo #18/#46 và operator phải tự xác minh actor/target.
 
 ## 2. Yêu cầu máy tính
@@ -175,22 +176,32 @@ uv run --locked python scripts/run_recruitment.py --account test-a --observe
 
    Có 1–20 dòng không trống, tối đa 64 KiB tổng file và tối đa 2048 byte/ký tự mỗi URL. Chỉ nhận UTF-8 không BOM và permalink đúng host `www.threads.com`; query tracking được S2 cho phép sẽ bị loại khi chuẩn hóa. URL trùng được gộp ổn định và lệnh in số dòng gốc ánh xạ tới mục shortlist còn lại. URL sai hoặc dữ liệu mơ hồ làm lệnh dừng.
 
-3. Tự viết/chỉnh sửa draft trong `draft.txt`; tối đa 500 ký tự. Context tùy chọn trong `context.txt` tối đa 4000 ký tự/16 KiB. Hai file phải là UTF-8 không BOM, không chứa control character hoặc ký tự vô hình nguy hiểm. Draft không được AI tạo; context chỉ là nội dung operator tự quan sát/cung cấp, không được app đọc từ Threads.
-4. Mở PowerShell tương tác riêng tư, không chuyển hướng stdin/stdout/stderr và không chạy trong CI. Chỉ file local được cung cấp rõ ràng mới được đọc:
+3. Mở PowerShell tương tác riêng tư, không chuyển hướng stdin/stdout/stderr và không chạy trong CI. Xem shortlist trước; lệnh này không cần draft:
+
+   ```powershell
+   uv run --locked threads-local recruitment manual-list test-a `
+     --targets-file .\targets.txt
+   ```
+
+   Lệnh in danh sách canonical một-based và ánh xạ các dòng trùng. Chọn đúng một số thứ tự từ danh sách này; không cần đoán vị trí trước khi thấy shortlist.
+
+4. Tự viết/chỉnh sửa draft trong `draft.txt`; tối đa 500 ký tự. Context tùy chọn trong `context.txt` tối đa 4000 ký tự/16 KiB. Hai file phải là UTF-8 không BOM, không chứa control character hoặc ký tự vô hình nguy hiểm. Draft không được AI tạo; context chỉ là nội dung operator tự quan sát/cung cấp, không được app đọc từ Threads.
+5. Chạy review trong terminal riêng tư. Dùng URL canonical đúng dòng shortlist cùng `--select`; `--confirm-target` tùy chọn nhưng được khuyến nghị để lệnh dừng nếu file target đổi sau khi xem danh sách:
 
    ```powershell
    uv run --locked threads-local recruitment manual-review test-a `
      --targets-file .\targets.txt `
      --select 2 `
+     --confirm-target "https://www.threads.com/@synthetic/post/fake_02" `
      --draft-file .\draft.txt `
      --context-file .\context.txt
    ```
 
-   Bỏ `--context-file` nếu chưa có context. `--select` là số thứ tự **một-based** trong shortlist đã in; bắt buộc chọn chính xác một mục, không có chọn mặc định.
+   Bỏ `--context-file` nếu chưa có context. `--select` là số thứ tự **một-based** trong shortlist vừa xem; bắt buộc chọn chính xác một mục, không có chọn mặc định. Khi có `--confirm-target`, giá trị phải khớp chính xác URL canonical của mục đã chọn.
 
-5. Review chỉ in ra `stderr` của terminal private: alias và UUID, actor `UNKNOWN_IDENTITY`, URL canonical, author chỉ từ permalink (chưa xác minh), provenance `MANUAL_URL`, context `OPERATOR_SUPPLIED`/`NONE` với completeness `UNKNOWN`, toàn văn draft, hash SHA-256 và `NOT_SENT`. Thay account, target hoặc draft làm thay hash; chỉnh file rồi chạy lại để review phiên bản mới.
-6. Lệnh offline này không mở Chromium, gọi API, đăng nhập, gửi reply, hoặc ghi queue/state/journal/receipt. `NOT_SENT` không phải là quyền gửi và không chứng minh danh tính actor.
-7. **Chỉ sau khi có phê duyệt live riêng theo #18/#46**, operator có thể tự chọn lệnh S1 được in trong review: `threads-local browser open-thread test-a "/@synthetic/post/fake_02" --interactive`. Đây là lệnh browser riêng; operator phải tự xác minh account và target trong UI chính thức. S1 không tự điền hay gửi reply.
+6. Review chỉ in ra `stderr` của terminal private: alias và UUID, actor `UNKNOWN_IDENTITY`, URL canonical, author chỉ từ permalink (chưa xác minh), provenance `MANUAL_URL`, context `OPERATOR_SUPPLIED`/`NONE` với completeness `UNKNOWN`, toàn văn draft, hash SHA-256 và `NOT_SENT`. Thay account, target hoặc draft làm thay hash; chỉnh file rồi chạy lại để review phiên bản mới.
+7. Lệnh offline này không mở Chromium, gọi API, đăng nhập, gửi reply, hoặc ghi queue/state/journal/receipt. `NOT_SENT` không phải là quyền gửi và không chứng minh danh tính actor.
+8. **Chỉ sau khi có phê duyệt live riêng theo #18/#46**, operator có thể tự chọn lệnh S1 được in trong review: `threads-local browser open-thread test-a "/@synthetic/post/fake_02" --interactive`. Đây là lệnh browser riêng; operator phải tự xác minh account và target trong UI chính thức. S1 không tự điền hay gửi reply.
 
 ### API-driven Nurture
 

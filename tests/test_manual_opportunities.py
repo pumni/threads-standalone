@@ -188,6 +188,122 @@ def test_manual_review_without_context_keeps_candidate_needs_context(
     assert stdout.getvalue() == ""
 
 
+def test_manual_review_optional_exact_target_confirmation_fails_closed(
+    tmp_path: Path,
+) -> None:
+    store = LocalAccountStore(tmp_path / "local-data")
+    account = store.add("synthetic_account")
+    target_url = _target("AbC")
+    targets = _write(tmp_path / "targets.txt", target_url)
+    draft = _write(tmp_path / "draft.txt", "Synthetic private draft")
+    stdin, stdout, stderr = _TtyStringIO(), _TtyStringIO(), _TtyStringIO()
+
+    with pytest.raises(ManualOpportunityError) as mismatch:
+        run_manual_review_cli(
+            account.alias,
+            targets,
+            1,
+            draft,
+            None,
+            account_store_factory=lambda: store,
+            confirm_target=_target("abc"),
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            environment={},
+        )
+    assert mismatch.value.code == "MANUAL_TARGET_MISMATCH"
+    assert stderr.getvalue() == ""
+
+    assert (
+        run_manual_review_cli(
+            account.alias,
+            targets,
+            1,
+            draft,
+            None,
+            account_store_factory=lambda: store,
+            confirm_target=target_url,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            environment={},
+        )
+        == 0
+    )
+    assert f"selected target: {target_url}" in stderr.getvalue()
+
+
+def test_manual_list_shows_canonical_shortlist_privately_without_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "local-data"
+    store = LocalAccountStore(data_root)
+    store.add("synthetic_account")
+    before = _snapshot(data_root)
+    first_target = _target("AbC")
+    second_target = _target("abc")
+    targets = _write(
+        tmp_path / "targets.txt",
+        "HTTPS://WWW.THREADS.COM/@Synthetic/post/AbC?utm_source=operator\n"
+        "https://www.threads.com/@synthetic/post/AbC?xmt=copy\n"
+        f"{second_target}\n",
+    )
+    _install_tty(monkeypatch)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(data_root))
+
+    def unexpected_runtime(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("manual list must not construct browser, API, or mutation runtimes")
+
+    monkeypatch.setattr(cli, "_run_browser_command", unexpected_runtime)
+    monkeypatch.setattr(cli, "_run_api_command", unexpected_runtime)
+    monkeypatch.setattr(cli, "_run_post_command", unexpected_runtime)
+    monkeypatch.setattr(cli, "_run_reply_command", unexpected_runtime)
+
+    assert (
+        cli.main(
+            [
+                "recruitment",
+                "manual-list",
+                "synthetic_account",
+                "--targets-file",
+                str(targets),
+            ]
+        )
+        == 0
+    )
+
+    assert sys.stdout.getvalue() == ""
+    assert sys.stderr.getvalue() == (
+        "MANUAL OPPORTUNITY SHORTLIST — PRIVATE LOCAL TERMINAL\n"
+        f"1. source_line=1 target={first_target}\n"
+        f"2. source_line=3 target={second_target}\n"
+        "duplicate source_line=2 maps_to_selection=1 reason=DUPLICATE\n"
+    )
+    assert _snapshot(data_root) == before
+
+
+def test_manual_dedup_preserves_post_id_case_and_normalizes_author_and_tracking(
+    tmp_path: Path,
+) -> None:
+    targets = _write(
+        tmp_path / "targets.txt",
+        "HTTPS://WWW.THREADS.COM/@Synthetic/post/AbC?utm_source=operator\n"
+        "https://www.threads.com/@synthetic/post/AbC?xmt=copy\n"
+        "https://www.threads.com/@synthetic/post/abc\n",
+    )
+
+    intake = load_manual_opportunities(targets)
+
+    assert [candidate.target_url for candidate in intake.candidates] == [
+        _target("AbC"),
+        _target("abc"),
+    ]
+    assert len(intake.duplicates) == 1
+    assert intake.duplicates[0].source_line == 2
+    assert intake.duplicates[0].shortlist_index == 1
+
+
 @pytest.mark.parametrize(
     ("count", "expected"),
     [
@@ -363,31 +479,41 @@ def test_private_terminal_refusal_precedes_account_and_file_access(
         (streams[0], streams[1], io.StringIO(), {}),
         (streams[0], streams[1], streams[2], {"GITHUB_ACTIONS": "true"}),
     ]
+    commands = [
+        [
+            "recruitment",
+            "manual-review",
+            "synthetic_account",
+            "--targets-file",
+            str(target_file),
+            "--select",
+            "1",
+            "--draft-file",
+            str(draft_file),
+        ],
+        [
+            "recruitment",
+            "manual-list",
+            "synthetic_account",
+            "--targets-file",
+            str(target_file),
+        ],
+    ]
     for stdin, stdout, stderr, environment in cases:
         monkeypatch.setattr(sys, "stdin", stdin)
         monkeypatch.setattr(sys, "stdout", stdout)
         monkeypatch.setattr(sys, "stderr", stderr)
         monkeypatch.setattr(manual_opportunities.os, "environ", environment)
-        assert (
-            cli.main(
-                [
-                    "recruitment",
-                    "manual-review",
-                    "synthetic_account",
-                    "--targets-file",
-                    str(target_file),
-                    "--select",
-                    "1",
-                    "--draft-file",
-                    str(draft_file),
-                ]
-            )
-            == 1
-        )
-        rendered = stdout.getvalue() + stderr.getvalue()
-        assert "PRIVATE_REVIEW_TERMINAL_REQUIRED" in rendered
-        assert "PRIVATE_URL_SENTINEL" not in rendered
-        assert "PRIVATE_DRAFT_SENTINEL" not in rendered
+        for command in commands:
+            assert cli.main(command) == 1
+            rendered = stdout.getvalue() + stderr.getvalue()
+            assert "PRIVATE_REVIEW_TERMINAL_REQUIRED" in rendered
+            assert "PRIVATE_URL_SENTINEL" not in rendered
+            assert "PRIVATE_DRAFT_SENTINEL" not in rendered
+            stdout.seek(0)
+            stdout.truncate(0)
+            stderr.seek(0)
+            stderr.truncate(0)
 
 
 def test_hash_binds_account_target_and_normalized_draft(tmp_path: Path) -> None:
@@ -411,6 +537,7 @@ def test_hash_binds_account_target_and_normalized_draft(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "value",
     [
+        _target("fake_1"),
         "https://www.threads.com/@synthetic/post/fake_1?utm_source=operator",
         "https://www.threads.com.evil/@synthetic/post/fake_1",
         "/@synthetic/post/fake_1",
@@ -442,6 +569,7 @@ def test_manual_review_parser_is_additive_and_requires_explicit_selection() -> N
     assert parsed.recruitment_command == "manual-review"
     assert parsed.select == 2
     assert parsed.context_file is None
+    assert parsed.confirm_target is None
     with pytest.raises(SystemExit):
         cli._build_parser().parse_args(
             [
@@ -454,3 +582,16 @@ def test_manual_review_parser_is_additive_and_requires_explicit_selection() -> N
                 "draft.txt",
             ]
         )
+
+    list_parsed = cli._build_parser().parse_args(
+        [
+            "recruitment",
+            "manual-list",
+            "synthetic_account",
+            "--targets-file",
+            "targets.txt",
+        ]
+    )
+    assert list_parsed.recruitment_command == "manual-list"
+    assert list_parsed.targets_file == "targets.txt"
+    assert not hasattr(list_parsed, "draft_file")
