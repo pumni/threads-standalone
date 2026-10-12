@@ -67,8 +67,12 @@ operator data root or a customer archive.
 
 Checkpoint schema v1 has a 16 KiB hard file limit, an exact key set, duplicate
 JSON-key rejection, account binding, a query digest instead of query text,
-capture-ID digests for reuse detection, a digest binding the selected targets
-of a pending capture, and one optional pending capture. It
+capture-ID digests for reuse detection, a target-plan digest binding the exact
+ordered selected targets of every cycle to the run ID, a digest binding the
+selected targets of a pending capture, and one optional pending capture. A
+same-run resume compares the target-plan digest before returning COMPLETE or
+reading another fixture; a changed plan returns CHECKPOINT_CONFLICT. The
+checkpoint stores only digests, never raw target URLs. It
 contains no post text, permalink, author label, contact, or filesystem path.
 Unknown versions, corrupt data, unsafe paths, symlinks/reparse points, and
 unverified permissions fail closed. There is no automatic migration or stale
@@ -102,11 +106,13 @@ actor label, local path, or underlying exception text.
 `tests/test_browser_job_watch.py` exercises zero, one, 20, and 21 selected
 targets; one, five, and six requested cycles; the five-batch appearance cap;
 separate accounts; same and changed revisions; capture-ID reuse; first- and
-second-cycle resume; stop during fake read, interval wait, and after archive
-write; replay after archive/checkpoint interruption; atomic-write failure;
-partial, quote, and image-only observations; UTC and monotonic clock rollback;
-corrupt and unsupported checkpoints; private path, symlink, lock, and
-permission failures; result redaction; and the disabled manual/browser gates.
+second-cycle resume; changed target plans after a completed run and after
+one- or two-cycle interruption; unchanged completed-run idempotency; stop
+during fake read, interval wait, and after archive write; replay after
+archive/checkpoint interruption; atomic-write failure; partial, quote, and
+image-only observations; UTC and monotonic clock rollback; corrupt and
+unsupported checkpoints; private path, symlink, lock, and permission failures;
+result redaction; and the disabled manual/browser gates.
 
 The tests use an isolated synthetic basetemp. Windows may skip symlink
 creation when the host disallows it; the store path checks remain fail-closed.

@@ -71,6 +71,7 @@ _CHECKPOINT_KEYS = frozenset(
         "generation",
         "run_id",
         "query_sha256",
+        "target_plan_sha256",
         "max_cycles",
         "interval_seconds",
         "completed_cycles",
@@ -202,6 +203,7 @@ class _Checkpoint:
     generation: int
     run_id: str
     query_sha256: str
+    target_plan_sha256: str
     max_cycles: int
     interval_seconds: int
     completed_cycles: int
@@ -218,6 +220,7 @@ class _Checkpoint:
             "generation": self.generation,
             "run_id": self.run_id,
             "query_sha256": self.query_sha256,
+            "target_plan_sha256": self.target_plan_sha256,
             "max_cycles": self.max_cycles,
             "interval_seconds": self.interval_seconds,
             "completed_cycles": self.completed_cycles,
@@ -551,6 +554,7 @@ class BrowserJobWatchEngine:
                     account_id=account_id,
                     run_id=safe_run_id,
                     query=safe_query,
+                    target_plan_sha256=_target_plan_sha256(safe_cycles),
                     max_cycles=max_cycles,
                     interval_seconds=interval_seconds,
                 )
@@ -758,6 +762,7 @@ class BrowserJobWatchEngine:
         account_id: UUID,
         run_id: str,
         query: str,
+        target_plan_sha256: str,
         max_cycles: int,
         interval_seconds: int,
     ) -> tuple[_Checkpoint, bool]:
@@ -768,6 +773,7 @@ class BrowserJobWatchEngine:
                 generation=1,
                 run_id=run_id,
                 query_sha256=query_digest,
+                target_plan_sha256=target_plan_sha256,
                 max_cycles=max_cycles,
                 interval_seconds=interval_seconds,
                 completed_cycles=0,
@@ -781,24 +787,17 @@ class BrowserJobWatchEngine:
             return state, False
         if current.account_uuid != str(account_id):
             raise _WatchFailure(WatchReasonCode.INVALID_CHECKPOINT)
-        if not current.is_complete:
-            if current.run_id != run_id:
-                raise _WatchFailure(WatchReasonCode.CHECKPOINT_CONFLICT)
-            if (
-                current.query_sha256 != query_digest
-                or current.max_cycles != max_cycles
-                or current.interval_seconds != interval_seconds
-            ):
-                raise _WatchFailure(WatchReasonCode.CHECKPOINT_CONFLICT)
-            return current, False
         if current.run_id == run_id:
             if (
                 current.query_sha256 != query_digest
+                or current.target_plan_sha256 != target_plan_sha256
                 or current.max_cycles != max_cycles
                 or current.interval_seconds != interval_seconds
             ):
                 raise _WatchFailure(WatchReasonCode.CHECKPOINT_CONFLICT)
-            return current, True
+            return current, current.is_complete
+        if not current.is_complete:
+            raise _WatchFailure(WatchReasonCode.CHECKPOINT_CONFLICT)
         if current.generation >= MAX_CAPTURE_IDENTITIES:
             raise _WatchFailure(WatchReasonCode.CAPTURE_ID_REUSED)
         state = _Checkpoint(
@@ -806,6 +805,7 @@ class BrowserJobWatchEngine:
             generation=current.generation + 1,
             run_id=run_id,
             query_sha256=query_digest,
+            target_plan_sha256=target_plan_sha256,
             max_cycles=max_cycles,
             interval_seconds=interval_seconds,
             completed_cycles=0,
@@ -970,7 +970,13 @@ def _validate_run_inputs(
         query.encode("utf-8", errors="strict")
     except UnicodeEncodeError:
         return None
-    for cycle in cycles:
+    try:
+        safe_cycles = tuple(cycles)
+    except Exception:  # noqa: BLE001 - malformed caller sequences fail closed.
+        return None
+    if len(safe_cycles) != max_cycles:
+        return None
+    for cycle in safe_cycles:
         if (
             type(cycle) is not SyntheticCycleInput
             or cast(object, cycle.session) is None
@@ -985,7 +991,7 @@ def _validate_run_inputs(
         account_uuid,
         query,
         run_id,
-        cycles,
+        safe_cycles,
         clock,
         sleeper,
         stop_signal,
@@ -1021,6 +1027,7 @@ def _decode_checkpoint(value: object | None, account_id: UUID) -> _Checkpoint | 
     generation = document.get("generation")
     run_id = document.get("run_id")
     query_digest = document.get("query_sha256")
+    target_plan_digest = document.get("target_plan_sha256")
     max_cycles = document.get("max_cycles")
     interval_seconds = document.get("interval_seconds")
     completed_cycles = document.get("completed_cycles")
@@ -1037,6 +1044,8 @@ def _decode_checkpoint(value: object | None, account_id: UUID) -> _Checkpoint | 
         or _RUN_ID_RE.fullmatch(run_id) is None
         or not isinstance(query_digest, str)
         or _SHA256_RE.fullmatch(query_digest) is None
+        or not isinstance(target_plan_digest, str)
+        or _SHA256_RE.fullmatch(target_plan_digest) is None
         or type(max_cycles) is not int
         or not 1 <= max_cycles <= MAX_WATCH_CYCLES
         or type(interval_seconds) is not int
@@ -1085,6 +1094,7 @@ def _decode_checkpoint(value: object | None, account_id: UUID) -> _Checkpoint | 
         generation=generation,
         run_id=run_id,
         query_sha256=query_digest,
+        target_plan_sha256=target_plan_digest,
         max_cycles=max_cycles,
         interval_seconds=interval_seconds,
         completed_cycles=completed_cycles,
@@ -1216,6 +1226,12 @@ def _sha256(value: bytes) -> str:
 
 def _targets_sha256(targets: tuple[str, ...]) -> str:
     encoded = json.dumps(targets, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    return _sha256(encoded)
+
+
+def _target_plan_sha256(cycles: Sequence[SyntheticCycleInput]) -> str:
+    target_plan = tuple(cycle.selected_targets for cycle in cycles)
+    encoded = json.dumps(target_plan, ensure_ascii=True, separators=(",", ":")).encode("ascii")
     return _sha256(encoded)
 
 

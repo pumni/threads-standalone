@@ -354,8 +354,105 @@ def test_default_run_uses_one_cycle_and_persists_only_synthetic_observations(
     assert checkpoint["schema_version"] == 1
     assert checkpoint["completed_cycles"] == 1
     assert checkpoint["pending_capture_id"] is None
+    assert isinstance(checkpoint["target_plan_sha256"], str)
+    assert len(checkpoint["target_plan_sha256"]) == 64
     assert "query" not in checkpoint
     assert "visible_text" not in checkpoint
+
+
+def test_completed_run_conflicts_when_same_run_id_has_changed_target_plan(
+    tmp_path: Path,
+) -> None:
+    engine, root = _engine(tmp_path)
+    original_cycle, original_session, original_urls = _cycle()
+    completed = _run(engine, (original_cycle,), run_id="run-plan-complete")
+    assert completed.status is WatchStatus.COMPLETE
+    assert original_session.read_calls == 1
+
+    changed_session, _changed_urls = _session()
+    changed_target = _url(2)
+    assert changed_target != original_urls[0]
+    changed_cycle = SyntheticCycleInput(
+        session=changed_session,
+        selected_targets=(changed_target,),
+    )
+    checkpoint_before = _checkpoint_path(root).read_bytes()
+    archive_before = _archive_path(root).read_bytes()
+
+    changed = _run(engine, (changed_cycle,), run_id="run-plan-complete")
+
+    assert changed.status is WatchStatus.FAILED
+    assert changed.reason_code is WatchReasonCode.CHECKPOINT_CONFLICT
+    assert changed_session.read_calls == 0
+    assert _checkpoint_path(root).read_bytes() == checkpoint_before
+    assert _archive_path(root).read_bytes() == archive_before
+
+
+@pytest.mark.parametrize("completed_cycles", [1, 2])
+def test_interrupted_run_conflicts_when_completed_cycle_target_changes(
+    tmp_path: Path,
+    completed_cycles: int,
+) -> None:
+    engine, root = _engine(tmp_path)
+    session, urls = _session(count=3)
+    cycles = tuple(SyntheticCycleInput(session, (target,)) for target in urls)
+    clock = _Clock()
+    stop = _Stop()
+    sleeper = _Sleeper(clock, stop_after_wait=stop, stop_on_wait_number=completed_cycles)
+
+    interrupted = _run(
+        engine,
+        cycles,
+        clock=clock,
+        sleeper=sleeper,
+        stop=stop,
+        run_id="run-plan-resume",
+        max_cycles=3,
+    )
+
+    assert interrupted.status is WatchStatus.STOPPED
+    assert interrupted.completed_cycles == completed_cycles
+    assert session.read_calls == completed_cycles
+    checkpoint_before = _checkpoint_path(root).read_bytes()
+    archive_before = _archive_path(root).read_bytes()
+    changed_cycles = (SyntheticCycleInput(session, (urls[2],)), *cycles[1:])
+
+    changed = _run(
+        engine,
+        changed_cycles,
+        clock=clock,
+        run_id="run-plan-resume",
+        max_cycles=3,
+    )
+
+    assert changed.status is WatchStatus.FAILED
+    assert changed.reason_code is WatchReasonCode.CHECKPOINT_CONFLICT
+    assert session.read_calls == completed_cycles
+    assert _checkpoint_path(root).read_bytes() == checkpoint_before
+    assert _archive_path(root).read_bytes() == archive_before
+    assert (
+        RecruitmentJobStore(root, retention_policy=_POLICY).summary(_ACCOUNT_ONE).observation_count
+        == completed_cycles
+    )
+
+
+def test_completed_run_replay_with_unchanged_target_plan_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    engine, root = _engine(tmp_path)
+    cycle_input, session, _urls = _cycle()
+    first = _run(engine, (cycle_input,), run_id="run-plan-idempotent")
+    assert first.status is WatchStatus.COMPLETE
+    checkpoint_before = _checkpoint_path(root).read_bytes()
+    archive_before = _archive_path(root).read_bytes()
+
+    replayed = _run(engine, (cycle_input,), run_id="run-plan-idempotent")
+
+    assert replayed.status is WatchStatus.COMPLETE
+    assert replayed.completed_cycles == 1
+    assert session.read_calls == 1
+    assert _checkpoint_path(root).read_bytes() == checkpoint_before
+    assert _archive_path(root).read_bytes() == archive_before
 
 
 @pytest.mark.parametrize("count", [0, 1, MAX_SELECTED_POSTS_PER_CYCLE])
@@ -570,7 +667,7 @@ def test_restart_reuses_pending_event_after_fake_read_is_stopped(tmp_path: Path)
         run_id="run-restart-read",
     )
     assert changed.status is WatchStatus.FAILED
-    assert changed.reason_code is WatchReasonCode.TARGET_CHANGED
+    assert changed.reason_code is WatchReasonCode.CHECKPOINT_CONFLICT
     assert changed_session.read_calls == 0
     assert _document(_checkpoint_path(root))["pending_capture_id"] == pending_before
 
