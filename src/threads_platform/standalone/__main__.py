@@ -41,6 +41,13 @@ from threads_platform.standalone.manual_opportunities import (
     run_manual_list_cli,
     run_manual_review_cli,
 )
+from threads_platform.standalone.manual_outcomes import ManualOutcomeError
+from threads_platform.standalone.manual_workflow import (
+    ManualWorkflowError,
+    run_manual_handoff_cli,
+    run_manual_record_cli,
+    run_manual_status_cli,
+)
 from threads_platform.standalone.mutations import (
     CarouselManifest,
     LocalOperationStore,
@@ -771,6 +778,33 @@ def _build_parser() -> argparse.ArgumentParser:
     manual_list_parser = recruitment_commands.add_parser("manual-list")
     manual_list_parser.add_argument("alias")
     manual_list_parser.add_argument("--targets-file", required=True)
+    manual_handoff_parser = recruitment_commands.add_parser("manual-handoff")
+    manual_handoff_parser.add_argument("alias")
+    manual_handoff_parser.add_argument("--targets-file", required=True)
+    manual_handoff_parser.add_argument("--select", type=int, required=True)
+    manual_handoff_parser.add_argument("--confirm-target", required=True)
+    manual_handoff_parser.add_argument("--draft-file", required=True)
+    manual_handoff_parser.add_argument("--approve-sha", required=True)
+    manual_handoff_parser.add_argument("--context-file")
+    manual_handoff_parser.add_argument("--interactive", action="store_true", required=True)
+    manual_record_parser = recruitment_commands.add_parser("manual-record")
+    manual_record_parser.add_argument("alias")
+    manual_record_parser.add_argument("--targets-file", required=True)
+    manual_record_parser.add_argument("--select", type=int, required=True)
+    manual_record_parser.add_argument("--confirm-target", required=True)
+    manual_record_parser.add_argument("--draft-file", required=True)
+    manual_record_parser.add_argument("--approve-sha", required=True)
+    manual_record_parser.add_argument(
+        "--outcome",
+        choices=("ABORTED_NOT_SENT", "OPERATOR_REPORTED_SENT_UNVERIFIED", "AMBIGUOUS"),
+        required=True,
+    )
+    manual_record_parser.add_argument("--context-file")
+    manual_status_parser = recruitment_commands.add_parser("manual-status")
+    manual_status_parser.add_argument("alias")
+    manual_status_parser.add_argument("--targets-file", required=True)
+    manual_status_parser.add_argument("--select", type=int, required=True)
+    manual_status_parser.add_argument("--confirm-target", required=True)
     return parser
 
 
@@ -816,6 +850,55 @@ def _run_browser_command(args: argparse.Namespace, root: Path, store: LocalAccou
     except StandaloneRuntimeError as error:
         sys.stderr.write(f"ERROR {error.code}\n")
         return 1
+
+
+def _handle_recruitment_command(args: argparse.Namespace) -> int:
+    if args.recruitment_command == "manual-list":
+        return run_manual_list_cli(
+            args.alias,
+            Path(args.targets_file),
+            account_store_factory=lambda: LocalAccountStore(resolve_standalone_data_root()),
+        )
+    if args.recruitment_command == "manual-handoff":
+        return run_manual_handoff_cli(
+            args.alias,
+            Path(args.targets_file),
+            args.select,
+            args.confirm_target,
+            Path(args.draft_file),
+            args.approve_sha,
+            None if args.context_file is None else Path(args.context_file),
+            data_root_factory=resolve_standalone_data_root,
+        )
+    if args.recruitment_command == "manual-record":
+        return run_manual_record_cli(
+            args.alias,
+            Path(args.targets_file),
+            args.select,
+            args.confirm_target,
+            Path(args.draft_file),
+            args.approve_sha,
+            args.outcome,
+            None if args.context_file is None else Path(args.context_file),
+            data_root_factory=resolve_standalone_data_root,
+        )
+    if args.recruitment_command == "manual-status":
+        return run_manual_status_cli(
+            args.alias,
+            Path(args.targets_file),
+            args.select,
+            args.confirm_target,
+            data_root_factory=resolve_standalone_data_root,
+        )
+    return run_manual_review_cli(
+        args.alias,
+        Path(args.targets_file),
+        args.select,
+        Path(args.draft_file),
+        None if args.context_file is None else Path(args.context_file),
+        account_store_factory=lambda: LocalAccountStore(resolve_standalone_data_root()),
+        confirm_target=args.confirm_target,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -884,21 +967,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_nurture_command(args)
 
         if args.command == "recruitment":
-            if args.recruitment_command == "manual-list":
-                return run_manual_list_cli(
-                    args.alias,
-                    Path(args.targets_file),
-                    account_store_factory=lambda: LocalAccountStore(resolve_standalone_data_root()),
-                )
-            return run_manual_review_cli(
-                args.alias,
-                Path(args.targets_file),
-                args.select,
-                Path(args.draft_file),
-                None if args.context_file is None else Path(args.context_file),
-                account_store_factory=lambda: LocalAccountStore(resolve_standalone_data_root()),
-                confirm_target=args.confirm_target,
-            )
+            return _handle_recruitment_command(args)
 
         root = resolve_standalone_data_root()
         store = LocalAccountStore(root)
@@ -965,8 +1034,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         sys.stdout.write(asyncio.run(_run_api_command(args, root, store)))
         return 0
+    except ManualWorkflowError as error:
+        sys.stderr.write(f"ERROR {error.code}\n")
+        return 130 if error.code.endswith("INTERRUPTED") else 1
     except (
         ManualOpportunityError,
+        ManualOutcomeError,
         StandaloneAccountError,
         StandaloneApiError,
         ThreadsCredentialError,

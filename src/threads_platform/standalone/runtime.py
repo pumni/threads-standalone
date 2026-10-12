@@ -8,7 +8,8 @@ import re
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, TextIO, cast
+from uuid import UUID
 
 from threads_platform.browser.capabilities import (
     BrowserFeedItemResultV1,
@@ -65,9 +66,14 @@ async def _wait_for_windows_console_enter(
         await asyncio.sleep(0.05)
 
 
-async def _wait_for_interactive_operator(prompt: str) -> None:
-    sys.stdout.write(prompt)
-    sys.stdout.flush()
+async def _wait_for_interactive_operator(
+    prompt: str,
+    *,
+    output: TextIO | None = None,
+) -> None:
+    output_stream = sys.stdout if output is None else output
+    output_stream.write(prompt)
+    output_stream.flush()
     if not sys.stdin.isatty():
         raise EOFError
 
@@ -99,8 +105,8 @@ async def _wait_for_interactive_operator(prompt: str) -> None:
         finally:
             loop.remove_reader(input_fd)
 
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+    output_stream.write("\n")
+    output_stream.flush()
 
 
 _DEFAULT_INTERACTIVE_OPERATOR_WAITER = _wait_for_interactive_operator
@@ -198,20 +204,33 @@ class LocalRuntime:
         alias: str,
         thread_ref: str,
         *,
-        wait_for_operator: Callable[[str], Awaitable[None]] = (
-            _DEFAULT_INTERACTIVE_OPERATOR_WAITER
-        ),
+        wait_for_operator: Callable[[str], Awaitable[None]] | None = None,
+        operator_output: TextIO | None = None,
+        expected_account_id: UUID | None = None,
     ) -> BrowserTargetOpenResultV1:
         parsed_target = parse_thread_ref(thread_ref)
         if parsed_target is None:
             raise StandaloneRuntimeError("INVALID_THREAD_TARGET")
         target_ref, author_username = parsed_target
+        operator_waiter: Callable[[str], Awaitable[None]]
+        if wait_for_operator is not None:
+            operator_waiter = wait_for_operator
+        elif operator_output is not None:
+
+            async def wait_on_operator_output(prompt: str) -> None:
+                await _wait_for_interactive_operator(prompt, output=operator_output)
+
+            operator_waiter = wait_on_operator_output
+
+        else:
+            operator_waiter = _DEFAULT_INTERACTIVE_OPERATOR_WAITER
         return await self._open_browser_target(
             alias,
             target_ref,
             target_kind="THREAD",
             author_username=author_username,
-            wait_for_operator=wait_for_operator,
+            wait_for_operator=operator_waiter,
+            expected_account_id=expected_account_id,
         )
 
     async def browse_feed(self, alias: str, max_items: int = 10) -> BrowserFeedResultV1:
@@ -313,12 +332,15 @@ class LocalRuntime:
         target_kind: Literal["PROFILE", "THREAD"],
         author_username: str | None = None,
         wait_for_operator: Callable[[str], Awaitable[None]] | None = None,
+        expected_account_id: UUID | None = None,
     ) -> BrowserTargetOpenResultV1:
         lock: FilesystemProcessLock | None = None
         session: BrowserEngineSession | None = None
         try:
             async with asyncio.timeout(_BROWSER_READ_TIMEOUT_SECONDS):
                 account = await asyncio.to_thread(self._accounts.get, alias)
+                if expected_account_id is not None and account.id != expected_account_id:
+                    raise StandaloneRuntimeError("ACCOUNT_IDENTITY_CHANGED")
                 lock = FilesystemProcessLock(self._lock_path(account))
                 try:
                     lock.acquire()

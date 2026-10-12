@@ -201,7 +201,47 @@ uv run --locked python scripts/run_recruitment.py --account test-a --observe
 
 6. Review chỉ in ra `stderr` của terminal private: alias và UUID, actor `UNKNOWN_IDENTITY`, URL canonical, author chỉ từ permalink (chưa xác minh), provenance `MANUAL_URL`, context `OPERATOR_SUPPLIED`/`NONE` với completeness `UNKNOWN`, toàn văn draft, hash SHA-256 và `NOT_SENT`. Thay account, target hoặc draft làm thay hash; chỉnh file rồi chạy lại để review phiên bản mới.
 7. Lệnh offline này không mở Chromium, gọi API, đăng nhập, gửi reply, hoặc ghi queue/state/journal/receipt. `NOT_SENT` không phải là quyền gửi và không chứng minh danh tính actor.
-8. **Chỉ sau khi có phê duyệt live riêng theo #18/#46**, operator có thể tự chọn lệnh S1 được in trong review: `threads-local browser open-thread test-a "/@synthetic/post/fake_02" --interactive`. Đây là lệnh browser riêng; operator phải tự xác minh account và target trong UI chính thức. S1 không tự điền hay gửi reply.
+8. Micro-slice 4 nối review S3 với đúng lệnh S1 bằng SHA đã duyệt. Từ terminal riêng tư, chạy lệnh dưới đây sau khi thay các giá trị bằng shortlist, URL canonical và SHA vừa review:
+
+   ```powershell
+   $approvalSha = Read-Host "Nhập SHA-256 chính xác từ manual-review"
+   uv run --locked threads-local recruitment manual-handoff test-a `
+     --targets-file .\targets.txt `
+     --select 2 `
+     --confirm-target "https://www.threads.com/@synthetic/post/fake_02" `
+     --draft-file .\draft.txt `
+     --context-file .\context.txt `
+     --approve-sha $approvalSha `
+     --interactive
+   ```
+
+   Bỏ `--context-file` nếu không dùng context. Lệnh đọc lại account, shortlist, draft và context, tính lại SHA S3, rồi in account alias/UUID, actor `UNKNOWN_IDENTITY`, exact target và draft vào `stderr` riêng tư. Chỉ dòng `OPEN` rồi Enter mới mở một browser S1 tới target đã duyệt; Enter trống, EOF hoặc nội dung khác dừng trước khi mở. Trong browser, operator tự kiểm tra account và target. Công cụ không điền nội dung, tìm composer hoặc nhấn Send. Sau khi đóng browser, `HANDOFF_CLOSED_ACTION_UNVERIFIED` chỉ cho biết phiên handoff đã đóng; nó không xác nhận có gửi hay không.
+
+9. Nếu operator muốn lưu lời khai kết quả, chạy lại `manual-review` với cùng account/target/draft/context để lấy SHA hiện tại, cập nhật `$approvalSha`, rồi chạy `manual-record` với SHA được tính lại, chọn một outcome và nhập đúng `RECORD`:
+
+   ```powershell
+   uv run --locked threads-local recruitment manual-record test-a `
+     --targets-file .\targets.txt `
+     --select 2 `
+     --confirm-target "https://www.threads.com/@synthetic/post/fake_02" `
+     --draft-file .\draft.txt `
+     --context-file .\context.txt `
+     --approve-sha $approvalSha `
+     --outcome ABORTED_NOT_SENT
+   ```
+
+   `--outcome` nhận `ABORTED_NOT_SENT`, `OPERATOR_REPORTED_SENT_UNVERIFIED` hoặc `AMBIGUOUS`. Đây là lời khai của operator, luôn mang `UNVERIFIED`, không phải receipt hay bằng chứng gửi. Journal nằm riêng trong `manual_recruitment_v1`; nó chỉ lưu account UUID, fingerprint target, SHA draft, thời điểm và outcome, không lưu URL, draft hay context. `AMBIGUOUS` và `OPERATOR_REPORTED_SENT_UNVERIFIED` chặn mở lại target qua S4. Chỉ `ABORTED_NOT_SENT` không chặn lần handoff sau.
+
+10. Xem trạng thái target trong terminal riêng tư bằng lệnh read-only sau; shortlist và target phải khớp chính xác:
+
+   ```powershell
+   uv run --locked threads-local recruitment manual-status test-a `
+     --targets-file .\targets.txt `
+     --select 2 `
+     --confirm-target "https://www.threads.com/@synthetic/post/fake_02"
+   ```
+
+   Mọi kết quả đều là `UNVERIFIED`, kể cả lời khai `OPERATOR_REPORTED_SENT_UNVERIFIED`. S4 handoff/outcome hiện chỉ được kiểm thử với browser giả và dữ liệu tổng hợp; không chạy trên Threads thật nếu chưa có phê duyệt live riêng. Hướng dẫn này không cấp quyền truy cập tự động hay gửi nội dung. S1 vẫn không tự điền hoặc gửi reply.
 
 ### API-driven Nurture
 
