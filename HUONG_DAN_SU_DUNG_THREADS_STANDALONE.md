@@ -1,39 +1,38 @@
 # HƯỚNG DẪN SỬ DỤNG THREADS STANDALONE — TIẾNG VIỆT
 
-> **Phiên bản tài liệu:** 2026-10-12. **Đối tượng:** người vận hành quản lý tài khoản Threads được sở hữu/ủy quyền hợp lệ trên Windows.
+> **Phiên bản tài liệu:** 2026-10-12. **Đối tượng:** operator dùng CLI cục bộ trên Windows.
 >
-> **Đọc trước:** Tài liệu mô tả đúng các chức năng đã có trong mã nguồn và lộ trình phát triển. Tính năng **tự động tìm kiếm Threads qua browser, đọc hội thoại, tự điền/gửi reply chưa có trong phiên bản hiện tại**. Không sử dụng tài liệu này như lời xác nhận đã vượt qua Meta App Review hoặc đã được Meta cho phép tự động hóa UI.
+> **Đọc trước:** Micro-slice S1–S5 cung cấp quy trình offline để operator nhập permalink, xem shortlist, tự viết draft và duyệt target. S2 search/conversation chỉ dùng fixture synthetic; **không có tìm kiếm/thu thập Threads thật bằng browser**. S4 handoff có thể mở browser thật tới đúng URL sau xác nhận `OPEN`, nhưng chưa chạy live UAT. Không có browser auto-fill hoặc auto-send. Không hiểu tài liệu/test synthetic là sự cho phép của Meta hay bằng chứng đã qua App Review.
 >
-> Kế hoạch Codex: [GitHub issue #47](https://github.com/pumni/threads-standalone/issues/47). Giới hạn triển khai/live: [issue #18](https://github.com/pumni/threads-standalone/issues/18) và [#46](https://github.com/pumni/threads-standalone/issues/46).
+> Kế hoạch: [GitHub issue #47](https://github.com/pumni/threads-standalone/issues/47), S5: [issue #55](https://github.com/pumni/threads-standalone/issues/55). Release gate: [runbook](docs/BROWSER_MVP_RELEASE_READINESS.md). Giới hạn live/UAT: [issue #18](https://github.com/pumni/threads-standalone/issues/18) và [#46](https://github.com/pumni/threads-standalone/issues/46).
 
 ## 1. Threads Standalone dùng để làm gì?
 
-Threads Standalone là công cụ chạy **cục bộ trên máy tính**, giúp operator quản lý account, mở Threads trong Chromium riêng, xem một phần thông tin qua giao diện browser, dùng API chính thức **khi đã có quyền**, lập shortlist tuyển dụng, chuẩn bị nội dung, review câu trả lời và quản lý trạng thái xử lý.
+Threads Standalone là công cụ chạy **cục bộ trên máy tính**. Workflow S1–S5 tập trung vào permalink do operator cung cấp, shortlist/draft riêng tư, exact-target browser handoff có xác nhận và journal outcome local. Các lệnh API/Nurture/mutation đã có là luồng riêng, có thể gọi API hoặc tạo remote effect khi operator chạy với quyền phù hợp.
 
 **Nguyên tắc:** Mỗi tài khoản phải thuộc sở hữu khách hàng hoặc được ủy quyền hợp pháp; người dùng chịu trách nhiệm kiểm tra nội dung và đích gửi. Không tạo tương tác giả, spam hoặc dùng phần mềm vượt challenge/CAPTCHA. Các hoạt động đọc/ghi tự động trên website chỉ được kích hoạt khi nền tảng cho phép hành vi tương ứng.
 
-### Trạng thái chức năng sau Micro-slice 1
+### Trạng thái hiện tại sau Micro-slice 5
 
 | Chức năng | Trạng thái |
 | --- | --- |
-| Tạo local account, đặt bí danh, tách Chromium profile theo UUID | **Đã có mã nguồn; synthetic-tested** |
-| Mở Chromium để người dùng tự đăng nhập | **Đã có mã nguồn; chưa live-verified trong repo mới** |
-| Các lệnh `profile`, `thread`, `feed` (tối đa 20 permalink) | **Đã có mã nguồn; synthetic-tested**, mỗi lệnh đóng browser sau khi xong |
-| Mở một thread chính xác và giữ Chromium cho operator review | **Có ở Micro-slice 1; synthetic-tested; chưa live-verified**; actor identity luôn là `UNKNOWN_IDENTITY` |
-| Tìm kiếm bài qua browser và đọc hội thoại trên Threads thật | **Chưa được bật**; UI selector chưa xác minh, chỉ có adapter/fixture synthetic ở S2 |
-| Chuẩn hóa permalink do người vận hành nhập | **Có helper offline ở S2**, chưa nối vào CLI hoặc hàng đợi tuyển dụng |
-| Tìm kiếm/mentions/replies thông qua official Threads API | **Đã có mã nguồn**, phụ thuộc quyền token và endpoint |
-| Nurture discovery, ranking, dedupe, cooldown | **Đã có mã nguồn**, hiện sử dụng **API** thay vì browser |
-| Review, áp dụng trả lời/đăng bài qua API | **Đã có mã nguồn**, có thể phát sinh tác động thật; **không sử dụng khi chưa được duyệt** |
-| Browser điền/gửi reply | **Chưa có**; hành vi tự động cần kiểm tra quyền Meta riêng |
-| Customer demo launcher | **Chỉ synthetic, không đăng nhập và không gửi thật** |
+| Tạo local account, đặt alias, tách Chromium profile theo UUID | **Có; synthetic-tested**. Ví dụ trong tài liệu chỉ dùng alias synthetic |
+| S1: mở exact thread và giữ Chromium cho operator | **Có; fake-browser/synthetic-tested; chưa live UAT**. Actor luôn `UNKNOWN_IDENTITY` |
+| S2: search/conversation adapter | **Fixture synthetic-only**; chưa có live selector hoặc browser-search CLI |
+| S3: `manual-list` rồi `manual-review` | **CLI offline đã nối**; danh sách canonical/dedup trước khi chọn; draft/context chỉ in trong private TTY |
+| S4: `manual-handoff`, `manual-status`, `manual-record` | **Có; synthetic-tested**; exact target/SHA, xác nhận `OPEN`/`RECORD`, journal `UNVERIFIED`, không auto-fill/send |
+| S5: integrated CLI flow, installed-wheel smoke, docs/runbook | **Synthetic-only**; không mở Chromium thật hoặc gọi network/API trong test |
+| Đọc/ghi Threads bằng official API và Nurture | **Lệnh riêng đã có**; có thể truy cập API hoặc tạo remote effect tùy lệnh, credentials và quyền |
+| Browser tự điền/gửi reply, tự động engagement | **Không có trong S1–S5**; không hứa khả năng hoặc quyền sử dụng |
+
+S1–S5 **synthetic-ready, chưa production-ready**. Meta Terms/compliance permission cho automated browser reads/actions, App Review cho capability API cần review riêng. Live Threads UAT, kiểm tra root/profile/account thật và các issue #18/#46 chưa được thực hiện trong checkpoint này.
 
 ### Trạng thái Micro-slice 2 — synthetic-only
 
 - Adapter tìm kiếm và đọc hội thoại chỉ nhận dữ liệu fixture/fake engine. Chưa có selector Threads thật và không có lệnh `browser search` hay `browser scan`.
 - Search yêu cầu query do operator cung cấp (1–120 ký tự), tối đa 5 batch, 100 candidate đầu vào và 20 kết quả; excerpt tối đa 500 ký tự. Đọc hội thoại nhận đúng permalink, tối đa 100 candidate và trả tối đa 20 observation.
 - Kết quả hội thoại chỉ ghi `parent_ref` khi parent xuất hiện và khớp rõ trong fixture. Thiếu parent hoặc ngữ cảnh chưa hoàn chỉnh được đánh dấu `PARTIAL`/`UNKNOWN`.
-- Helper permalink hoạt động offline, chỉ nhận URL `https://www.threads.com` hoặc path tương đối có dạng post hợp lệ; query tracking nằm trong allowlist được loại khỏi kết quả. Helper đánh dấu `source=MANUAL_URL`, `context_status=UNKNOWN` và không ghi hàng đợi/state.
+- Helper permalink chạy offline và hiện được CLI S3 dùng trong `manual-list`/`manual-review`; chỉ nhận URL `https://www.threads.com` hoặc path tương đối đúng dạng post, chuẩn hóa query tracking trong allowlist, đánh dấu `source=MANUAL_URL` và context `UNKNOWN`.
 - S2 chỉ synthetic-tested; **chưa live-verified**. Không dùng adapter fixture để suy ra Threads thật cho phép hoặc hỗ trợ tự động thu thập dữ liệu.
 
 ### Trạng thái Micro-slice 3 — offline manual review
@@ -43,7 +42,14 @@ Threads Standalone là công cụ chạy **cục bộ trên máy tính**, giúp 
 - Operator phải chỉ định `--select` (đánh số từ 1) trong `manual-review`. Author chỉ được suy ra từ permalink và luôn là **chưa xác minh**; URL không tạo nội dung bài, điểm liên quan, remote ID hay trạng thái API/Nurture.
 - Draft do operator tự viết/chỉnh sửa trong file UTF-8, tối đa 500 ký tự; không có AI. Context tùy chọn cũng do operator cung cấp và luôn có mức đầy đủ `UNKNOWN`. Review hiển thị hash SHA-256 và `NOT_SENT`.
 - CLI chỉ chạy trong terminal riêng tư tương tác; từ chối CI và luồng có stdout/stderr/stdin chuyển hướng. Shortlist, draft, context và URL chỉ được in ở `stderr` terminal sau khi kiểm tra TTY. Lệnh không gọi API/browser và không ghi queue, receipt, journal hay Nurture state.
-- S3 synthetic-tested; **chưa live-verified**. S1 browser handoff là một lệnh riêng, chỉ dùng sau phê duyệt live riêng theo #18/#46 và operator phải tự xác minh actor/target.
+- S3 synthetic-tested; **chưa live-verified**. `manual-list` và `manual-review` offline không đồng nghĩa với quyền lấy dữ liệu Threads. S1 browser handoff là thao tác network riêng, chỉ dùng sau phê duyệt live riêng theo #18/#46 và operator phải tự xác minh actor/target.
+
+### Trạng thái Micro-slice 4–5 — synthetic-only
+
+- `manual-handoff` recheck account, selection, canonical target và SHA của draft S3; yêu cầu `--confirm-target`, `--interactive`, rồi literal `OPEN`. Sau `OPEN`, journal ghi `HANDOFF_UNRESOLVED` bền vững **trước khi** browser khởi động. Persistence lỗi hoặc lock bận thì browser không mở.
+- Handoff chỉ điều hướng đến một target đã duyệt. Không mở composer, tự điền draft hoặc nhấn Send. Browser đóng bình thường, crash, Ctrl+C hay EOF không chứng minh đã/ chưa gửi. `UNKNOWN_IDENTITY` luôn được hiển thị vì phần mềm không xác thực actor đang đăng nhập.
+- `manual-status` chỉ đọc journal local. `manual-record` yêu cầu attempt ID đang pending, SHA không đổi và nhập đúng `RECORD`; các outcome `ABORTED_NOT_SENT`, `AMBIGUOUS`, `OPERATOR_REPORTED_SENT_UNVERIFIED` đều mang `UNVERIFIED`. Chỉ `ABORTED_NOT_SENT` mới cho phép handoff sau; hai outcome còn lại chặn thử lại.
+- S5 thêm integrated CLI synthetic test chạy với fake browser engine và temporary root; wheel smoke kiểm tra import từ site-packages ngoài checkout. **Không có live Threads login, browser, API, gửi reply hay dữ liệu khách hàng trong test.** Kết quả synthetic không phải live UAT hoặc xác nhận quyền nền tảng.
 
 ## 2. Yêu cầu máy tính
 
@@ -133,7 +139,7 @@ Không chạy quét feed/search liên tục hoặc sử dụng browser tự thu 
 
 ## 7. Làm việc với các token tester và recruitment API (tùy chọn)
 
-**Không bắt buộc có App Review để sử dụng các chức năng browser thủ công.** Nếu đơn vị vận hành đã có token tester được cấp quyền hợp lệ, một số thao tác API có thể chạy theo đúng scope đã được xác minh; không suy diễn mọi endpoint đều khả dụng.
+Không suy ra rằng browser handoff thủ công được miễn khỏi điều khoản nền tảng hoặc review compliance. Phải xác minh riêng điều kiện áp dụng trước mọi browser network operation. Nếu đơn vị vận hành đã có token tester được cấp quyền hợp lệ, một số thao tác API có thể chạy theo đúng scope đã được xác minh; không suy diễn mọi endpoint đều khả dụng.
 
 **Chỉ sau GO riêng cho binding token và API reads**, dùng tên biến môi trường (không ghi giá trị token vào lệnh hoặc Git):
 
@@ -160,91 +166,106 @@ uv run --locked python scripts/run_recruitment.py --account test-a --observe
 
 `--shortlist` là danh sách ứng viên tạm thời, không tự tạo draft hoặc gửi reply. `--observe` có ghi local state, dù không gửi Threads reply. Không dùng `--apply-reply-file`, `--apply-post-file`, `threads-local reply` hoặc `threads-local post` nếu không được cấp quyền cụ thể cho account, target và nội dung.
 
-## 8. Quy trình operator cho các chức năng đã có
+## 8. Quy trình browser-first MVP — sáu bước
 
-### Review permalink và draft offline (Micro-slice 3)
+### 1. Chuẩn bị root và account synthetic
 
-1. Chọn alias của account local đã tạo trước đó. Lệnh chỉ đọc alias/UUID; account không được chia sẻ giữa các alias.
-2. Dùng nguồn permalink mà operator được phép sử dụng. Tạo file UTF-8 riêng tư, mỗi dòng một URL; có thể có dòng trống. Không đặt file này, draft hoặc context vào GitHub/repository.
+Chỉ dùng root mới nằm ngoài checkout và account alias synthetic. Không dùng profile, cookie, account thật, dữ liệu khách hàng hoặc thư mục của sản phẩm cũ trong phát triển, kiểm thử hay UAT chưa được phê duyệt:
 
-   Ví dụ synthetic cho `targets.txt`:
+```powershell
+$sampleId = [Guid]::NewGuid().ToString('N')
+$sampleRoot = Join-Path $env:TEMP "threads-standalone-synthetic-$sampleId"
+$env:THREADS_LOCAL_DATA_ROOT = Join-Path $sampleRoot 'data'
+$inputRoot = Join-Path $sampleRoot 'inputs'
+New-Item -ItemType Directory -Path $inputRoot | Out-Null
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+$targetsFile = Join-Path $inputRoot 'targets.txt'
+$draftFile = Join-Path $inputRoot 'draft.txt'
+[System.IO.File]::WriteAllText($targetsFile, "https://www.threads.com/@synthetic/post/fake_01`nhttps://www.threads.com/@synthetic/post/fake_02?utm_source=synthetic`n", $utf8NoBom)
+[System.IO.File]::WriteAllText($draftFile, 'Synthetic operator-authored draft.', $utf8NoBom)
+uv run --locked threads-local account add synthetic
+uv run --locked threads-local account list
+```
 
-   ```text
-   https://www.threads.com/@synthetic/post/fake_01
-   https://www.threads.com/@synthetic/post/fake_02?utm_source=operator
-   ```
+Nếu alias đã tồn tại trong root synthetic, dùng root temporary khác hoặc alias synthetic mới; không xóa journal/profile để làm sạch một attempt chưa resolve.
 
-   Có 1–20 dòng không trống, tối đa 64 KiB tổng file và tối đa 2048 byte/ký tự mỗi URL. Chỉ nhận UTF-8 không BOM và permalink đúng host `www.threads.com`; query tracking được S2 cho phép sẽ bị loại khi chuẩn hóa. URL trùng được gộp ổn định và lệnh in số dòng gốc ánh xạ tới mục shortlist còn lại. URL sai hoặc dữ liệu mơ hồ làm lệnh dừng.
+### 2. Nhập permalink và xem shortlist trước khi chọn
 
-3. Mở PowerShell tương tác riêng tư, không chuyển hướng stdin/stdout/stderr và không chạy trong CI. Xem shortlist trước; lệnh này không cần draft:
+Operator tạo file UTF-8 riêng tư, mỗi dòng một permalink. Ví dụ bên dưới là chuỗi synthetic để dùng trong lệnh offline, không phải post thật:
 
-   ```powershell
-   uv run --locked threads-local recruitment manual-list test-a `
-     --targets-file .\targets.txt
-   ```
+PowerShell block ở bước 1 đã tạo file synthetic `targets.txt` dưới `%TEMP%`, không nằm trong repo. Cấu trúc nội dung:
 
-   Lệnh in danh sách canonical một-based và ánh xạ các dòng trùng. Chọn đúng một số thứ tự từ danh sách này; không cần đoán vị trí trước khi thấy shortlist.
+```text
+https://www.threads.com/@synthetic/post/fake_01
+https://www.threads.com/@synthetic/post/fake_02?utm_source=synthetic
+```
 
-4. Tự viết/chỉnh sửa draft trong `draft.txt`; tối đa 500 ký tự. Context tùy chọn trong `context.txt` tối đa 4000 ký tự/16 KiB. Hai file phải là UTF-8 không BOM, không chứa control character hoặc ký tự vô hình nguy hiểm. Draft không được AI tạo; context chỉ là nội dung operator tự quan sát/cung cấp, không được app đọc từ Threads.
-5. Chạy review trong terminal riêng tư. Dùng URL canonical đúng dòng shortlist cùng `--select`; `--confirm-target` tùy chọn nhưng được khuyến nghị để lệnh dừng nếu file target đổi sau khi xem danh sách:
+File nhận 1–20 URL không rỗng, tối đa 64 KiB tổng, tối đa 2048 byte mỗi URL, UTF-8 không BOM và URL đúng host/path. Query tracking được allowlist loại khi canonicalize. Post ID giữ nguyên phân biệt hoa/thường. URL trùng được gộp theo thứ tự đầu tiên; dữ liệu sai hoặc mơ hồ làm lệnh dừng.
 
-   ```powershell
-   uv run --locked threads-local recruitment manual-review test-a `
-     --targets-file .\targets.txt `
-     --select 2 `
-     --confirm-target "https://www.threads.com/@synthetic/post/fake_02" `
-     --draft-file .\draft.txt `
-     --context-file .\context.txt
-   ```
+Trong PowerShell riêng tư, không pipe/redirect stdin, stdout, stderr và không chạy trong CI:
 
-   Bỏ `--context-file` nếu chưa có context. `--select` là số thứ tự **một-based** trong shortlist vừa xem; bắt buộc chọn chính xác một mục, không có chọn mặc định. Khi có `--confirm-target`, giá trị phải khớp chính xác URL canonical của mục đã chọn.
+```powershell
+uv run --locked threads-local recruitment manual-list synthetic `
+  --targets-file $targetsFile
+```
 
-6. Review chỉ in ra `stderr` của terminal private: alias và UUID, actor `UNKNOWN_IDENTITY`, URL canonical, author chỉ từ permalink (chưa xác minh), provenance `MANUAL_URL`, context `OPERATOR_SUPPLIED`/`NONE` với completeness `UNKNOWN`, toàn văn draft, hash SHA-256 và `NOT_SENT`. Thay account, target hoặc draft làm thay hash; chỉnh file rồi chạy lại để review phiên bản mới.
-7. Lệnh offline này không mở Chromium, gọi API, đăng nhập, gửi reply, hoặc ghi queue/state/journal/receipt. `NOT_SENT` không phải là quyền gửi và không chứng minh danh tính actor.
-8. Micro-slice 4 nối review S3 với đúng lệnh S1 bằng SHA đã duyệt. Từ terminal riêng tư, chạy lệnh dưới đây sau khi thay các giá trị bằng shortlist, URL canonical và SHA vừa review:
+Lệnh chỉ đọc file và local account, không gọi browser/API, không ghi state. Shortlist canonical một-based và mapping dòng trùng in lên `stderr` terminal riêng tư. Operator chọn mục từ danh sách vừa xem.
 
-   ```powershell
-   $approvalSha = Read-Host "Nhập SHA-256 chính xác từ manual-review"
-   uv run --locked threads-local recruitment manual-handoff test-a `
-     --targets-file .\targets.txt `
-     --select 2 `
-     --confirm-target "https://www.threads.com/@synthetic/post/fake_02" `
-     --draft-file .\draft.txt `
-     --context-file .\context.txt `
-     --approve-sha $approvalSha `
-     --interactive
-   ```
+### 3. Tự viết draft và duyệt đúng target
 
-   Bỏ `--context-file` nếu không dùng context. Lệnh đọc lại account, shortlist, draft và context, tính lại SHA S3, rồi in account alias/UUID, actor `UNKNOWN_IDENTITY`, exact target và draft vào `stderr` riêng tư. Chỉ dòng `OPEN` rồi Enter mới tiếp tục. Ngay sau xác nhận này, trước khi khởi tạo browser, lệnh ghi bền vững sự kiện `HANDOFF_UNRESOLVED` vào journal riêng và in `attempt_id`; nếu journal ghi lỗi hoặc đang bị khóa, Chromium không mở. Trong browser, operator tự kiểm tra account và target. Công cụ không điền nội dung, tìm composer hoặc nhấn Send. Đóng browser bình thường, crash hoặc mất điện đều không tự ghi outcome: attempt vẫn `HANDOFF_UNRESOLVED` và chặn handoff tiếp theo. `HANDOFF_CLOSED_ACTION_UNVERIFIED` chỉ cho biết phiên đã đóng; không xác nhận có gửi hay không.
+Draft trong file UTF-8 do operator tự viết/chỉnh sửa, tối đa 500 ký tự. Context tùy chọn do operator cung cấp, tối đa 4000 ký tự/16 KiB; app không lấy context từ Threads. Không đặt target file, draft, context trong repository, GitHub, CI hay thư mục chia sẻ.
 
-9. Trước khi mở lại target, operator bắt buộc phải resolve attempt hiện tại. Dùng `manual-status` để xem `status=HANDOFF_UNRESOLVED` và `attempt_id`; nhập đúng attempt ID đã in khi handoff, duyệt lại đúng account/target/draft/context để lấy SHA hiện tại, rồi chạy `manual-record` và nhập chính xác `RECORD`:
+```powershell
+uv run --locked threads-local recruitment manual-review synthetic `
+  --targets-file $targetsFile `
+  --select 2 `
+  --confirm-target "https://www.threads.com/@synthetic/post/fake_02" `
+  --draft-file $draftFile
+```
 
-   ```powershell
-   $attemptId = Read-Host "Nhập attempt_id đang HANDOFF_UNRESOLVED từ manual-status"
-   $approvalSha = Read-Host "Nhập SHA-256 chính xác từ manual-review"
-   uv run --locked threads-local recruitment manual-record test-a `
-     --targets-file .\targets.txt `
-     --select 2 `
-     --confirm-target "https://www.threads.com/@synthetic/post/fake_02" `
-     --draft-file .\draft.txt `
-     --context-file .\context.txt `
-     --approve-sha $approvalSha `
-     --attempt-id $attemptId `
-     --outcome ABORTED_NOT_SENT
-   ```
+Bỏ `--context-file` nếu không có context. `--select` bắt buộc là số một-based trong shortlist; `--confirm-target` phải khớp chính xác permalink canonical ở mục đó. Output riêng tư gồm full draft, canonical target, author chỉ suy ra từ permalink (chưa xác minh), actor `UNKNOWN_IDENTITY`, context `OPERATOR_SUPPLIED`/`NONE` với completeness `UNKNOWN`, trạng thái `NOT_SENT` và SHA-256.
 
-   `--attempt-id` phải khớp attempt đang pending của đúng account và target; attempt cũ không thể resolve attempt mới. `--outcome` nhận `ABORTED_NOT_SENT`, `OPERATOR_REPORTED_SENT_UNVERIFIED` hoặc `AMBIGUOUS`. Chỉ chọn `ABORTED_NOT_SENT` khi operator biết chắc chưa gửi; đây là lựa chọn duy nhất cho phép handoff mới. Nếu có thể đã gửi nhưng không xác định được, chọn `AMBIGUOUS`; nếu operator tự khai đã gửi, chọn `OPERATOR_REPORTED_SENT_UNVERIFIED`. Hai trạng thái này chặn handoff tiếp theo. Cả ba đều là lời khai của operator, luôn mang `UNVERIFIED`, không phải receipt hay bằng chứng gửi. Journal nằm riêng trong `manual_recruitment_v1`; nó chỉ lưu account UUID, fingerprint target, SHA draft, attempt/event ID, thời điểm và trạng thái, không lưu URL, draft hay context.
+SHA này gắn với account UUID + canonical target URL + draft cuối. Context không thuộc hash, và software không xác thực actor nên identity cũng không thuộc hash. Thay account, target hoặc draft yêu cầu review lại. `manual-list`/`manual-review` chỉ chạy offline: không search, mở browser, gọi API, gửi reply hoặc ghi queue/draft/state.
 
-10. Xem trạng thái target trong terminal riêng tư bằng lệnh read-only sau; shortlist và target phải khớp chính xác:
+### 4. Yêu cầu exact browser handoff sau phê duyệt riêng
 
-   ```powershell
-   uv run --locked threads-local recruitment manual-status test-a `
-     --targets-file .\targets.txt `
-     --select 2 `
-     --confirm-target "https://www.threads.com/@synthetic/post/fake_02"
-   ```
+> **Không chạy lệnh này trong test, sample dry run, CI hoặc checkpoint synthetic.** Lệnh mở headed Chromium và điều hướng qua mạng tới target thật nếu operator đưa URL thật. Chỉ dùng sau phê duyệt live riêng cho account, target và nội dung, và chỉ khi hoạt động đó được nền tảng cho phép.
 
-   Lệnh này chỉ đọc journal, không xóa hoặc resolve attempt. Nếu trạng thái còn `HANDOFF_UNRESOLVED`, phải dùng đúng `attempt_id` với `manual-record`; không chạy lại `manual-handoff` để thử lại. Mọi kết quả đều là `UNVERIFIED`, kể cả lời khai `OPERATOR_REPORTED_SENT_UNVERIFIED`. S4 handoff/outcome hiện chỉ được kiểm thử với browser giả và dữ liệu tổng hợp; không chạy trên Threads thật nếu chưa có phê duyệt live riêng. Hướng dẫn này không cấp quyền truy cập tự động hay gửi nội dung. S1 vẫn không tự điền hoặc gửi reply.
+Không chạy command handoff với target synthetic trong ví dụ, test hoặc sample dry run. Khi có phê duyệt live riêng, operator tự tạo command từ private files và dùng `threads-local recruitment manual-handoff ALIAS` cùng `--targets-file`, `--select`, `--confirm-target` (exact canonical permalink), `--draft-file`, `--approve-sha` (đúng SHA đã review), và `--interactive`. Chỉ literal `OPEN` rồi Enter mới tiếp tục. Lệnh recheck alias/account UUID, selection, canonical URL, full draft và SHA. Sau `OPEN`, trước khi khởi động Chromium, journal riêng ghi bền vững `HANDOFF_UNRESOLVED` và in attempt ID. Nếu journal lỗi, corrupt, lock bận hoặc approval thay đổi thì browser không mở. Journal không lưu raw URL/draft/context.
+
+### 5. Operator tự xác minh account và target trong browser
+
+Browser mở đúng thread qua S1 và kiểm tra target/author theo locator hiện có. Phần mềm không thể khẳng định account nào đang đăng nhập; màn hình luôn ghi `UNKNOWN_IDENTITY`. Operator phải tự kiểm tra profile/account và exact target. Nếu và chỉ nếu có quyền riêng, operator tự thao tác bằng native UI chính thức. Không có auto-fill, composer automation hoặc click Send.
+
+Đóng browser bình thường, crash, Ctrl+C, mất mạng hoặc không có attestation **không xác định** đã gửi hay chưa. Attempt vẫn pending; không chạy lại handoff để thử. `HANDOFF_CLOSED_ACTION_UNVERIFIED` chỉ nói browser đã đóng.
+
+### 6. Xem status và resolve đúng attempt bằng `RECORD`
+
+Status chỉ đọc journal local, không kiểm tra Threads/API và không phải receipt:
+
+```powershell
+uv run --locked threads-local recruitment manual-status synthetic `
+  --targets-file $targetsFile `
+  --select 2 `
+  --confirm-target "https://www.threads.com/@synthetic/post/fake_02"
+```
+
+Nếu thấy `HANDOFF_UNRESOLVED`, lấy attempt ID hiện hành và SHA vẫn khớp, rồi record khai báo đúng sự thật:
+
+```powershell
+$attemptId = Read-Host "Nhập attempt_id hiện đang pending từ manual-status"
+$approvalSha = Read-Host "Nhập SHA-256 đã duyệt"
+uv run --locked threads-local recruitment manual-record synthetic `
+  --targets-file $targetsFile `
+  --select 2 `
+  --confirm-target "https://www.threads.com/@synthetic/post/fake_02" `
+  --draft-file $draftFile `
+  --approve-sha $approvalSha `
+  --attempt-id $attemptId `
+  --outcome ABORTED_NOT_SENT
+```
+
+`manual-record` chỉ ghi sau exact `RECORD`, attempt ID hiện tại, account/target chính xác và cùng SHA. Outcome chọn được là `ABORTED_NOT_SENT`, `AMBIGUOUS`, `OPERATOR_REPORTED_SENT_UNVERIFIED`; tất cả luôn `UNVERIFIED`, không phải official receipt/API result. Chỉ khai `ABORTED_NOT_SENT` khi biết chắc chưa gửi; đây là outcome duy nhất cho phép handoff sau. Nếu có thể đã gửi nhưng không biết, chọn `AMBIGUOUS`; nếu operator tự khai đã gửi, chọn `OPERATOR_REPORTED_SENT_UNVERIFIED`. Hai trạng thái này chặn mọi handoff sau. Attempt cũ không resolve được attempt mới. Browser close không bao giờ tự tạo kết quả gửi.
 
 ### API-driven Nurture
 
@@ -257,13 +278,18 @@ uv run --locked python scripts/run_recruitment.py --account test-a --observe
 | Sai account hoặc không chứng minh được identity | **STOP**, không soạn/gửi; mở lại đúng profile, người dùng tự kiểm tra |
 | Mất session / challenge / CAPTCHA | **STOP**; operator tự giải quyết qua giao diện chính thức |
 | Giao diện thay đổi / không tìm được target | **STOP**; không dùng locator đoán, không chọn kết quả gần đúng |
-| Browser crash / mất mạng | Đóng tác vụ, kiểm tra trạng thái; **không tự gửi lại** |
-| `ACCOUNT_BUSY` | Đợi hoặc kết thúc phiên hiện có; không xóa lock tùy tiện |
+| `NO_RECORD` | Chỉ có nghĩa journal local chưa có bản ghi cho account/target đó; không chứng minh điều gì đã/ chưa xảy ra online |
+| `HANDOFF_UNRESOLVED` | **STOP**, không handoff lại. Chỉ resolve đúng attempt hiện hành với cùng SHA và literal `RECORD` |
+| Browser đóng / crash / Ctrl+C / EOF / mất mạng sau `OPEN` | Không suy luận gửi hay chưa gửi. Giữ journal; đọc `manual-status`, không retry; chỉ khai outcome operator biết chắc |
+| `AMBIGUOUS` hoặc `OPERATOR_REPORTED_SENT_UNVERIFIED` | **STOP**, không thử gửi/handoff lại; hai outcome này chặn attempt mới |
+| `MANUAL_OUTCOME_INVALID` hoặc journal corrupt/unreadable | **STOP**; giữ nguyên toàn bộ root, không xóa hoặc sửa tay journal |
+| `MANUAL_OUTCOME_BUSY` / `ACCOUNT_BUSY` | Chờ foreground process hiện tại; không xóa lock file và không mở phiên song song |
+| Attempt ID cũ / `MANUAL_OUTCOME_ATTEMPT_MISMATCH` | Đọc status riêng tư, chỉ dùng attempt đang pending; attempt `ABORTED_NOT_SENT` cũ không resolve attempt mới |
 | Target khác bản preview | Hủy approval, đọc lại nội dung và duyệt lại |
 | Không biết reply đã gửi thành công hay chưa | Đánh dấu **AMBIGUOUS/UNVERIFIED**, kiểm tra thủ công, không gửi lặp |
 | Nghi lộ token/cookie | Dừng thao tác, thu hồi session/token theo quy trình chính thức và thông báo quản trị |
 
-Có thể dùng `Ctrl+C` để dừng foreground command; việc dừng tiến trình sau một action remote không đủ chứng minh action đó chưa thực hiện.
+Không xóa outcome journal hoặc account profile trong bước cleanup. Backup root phải được bảo vệ như dữ liệu riêng tư vì browser profile có thể chứa cookies/session. Khi rollback code, dừng process và giữ nguyên data root; nếu version cũ không được xác nhận tương thích với namespace journal thì dừng để review, không xóa/hạ journal để ép CLI chạy tiếp. Xem [release readiness runbook](docs/BROWSER_MVP_RELEASE_READINESS.md) để biết quy trình evidence và release gates.
 
 ## 10. Kiểm thử trước khi bàn giao cho khách hàng
 
@@ -278,11 +304,13 @@ uv run --locked pytest
 uv build
 ```
 
-Checklist bàn giao sau khi Codex hoàn tất: đúng version/commit; cài wheel và Chromium theo quy trình được duyệt; hai profile riêng; login manual; case sai account/target/challenge/timeout; một luồng từ permalink đến draft rồi mở đúng target; không gửi tự động; không log bí mật; operator có quyền dừng. Báo cáo rõ những bước chỉ synthetic pass và những bước live UAT đã được phê duyệt/kiểm chứng.
+CI wheel smoke phải chạy ngoài checkout, không `PYTHONPATH`, với wheel artifact `0.1.0` và integrated flow trên fake browser. Cũng phải PASS hosted Windows/Ubuntu QA và full-history Gitleaks trước khi chấp nhận merge. S5 test **không** cài Chromium hoặc khởi chạy real browser.
+
+S5 local result trên Windows/Python 3.14.7: locked Ruff, format, Pyright, full synthetic pytest, build và installed-wheel smoke **PASS**; source suite `1266 passed, 6 skipped`, wheel suite `1260 passed, 12 skipped`. Skip gồm kiểm tra symlink bị hạn chế quyền Windows và test chỉ có trong source checkout; xem `pytest` summary/runbook để đối chiếu. Hosted Windows/Ubuntu và full-history Gitleaks chỉ PASS khi status trên đúng Draft PR head xác nhận. Live Threads UAT là **NOT RUN**. Local-root/security approval, account owner/actor/target proof, terms/compliance permission, Meta App Review nếu dùng gated API capability, provenance/license và issues #18/#46 vẫn **PENDING**. Không gắn nhãn production-ready trước khi các gate tương ứng được giải quyết.
 
 ## 11. Trạng thái App Review và đường nâng cấp
 
-**Hiện tại:** browser-guided operator workflow là đường sử dụng khi chưa hoàn tất App Review; các API reads chỉ dùng theo quyền tester thực tế đã được xác minh. **Tương lai:** khi Meta App Review được phê duyệt, dùng adapter official API cho các capability tương ứng. Không cần đổi mô hình local account, Nurture ranking/dedupe/cooldown hoặc quy trình human review.
+**Hiện tại:** S1–S5 chỉ đạt synthetic readiness, chưa production-ready. Tài liệu này không cấp quyền tự động thu thập dữ liệu hoặc điều khiển website. Cần xác minh riêng điều khoản nền tảng và phê duyệt compliance trước automated browser reads/actions; official API capability cần App Review/permission tương ứng. Live UAT và issues #18/#46 vẫn là gate riêng. Lịch sử chuyển mã nguồn và quyết định license công khai cũng chưa được giải quyết: xem [PROVENANCE_DECISION.md](docs/PROVENANCE_DECISION.md); không suy ra quyền tái sử dụng từ việc repository public.
 
 Tài liệu tham khảo: [Meta Terms](https://www.facebook.com/terms/) · [Playwright persistent context](https://playwright.dev/python/docs/api/class-browsertype) · [Playwright locators](https://playwright.dev/python/docs/locators) · [README dự án](README.md).
 
