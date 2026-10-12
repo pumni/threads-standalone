@@ -17,6 +17,9 @@ from threads_platform.standalone.accounts import (
     LocalAccountStore,
     resolve_standalone_data_root,
 )
+from threads_platform.standalone.recruitment_content_calendar import (
+    render_recruitment_content_calendar,
+)
 from threads_platform.standalone.recruitment_content_planner import (
     RecruitmentContentPacketV1,
     RecruitmentContentPlannerError,
@@ -37,6 +40,7 @@ _COMMANDS = frozenset(
         "content-upcoming",
         "content-approve",
         "content-reject",
+        "content-calendar-export",
     }
 )
 _REVIEW_COMMANDS = frozenset({"content-show", "content-approve", "content-reject"})
@@ -129,6 +133,17 @@ def run_recruitment_content_cli(
     if command == "content-list":
         packets = planner.list(account.id).packets
         _write_packet_listing(output_stream, packets)
+        return 0
+
+    if command == "content-calendar-export":
+        ics = render_recruitment_content_calendar(planner.list(account.id))
+        binary_output = getattr(output_stream, "buffer", None)
+        if output_stream is sys.stdout and binary_output is not None:
+            output_stream.flush()
+            binary_output.write(ics.encode("utf-8"))
+            binary_output.flush()
+        else:
+            output_stream.write(ics)
         return 0
 
     if command == "content-due":

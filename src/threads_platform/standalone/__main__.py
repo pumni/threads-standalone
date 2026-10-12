@@ -868,7 +868,12 @@ def _build_parser() -> argparse.ArgumentParser:
     content_add_parser.add_argument("--scheduled-utc", required=True)
     content_add_parser.add_argument("--assert-rights", action="store_true")
     content_add_parser.add_argument("--assert-consent", action="store_true")
-    for content_command in ("content-list", "content-due", "content-upcoming"):
+    for content_command in (
+        "content-list",
+        "content-due",
+        "content-upcoming",
+        "content-calendar-export",
+    ):
         recruitment_commands.add_parser(content_command).add_argument("alias")
     for content_command in ("content-show", "content-approve", "content-reject"):
         content_parser = recruitment_commands.add_parser(content_command)
