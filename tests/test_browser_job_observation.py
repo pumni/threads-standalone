@@ -4,7 +4,8 @@ import ast
 import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
+from itertools import count
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -42,6 +43,7 @@ from threads_platform.standalone.recruitment_job_vacancy import (
     CompletenessBasis,
     ExtractionStatus,
     ObservationSource,
+    TextCompleteness,
     TextProvenance,
     VacancyClassification,
     extract_vietnamese_vacancies,
@@ -50,6 +52,8 @@ from threads_platform.standalone.recruitment_job_vacancy import (
 _ACCOUNT_ONE = UUID("00000000-0000-4000-8000-000000000101")
 _ACCOUNT_TWO = UUID("00000000-0000-4000-8000-000000000102")
 _QUERY = "tuyển dụng synthetic"
+_CAPTURE_IDS = count(1)
+_CAPTURED_AT = datetime(2026, 10, 13, tzinfo=UTC)
 
 
 def _url(index: int) -> str:
@@ -214,8 +218,13 @@ def _observe(
     selected_targets: Sequence[str] = (),
     clock: _FakeClock | None = None,
     stop: _FakeStop | None = None,
+    capture_id: str | None = None,
+    observed_at_utc: datetime = _CAPTURED_AT,
     limits: ObservationLimits = DEFAULT_OBSERVATION_LIMITS,
 ) -> BrowserJobObservationRunV1:
+    injected_capture_id = (
+        capture_id if capture_id is not None else f"capture-synthetic-{next(_CAPTURE_IDS):04d}"
+    )
     return observe_fake_job_feed(
         session,
         account_uuid=account_uuid,
@@ -223,6 +232,8 @@ def _observe(
         selected_targets=selected_targets,
         clock=clock or _FakeClock(),
         stop_signal=stop or _FakeStop(),
+        capture_id=injected_capture_id,
+        observed_at_utc=observed_at_utc,
         limits=limits,
     )
 
@@ -254,6 +265,7 @@ def test_captures_targets_before_virtualized_cards_are_evicted_and_opens_exact_s
         ("open", _url(9)),
     ]
     assert [item.canonical_post_url for item in result.observations] == [_url(2), _url(9)]
+    assert len({item.observation_id for item in result.observations}) == 2
     assert all(item.author_marker == "UNVERIFIED" for item in result.observations)
 
 
@@ -356,14 +368,104 @@ def test_accounts_with_same_target_have_separate_observations() -> None:
         {shared_target: _detail(shared_target, account_uuid=_ACCOUNT_TWO, author="account-two")},
     )
 
-    first_result = _observe(first, account_uuid=_ACCOUNT_ONE, selected_targets=(shared_target,))
-    second_result = _observe(second, account_uuid=_ACCOUNT_TWO, selected_targets=(shared_target,))
+    first_result = _observe(
+        first,
+        account_uuid=_ACCOUNT_ONE,
+        selected_targets=(shared_target,),
+        capture_id="capture-shared-accounts",
+    )
+    second_result = _observe(
+        second,
+        account_uuid=_ACCOUNT_TWO,
+        selected_targets=(shared_target,),
+        capture_id="capture-shared-accounts",
+    )
 
     assert first_result.status is second_result.status is ObservationRunStatus.COMPLETE
     assert first_result.captured_targets[0].account_uuid == _ACCOUNT_ONE
     assert second_result.captured_targets[0].account_uuid == _ACCOUNT_TWO
     assert first_result.observations[0].author_label == "account-one"
     assert second_result.observations[0].author_label == "account-two"
+    assert (
+        first_result.observations[0].observation_id != second_result.observations[0].observation_id
+    )
+
+
+@pytest.mark.parametrize(
+    ("second_body", "same_revision"),
+    [
+        ("Cần tuyển sales tại Đà Nẵng", True),
+        ("Cần tuyển kế toán tại Đà Nẵng", False),
+    ],
+)
+def test_each_capture_has_a_distinct_observation_id_and_content_revision(
+    second_body: str,
+    same_revision: bool,
+) -> None:
+    target = _url(1)
+    observed_at = datetime(2026, 10, 13, 8, tzinfo=UTC)
+    published_at = datetime(2026, 10, 12, 10, tzinfo=UTC)
+    first_session = _InMemorySession(
+        (_batch(0, (_card(1, target=target),)),),
+        {
+            target: _detail(
+                target, body="Cần tuyển sales tại Đà Nẵng", published_at_utc=published_at
+            )
+        },
+    )
+    second_session = _InMemorySession(
+        (_batch(0, (_card(1, target=target),)),),
+        {target: _detail(target, body=second_body, published_at_utc=published_at)},
+    )
+
+    first = _observe(
+        first_session,
+        selected_targets=(target,),
+        capture_id="synthetic-capture-one",
+        observed_at_utc=observed_at,
+    ).observations[0]
+    second = _observe(
+        second_session,
+        selected_targets=(target,),
+        capture_id="synthetic-capture-two",
+        observed_at_utc=observed_at,
+    ).observations[0]
+
+    assert first.observation_id != second.observation_id
+    assert (first.post_revision_id == second.post_revision_id) is same_revision
+    assert first.observed_at_utc == second.observed_at_utc == observed_at
+    assert first.published_at_utc == second.published_at_utc == published_at
+    assert first.observed_at_utc != first.published_at_utc
+
+
+@pytest.mark.parametrize("capture_id", ["", "capture id", "x" * 129])
+def test_invalid_capture_id_fails_before_reading_fake_session(capture_id: str) -> None:
+    session = _InMemorySession((_batch(0, (_card(1),)),))
+
+    result = _observe(session, capture_id=capture_id)
+
+    assert result.status is ObservationRunStatus.FAILED
+    assert result.reason_codes == (ObservationReasonCode.INVALID_CAPTURE_ID,)
+    assert session.events == []
+
+
+@pytest.mark.parametrize(
+    "capture_time",
+    [
+        datetime(2026, 10, 13, 8),
+        datetime(2026, 10, 13, 8, tzinfo=timezone(timedelta(hours=7))),
+    ],
+)
+def test_naive_or_non_utc_capture_time_fails_before_reading_fake_session(
+    capture_time: datetime,
+) -> None:
+    session = _InMemorySession((_batch(0, (_card(1),)),))
+
+    result = _observe(session, observed_at_utc=capture_time)
+
+    assert result.status is ObservationRunStatus.FAILED
+    assert result.reason_codes == (ObservationReasonCode.INVALID_CAPTURE_TIMESTAMP,)
+    assert session.events == []
 
 
 def test_parser_bridge_keeps_synthetic_provenance_and_original_unicode_spans() -> None:
@@ -386,6 +488,9 @@ def test_parser_bridge_keeps_synthetic_provenance_and_original_unicode_spans() -
     assert parser_input.text_provenance is TextProvenance.SYNTHETIC_FIXTURE_TEXT
     assert parser_input.completeness_basis is CompletenessBasis.FIXTURE_DECLARED
     assert parser_input.author_status is AuthorEvidenceStatus.UNVERIFIED
+    assert synthetic.status is PostObservationStatus.COMPLETE
+    assert synthetic.text_completeness is FakeBodyVisibility.FULL_VISIBLE
+    assert parser_input.text_completeness is TextCompleteness.COMPLETE
     assert parser_input.observed_text == text
     assert parsed.status is ExtractionStatus.EXTRACTED
     assert parsed.classification is VacancyClassification.RECRUITER_VACANCY
@@ -452,6 +557,38 @@ def test_partial_and_unknown_detail_states_are_not_upgraded(
     assert observation.status is expected_status
     assert observation.text_completeness is expected_completeness
     assert expected_reason in observation.reason_codes
+    if expected_reason is ObservationReasonCode.IMAGE_ONLY:
+        assert observation.visible_text is None
+        with pytest.raises(ValueError, match="^TEXT_UNAVAILABLE$"):
+            to_parser_observation(observation)
+
+
+@pytest.mark.parametrize(
+    ("body", "visibility"),
+    [
+        ("Cần tuyển sales", FakeBodyVisibility.FULL_VISIBLE),
+        ("Cần tuyển sales", FakeBodyVisibility.UNKNOWN),
+        (None, FakeBodyVisibility.FULL_VISIBLE),
+    ],
+)
+def test_contradictory_image_only_detail_fails_closed_without_observation(
+    body: str | None,
+    visibility: FakeBodyVisibility,
+) -> None:
+    target = _url(1)
+    detail = _detail(
+        target,
+        body=body,
+        body_visibility=visibility,
+        image_only=True,
+    )
+    session = _InMemorySession((_batch(0, (_card(1, target=target),)),), {target: detail})
+
+    result = _observe(session, selected_targets=(target,))
+
+    assert result.status is ObservationRunStatus.FAILED
+    assert result.reason_codes == (ObservationReasonCode.INVALID_SESSION_STATE,)
+    assert result.observations == ()
 
 
 def test_quote_relationship_and_author_are_separate_from_top_level_body() -> None:
@@ -509,17 +646,27 @@ def test_reply_keeps_parent_relationship_separate_and_does_not_merge_parent_text
     assert observation.parent_author_label == "parent-employer"
 
 
-def test_timestamp_is_retained_only_when_timezone_aware_and_normalized_to_utc() -> None:
+def test_capture_time_is_utc_and_separate_from_source_published_time() -> None:
     target = _url(1)
+    observed_at = datetime(2026, 10, 13, 8, tzinfo=UTC)
+    published_at = datetime(2026, 10, 12, 10, tzinfo=UTC)
     detail = _detail(
         target,
-        published_at_utc=datetime(2026, 10, 12, 10, tzinfo=UTC),
+        published_at_utc=published_at,
     )
     session = _InMemorySession((_batch(0, (_card(1, target=target),)),), {target: detail})
 
-    result = _observe(session, selected_targets=(target,))
+    result = _observe(
+        session,
+        selected_targets=(target,),
+        capture_id="capture-time-check",
+        observed_at_utc=observed_at,
+    )
 
-    assert result.observations[0].published_at_utc == datetime(2026, 10, 12, 10, tzinfo=UTC)
+    observation = result.observations[0]
+    assert observation.observed_at_utc == observed_at
+    assert observation.published_at_utc == published_at
+    assert observation.observed_at_utc != observation.published_at_utc
 
 
 def test_exact_text_cap_is_complete_but_over_cap_is_clipped_and_partial() -> None:

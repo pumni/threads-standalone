@@ -10,7 +10,7 @@ import hashlib
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from math import isfinite
 from typing import Literal, Protocol, cast
@@ -84,6 +84,8 @@ class ObservationReasonCode(StrEnum):
     INVALID_QUERY = "INVALID_QUERY"
     INVALID_TARGET = "INVALID_TARGET"
     INVALID_LIMITS = "INVALID_LIMITS"
+    INVALID_CAPTURE_ID = "INVALID_CAPTURE_ID"
+    INVALID_CAPTURE_TIMESTAMP = "INVALID_CAPTURE_TIMESTAMP"
     INVALID_SESSION_STATE = "INVALID_SESSION_STATE"
     SESSION_FAILURE = "SESSION_FAILURE"
     CLOCK_FAILURE = "CLOCK_FAILURE"
@@ -285,6 +287,7 @@ class BrowserJobObservationV1:
     account_uuid: UUID = field(repr=False)
     canonical_post_url: str = field(repr=False)
     local_card_id: str = field(repr=False)
+    observed_at_utc: datetime = field(repr=False)
     post_revision_id: str | None = field(default=None, repr=False)
     source: Literal["SYNTHETIC_FIXTURE"] = "SYNTHETIC_FIXTURE"
     text_provenance: Literal["SYNTHETIC_FIXTURE_TEXT"] = "SYNTHETIC_FIXTURE_TEXT"
@@ -377,6 +380,8 @@ def observe_fake_job_feed(
     selected_targets: Sequence[str],
     clock: FakeClock,
     stop_signal: FakeStopSignal,
+    capture_id: str,
+    observed_at_utc: datetime,
     limits: ObservationLimits = DEFAULT_OBSERVATION_LIMITS,
 ) -> BrowserJobObservationRunV1:
     """Capture bounded fake feed targets, then open only selected exact targets.
@@ -390,6 +395,14 @@ def observe_fake_job_feed(
         return state.result(ObservationRunStatus.FAILED, ObservationReasonCode.INVALID_LIMITS)
     if not isinstance(cast(object, account_uuid), UUID):
         return state.result(ObservationRunStatus.FAILED, ObservationReasonCode.INVALID_ACCOUNT)
+    raw_capture_id = cast(object, capture_id)
+    if not isinstance(raw_capture_id, str) or _LOCAL_ID_RE.fullmatch(raw_capture_id) is None:
+        return state.result(ObservationRunStatus.FAILED, ObservationReasonCode.INVALID_CAPTURE_ID)
+    capture_timestamp = _normalize_capture_timestamp(cast(object, observed_at_utc))
+    if capture_timestamp is None:
+        return state.result(
+            ObservationRunStatus.FAILED, ObservationReasonCode.INVALID_CAPTURE_TIMESTAMP
+        )
     raw_query = cast(object, query)
     if (
         not isinstance(raw_query, str)
@@ -572,6 +585,8 @@ def observe_fake_job_feed(
                 detail,
                 captured=expected_target,
                 detail_index=detail_index,
+                capture_id=raw_capture_id,
+                observed_at_utc=capture_timestamp,
                 max_text_codepoints=limits.max_text_codepoints,
             )
         )
@@ -786,6 +801,10 @@ def _validate_detail(
     image_only = cast(object, detail.image_only)
     if not isinstance(image_only, bool):
         return ObservationRunStatus.FAILED, ObservationReasonCode.INVALID_SESSION_STATE
+    if image_only and (
+        body not in (None, "") or body_visibility is FakeBodyVisibility.FULL_VISIBLE
+    ):
+        return ObservationRunStatus.FAILED, ObservationReasonCode.INVALID_SESSION_STATE
     published_at = cast(object, detail.published_at_utc)
     if published_at is not None and not isinstance(published_at, datetime):
         return ObservationRunStatus.FAILED, ObservationReasonCode.INVALID_SESSION_STATE
@@ -801,11 +820,24 @@ def _validate_detail(
     return None
 
 
+def _normalize_capture_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    try:
+        if value.tzinfo is None or value.utcoffset() != timedelta(0):
+            return None
+        return value.astimezone(UTC)
+    except Exception:  # noqa: BLE001 - invalid injected timestamps become a fixed reason code.
+        return None
+
+
 def _build_observation(
     detail: FakeJobPostDetailV1,
     *,
     captured: CapturedJobTargetV1,
     detail_index: int,
+    capture_id: str,
+    observed_at_utc: datetime,
     max_text_codepoints: int,
 ) -> BrowserJobObservationV1:
     body = detail.body
@@ -891,6 +923,8 @@ def _build_observation(
         "bj02-obs",
         str(captured.account_uuid),
         captured.canonical_post_url,
+        capture_id,
+        observed_at_utc.isoformat(),
         str(detail_index),
     )
     return BrowserJobObservationV1(
@@ -899,6 +933,7 @@ def _build_observation(
         account_uuid=captured.account_uuid,
         canonical_post_url=captured.canonical_post_url,
         local_card_id=captured.local_card_id,
+        observed_at_utc=observed_at_utc,
         author_label=detail.author_marker,
         visible_text=body,
         text_completeness=text_completeness,
