@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -45,6 +47,10 @@ _MAX_URL_BYTES = 2_048
 _MAX_SCHEDULE_HORIZON = timedelta(days=180)
 _NEAR_DUPLICATE_THRESHOLD = 0.86
 _NEAR_DUPLICATE_MIN_CHARS = 32
+_REVIEW_FINGERPRINT_DOMAIN = b"threads-standalone/recruitment-content-packet-fingerprint/v1\x00"
+_REVIEW_FINGERPRINT_PREFIX = "content-packet-v1:sha256:"
+_REVIEW_FINGERPRINT_RE = re.compile(r"content-packet-v1:sha256:[0-9a-f]{64}")
+_REVIEW_DECISIONS = frozenset({"APPROVE", "REJECT"})
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _TOP_LEVEL_KEYS = frozenset({"version", "account_uuid", "packets"})
 _PACKET_KEYS = frozenset(
@@ -124,6 +130,7 @@ class RecruitmentContentPlannerError(ValueError):
             "CONTENT_PLANNER_LIMIT_REACHED",
             "CONTENT_PLANNER_PRIVATE_CONTENT_REJECTED",
             "CONTENT_PLANNER_REVIEW_INVALID",
+            "CONTENT_PLANNER_REVIEW_STALE",
             "CONTENT_PLANNER_RIGHTS_REQUIRED",
             "CONTENT_PLANNER_SCHEDULE_INVALID",
             "CONTENT_PLANNER_SOURCE_INVALID",
@@ -197,6 +204,14 @@ class RecruitmentContentCreateResult:
     packet: RecruitmentContentPacketV1
     warnings: tuple[ContentDuplicateWarning, ...]
     created: bool
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RecruitmentContentReviewSnapshotV1:
+    """Immutable packet snapshot and versioned fingerprint for one review."""
+
+    packet: RecruitmentContentPacketV1
+    fingerprint: str
 
 
 def _reject_constant(_: str) -> NoReturn:
@@ -495,6 +510,104 @@ class RecruitmentContentPlannerStore:
                 return packet
         raise RecruitmentContentPlannerError("CONTENT_PLANNER_ENTRY_NOT_FOUND")
 
+    def get_review_snapshot(
+        self,
+        account_uuid: UUID,
+        packet_id: UUID,
+    ) -> RecruitmentContentReviewSnapshotV1:
+        """Read one immutable packet and its complete, versioned review fingerprint."""
+
+        account = _validate_account_id(account_uuid)
+        identifier = _validate_account_id(packet_id)
+        with self.account_lock(account):
+            root = self._required_root()
+            calendar = self._read_unlocked(root, account)
+            for packet in calendar.packets:
+                if packet.packet_id == identifier:
+                    return RecruitmentContentReviewSnapshotV1(
+                        packet=packet,
+                        fingerprint=self._review_fingerprint(packet),
+                    )
+        raise RecruitmentContentPlannerError("CONTENT_PLANNER_ENTRY_NOT_FOUND")
+
+    def review_if_unchanged(
+        self,
+        account_uuid: UUID,
+        packet_id: UUID,
+        *,
+        expected_fingerprint: str,
+        expected_editorial_status: ContentEditorialStatusV1,
+        decision: Literal["APPROVE", "REJECT"],
+        note: str | None = None,
+    ) -> RecruitmentContentPacketV1:
+        """Apply a confirmed editorial decision only to its unchanged packet snapshot."""
+
+        account = _validate_account_id(account_uuid)
+        identifier = _validate_account_id(packet_id)
+        if (
+            type(expected_fingerprint) is not str
+            or _REVIEW_FINGERPRINT_RE.fullmatch(expected_fingerprint) is None
+            or type(expected_editorial_status) is not str
+            or expected_editorial_status not in _EDITORIAL_STATUSES
+            or type(decision) is not str
+            or decision not in _REVIEW_DECISIONS
+        ):
+            raise RecruitmentContentPlannerError("CONTENT_PLANNER_INVALID")
+
+        if decision == "REJECT" and note is None:
+            raise RecruitmentContentPlannerError("CONTENT_PLANNER_REVIEW_INVALID")
+        normalized_note = _normalize_text(
+            note,
+            maximum=_MAX_REVIEW_NOTE_CHARS,
+            empty_ok=decision == "APPROVE",
+        )
+        if decision == "REJECT" and normalized_note is None:
+            raise RecruitmentContentPlannerError("CONTENT_PLANNER_REVIEW_INVALID")
+        if normalized_note is not None:
+            self._reject_private_content(normalized_note)
+
+        with self.account_lock(account):
+            root = self._required_root()
+            try:
+                calendar = self._read_unlocked(root, account)
+            except RecruitmentContentPlannerError:
+                # A packet that cannot be strictly reread is no longer the reviewed
+                # v1 snapshot. Fail closed without exposing document details.
+                raise RecruitmentContentPlannerError("CONTENT_PLANNER_REVIEW_STALE") from None
+
+            index = next(
+                (
+                    index
+                    for index, packet in enumerate(calendar.packets)
+                    if packet.packet_id == identifier
+                ),
+                None,
+            )
+            if index is None:
+                raise RecruitmentContentPlannerError("CONTENT_PLANNER_REVIEW_STALE")
+            current = calendar.packets[index]
+            current_fingerprint = self._review_fingerprint(current)
+            if (
+                current.account_uuid != account
+                or current.packet_id != identifier
+                or current.editorial_status != expected_editorial_status
+                or current.editorial_status != "DRAFT"
+                or not hmac.compare_digest(current_fingerprint, expected_fingerprint)
+            ):
+                raise RecruitmentContentPlannerError("CONTENT_PLANNER_REVIEW_STALE")
+
+            reviewed = max(self._now(), current.updated_at, current.created_at)
+            updated = replace(
+                current,
+                editorial_status=(
+                    "READY_FOR_MANUAL_PUBLICATION" if decision == "APPROVE" else "REJECTED"
+                ),
+                updated_at=reviewed,
+                reviewed_at=reviewed,
+                review_note=normalized_note,
+            )
+            return self._replace_packet(root, calendar, index, updated)
+
     def approve(
         self,
         account_id: UUID,
@@ -630,6 +743,25 @@ class RecruitmentContentPlannerStore:
             ),
         )
         return packet
+
+    @staticmethod
+    def _review_fingerprint(packet: RecruitmentContentPacketV1) -> str:
+        """Hash the complete persisted packet using a stable, domain-separated codec."""
+
+        try:
+            canonical = json.dumps(
+                RecruitmentContentPlannerStore._encode_packet(packet),
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8", errors="strict")
+        except TypeError, UnicodeError, ValueError:
+            raise RecruitmentContentPlannerError("CONTENT_PLANNER_INVALID") from None
+        if len(canonical) > _MAX_DOCUMENT_BYTES:
+            raise RecruitmentContentPlannerError("CONTENT_PLANNER_INVALID")
+        digest = hashlib.sha256(_REVIEW_FINGERPRINT_DOMAIN + canonical).hexdigest()
+        return f"{_REVIEW_FINGERPRINT_PREFIX}{digest}"
 
     def _normalize_attachment(
         self,

@@ -20,6 +20,16 @@ Writes use a same-directory staging file, flush/fsync, strict reread, and atomic
 
 New packets start in `DRAFT`. `approve()` changes a draft to `READY_FOR_MANUAL_PUBLICATION`; `reject()` records a required local reason and changes the packet to `REJECTED`. A rejected packet cannot be approved. Approval is an editorial assertion only. Every stored item has `remote_publication_status: NOT_PUBLISHED_BY_PLANNER`; the schema has no published state and this module has no publish method. A ready packet still requires a separate human action through an authorized path.
 
+### Compare-and-review API
+
+Review flows that display packet contents before a decision should use `get_review_snapshot(account_uuid, packet_id)`, not a separate `get()` followed later by `approve()` or `reject()`. The result is a frozen `RecruitmentContentReviewSnapshotV1` containing the immutable packet and a fingerprint shaped like `content-packet-v1:sha256:<64 lowercase hex characters>`.
+
+The fingerprint hashes a deterministic, size-bounded canonical encoding of the complete v1 packet using the existing packet codec and a versioned domain prefix. It covers account and packet UUIDs, exact stored text, provenance and rights/consent assertions, attachment metadata, private notes, schedule, editorial and remote-publication status, and audit/review timestamps and notes. It is an equality check for stale review detection; it is not a secret, HMAC, identity check, proof of ownership, or platform permission. The snapshot and nested packet data are immutable, and their representations do not print private packet contents.
+
+After a private review and explicit confirmation, call `review_if_unchanged(account_uuid, packet_id, expected_fingerprint=..., expected_editorial_status="DRAFT", decision="APPROVE"|"REJECT", note=...)` once. The method takes one account lock, rereads and strictly decodes the latest calendar, locates the exact account-scoped packet, compares the full fingerprint and expected status, and performs the decision through the existing atomic writer while that same lock remains held. It does not call `approve()` or `reject()` under the lock. If the packet is missing, changed, already reviewed, no longer decodes as the reviewed v1 packet, or the expected status differs, it raises only `CONTENT_PLANNER_REVIEW_STALE` and does not write. A lock held by another operation continues to produce the fixed busy error. Rejections require a bounded, screened reason. Every successful approval retains `remote_publication_status: NOT_PUBLISHED_BY_PLANNER`.
+
+The original `approve()` and `reject()` methods keep their existing signatures and behavior for compatibility. They do not accept a review fingerprint, so interactive review clients must use the compare-and-review API to bind the decision to the contents they showed the operator.
+
 Creation accepts only `provenance="OPERATOR_AUTHORED"` and requires both `rights_asserted=True` and `consent_asserted=True`. Attachments, when present, separately require rights and consent assertions. The stored `UNVERIFIED_OPERATOR_ASSERTION` label explicitly means the software did not verify ownership, subject consent, licensing, or accuracy. `platform_permission_status` is always `NOT_ESTABLISHED`; these assertions do not grant or prove platform permission.
 
 Optional `ContentAttachmentMetadataV1` stores only a bounded HTTPS URL, kind (`IMAGE`, `VIDEO`, or `REFERENCE_LINK`), optional label/attribution, and the operator's unverified rights/consent assertions. URLs are inert metadata: the planner never opens a local path, downloads, previews, uploads, or follows the link. URL queries, fragments, credentials, local hosts, and non-public IP literals are rejected.
@@ -50,13 +60,20 @@ result = planner.create(
     rights_asserted=True,
     consent_asserted=True,
 )
-ready_for_review = planner.approve(account_uuid, result.packet.packet_id)
+snapshot = planner.get_review_snapshot(account_uuid, result.packet.packet_id)
+ready_for_review = planner.review_if_unchanged(
+    account_uuid,
+    result.packet.packet_id,
+    expected_fingerprint=snapshot.fingerprint,
+    expected_editorial_status="DRAFT",
+    decision="APPROVE",
+)
 ```
 
 The approval result remains `NOT_PUBLISHED_BY_PLANNER`. No CLI, native-composer handoff, browser runtime, API client, AI provider, or scheduler is part of this interface.
 
 ## Failure boundary and follow-up
 
-`RecruitmentContentPlannerError` exposes fixed codes only (`CONTENT_PLANNER_INVALID`, `..._STATE_INVALID`, `..._RIGHTS_REQUIRED`, `..._PRIVATE_CONTENT_REJECTED`, `..._SCHEDULE_INVALID`, `..._LIMIT_REACHED`, `..._BUSY`, and related source/review codes). It does not include text, notes, URLs, UUIDs, or paths.
+`RecruitmentContentPlannerError` exposes fixed codes only (`CONTENT_PLANNER_INVALID`, `..._STATE_INVALID`, `..._RIGHTS_REQUIRED`, `..._PRIVATE_CONTENT_REJECTED`, `..._SCHEDULE_INVALID`, `..._LIMIT_REACHED`, `..._BUSY`, `CONTENT_PLANNER_REVIEW_STALE`, and related source/review codes). It does not include text, notes, URLs, UUIDs, or paths.
 
 This slice does not import external sources, quote/repost content, inspect applicant files, read media, verify copyright/consent, establish account ownership or platform permission, send reminders, publish, or report remote success. Any integration with S9A review, CLI workflows, official publishing APIs, native UI, external AI/media, or live account operations needs its own reviewed scope and authorization.
