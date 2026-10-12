@@ -96,6 +96,10 @@ from threads_platform.standalone.opportunity_queue import (
     run_opportunity_select_cli,
     run_opportunity_skip_cli,
 )
+from threads_platform.standalone.recruitment_qualification import (
+    RecruitmentQualificationError,
+    run_opportunity_rank_cli,
+)
 from threads_platform.standalone.recurrences import (
     LocalRecurrenceRunner,
     LocalRecurrenceStore,
@@ -840,6 +844,9 @@ def _build_parser() -> argparse.ArgumentParser:
     opportunity_remove_parser = recruitment_commands.add_parser("opportunity-remove")
     opportunity_remove_parser.add_argument("alias")
     opportunity_remove_parser.add_argument("--id", required=True)
+    opportunity_rank_parser = recruitment_commands.add_parser("opportunity-rank")
+    opportunity_rank_parser.add_argument("alias")
+    opportunity_rank_parser.add_argument("--limit", type=int, default=10)
     return parser
 
 
@@ -888,6 +895,12 @@ def _run_browser_command(args: argparse.Namespace, root: Path, store: LocalAccou
 
 
 def _handle_recruitment_command(args: argparse.Namespace) -> int:
+    if args.recruitment_command == "opportunity-rank":
+        return run_opportunity_rank_cli(
+            args.alias,
+            limit=args.limit,
+            data_root_factory=resolve_standalone_data_root,
+        )
     if args.recruitment_command == "opportunity-import":
         return run_opportunity_import_cli(
             args.alias,
@@ -1110,6 +1123,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"ERROR {error.code}\n")
         return 130 if error.code.endswith("INTERRUPTED") else 1
     except (
+        RecruitmentQualificationError,
         OpportunityQueueError,
         ManualOpportunityError,
         ManualOutcomeError,
