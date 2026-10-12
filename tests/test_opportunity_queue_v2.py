@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import socket
@@ -8,7 +9,7 @@ import subprocess
 from dataclasses import replace
 from html import escape
 from pathlib import Path
-from typing import Literal, cast
+from typing import BinaryIO, Literal, cast
 from urllib.parse import urlencode
 from uuid import UUID
 
@@ -35,7 +36,7 @@ from threads_platform.standalone.manual_opportunities import (
     ManualOpportunity,
     ManualOpportunityIntake,
 )
-from threads_platform.standalone.opportunity_queue import OpportunityQueueStore
+from threads_platform.standalone.opportunity_queue import OpportunityQueue, OpportunityQueueStore
 from threads_platform.standalone.opportunity_queue_v2 import (
     OpportunityQueueV2Error,
     OpportunityQueueV2Store,
@@ -644,7 +645,76 @@ def test_migration_rejects_missing_source_target_collision_and_stale_preview(
     assert not _v2_path(stale_root).exists()
 
 
-def test_migration_staging_failure_rolls_back_without_changing_v1(
+def test_v1_snapshot_decodes_and_hashes_one_buffer_after_intervening_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_v1_queue(tmp_path)
+    source_path = _v1_path(tmp_path)
+    original_bytes = source_path.read_bytes()
+    original_open = Path.open
+    source_reads = 0
+
+    def tracked_open(path: Path, *args: object, **kwargs: object) -> BinaryIO:
+        nonlocal source_reads
+        if path == source_path:
+            source_reads += 1
+        return cast(BinaryIO, original_open(path, *args, **kwargs))
+
+    original_decode = OpportunityQueueStore._decode_queue
+
+    def mutate_after_decode(
+        reader: OpportunityQueueStore,
+        value: object,
+        account_id: UUID,
+    ) -> OpportunityQueue:
+        queue = original_decode(reader, value, account_id)
+        with original_open(source_path, "wb") as stream:
+            stream.write(b'{"intervening":true}')
+        return queue
+
+    monkeypatch.setattr(Path, "open", tracked_open)
+    monkeypatch.setattr(OpportunityQueueStore, "_decode_queue", mutate_after_decode)
+
+    preview = OpportunityQueueV2Store(tmp_path).preview_v1_migration(_ACCOUNT_ONE)
+
+    assert source_reads == 1
+    assert preview.source_sha256 == hashlib.sha256(original_bytes).hexdigest()
+    assert preview.v1_total_count == 3
+    assert source_path.read_bytes() == b'{"intervening":true}'
+
+
+def test_migration_no_clobber_preserves_late_competing_target_and_v1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_v1_queue(tmp_path)
+    source_path = _v1_path(tmp_path)
+    source_before = source_path.read_bytes()
+    store = OpportunityQueueV2Store(tmp_path)
+    preview = store.preview_v1_migration(_ACCOUNT_ONE)
+    target = _v2_path(tmp_path)
+    competing_bytes = b"competing v2 document created after staging"
+    real_link = os.link
+
+    def create_competitor_then_link(source: str | bytes, destination: str | bytes) -> None:
+        target.write_bytes(competing_bytes)
+        real_link(source, destination)
+
+    monkeypatch.setattr(os, "link", create_competitor_then_link)
+    with pytest.raises(OpportunityQueueV2Error) as collision:
+        store.apply_v1_migration(
+            _ACCOUNT_ONE,
+            confirmation=preview.confirmation_token,
+        )
+
+    assert collision.value.code == "OPPORTUNITY_QUEUE_V2_MIGRATION_TARGET_EXISTS"
+    assert target.read_bytes() == competing_bytes
+    assert source_path.read_bytes() == source_before
+    assert not list(target.parent.glob(".*.tmp"))
+
+
+def test_migration_install_failure_preserves_v1_and_cleans_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -652,10 +722,10 @@ def test_migration_staging_failure_rolls_back_without_changing_v1(
     source_before = _v1_path(tmp_path).read_bytes()
     preview = OpportunityQueueV2Store(tmp_path).preview_v1_migration(_ACCOUNT_ONE)
 
-    def fail_replace(*_args: object, **_kwargs: object) -> None:
+    def fail_link(*_args: object, **_kwargs: object) -> None:
         raise OSError("synthetic atomic install failure")
 
-    monkeypatch.setattr(os, "replace", fail_replace)
+    monkeypatch.setattr(os, "link", fail_link)
     with pytest.raises(OpportunityQueueV2Error) as error:
         OpportunityQueueV2Store(tmp_path).apply_v1_migration(
             _ACCOUNT_ONE,

@@ -356,20 +356,27 @@ class _LockedV1QueueReader(OpportunityQueueStore):
 
     def snapshot(self, root: Path, account_id: UUID) -> tuple[OpportunityQueue, bytes | None]:
         try:
-            queue = self._read_unlocked(root, account_id)
             source_path = self._queue_path(root, account_id, create=False)
             if source_path is None or not self._regular_file(
                 source_path, source_path.parent, allow_missing=True
             ):
-                return queue, None
+                return OpportunityQueue(str(account_id), ()), None
             with source_path.open("rb") as stream:
                 raw = stream.read(_MAX_DOCUMENT_BYTES + 1)
+            if len(raw) > _MAX_DOCUMENT_BYTES:
+                raise OpportunityQueueV2Error("OPPORTUNITY_QUEUE_V2_INVALID")
+            value = json.loads(
+                raw.decode("utf-8", errors="strict"),
+                object_pairs_hook=_unique_object,
+                parse_constant=_reject_constant,
+            )
+            queue = self._decode_queue(value, account_id)
         except OpportunityQueueError:
             raise OpportunityQueueV2Error("OPPORTUNITY_QUEUE_V2_INVALID") from None
-        except OSError:
+        except OpportunityQueueV2Error:
+            raise
+        except OSError, UnicodeError, json.JSONDecodeError, RecursionError, ValueError:
             raise OpportunityQueueV2Error("OPPORTUNITY_QUEUE_V2_INVALID") from None
-        if len(raw) > _MAX_DOCUMENT_BYTES:
-            raise OpportunityQueueV2Error("OPPORTUNITY_QUEUE_V2_INVALID")
         return queue, raw
 
 
@@ -1239,7 +1246,6 @@ class OpportunityQueueV2Store:
             raise OpportunityQueueV2Error("OPPORTUNITY_QUEUE_V2_MIGRATION_TARGET_EXISTS")
         temporary_path: Path | None = None
         descriptor: int | None = None
-        installed = False
         try:
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f".{target.name}.",
@@ -1262,15 +1268,20 @@ class OpportunityQueueV2Store:
                 raise OpportunityQueueV2Error("OPPORTUNITY_QUEUE_V2_INVALID")
             if must_be_absent and self._regular_file(target, target.parent, allow_missing=True):
                 raise OpportunityQueueV2Error("OPPORTUNITY_QUEUE_V2_MIGRATION_TARGET_EXISTS")
-            os.replace(temporary_path, target)
-            installed = True
+            if must_be_absent:
+                try:
+                    # Same-directory hard-link creation atomically fails if target exists.
+                    # Unsupported filesystems fail closed; migration never uses replace here.
+                    os.link(temporary_path, target)
+                except FileExistsError:
+                    raise OpportunityQueueV2Error(
+                        "OPPORTUNITY_QUEUE_V2_MIGRATION_TARGET_EXISTS"
+                    ) from None
+            else:
+                os.replace(temporary_path, target)
         except OpportunityQueueV2Error:
-            if must_be_absent and installed:
-                self._rollback_new_target(target)
             raise
         except OSError:
-            if must_be_absent and installed:
-                self._rollback_new_target(target)
             raise OpportunityQueueV2Error("OPPORTUNITY_QUEUE_V2_INVALID") from None
         finally:
             if descriptor is not None:
@@ -1283,13 +1294,6 @@ class OpportunityQueueV2Store:
                     temporary_path.unlink(missing_ok=True)
                 except OSError:
                     pass
-
-    def _rollback_new_target(self, target: Path) -> None:
-        try:
-            if self._regular_file(target, target.parent, allow_missing=True):
-                target.unlink()
-        except OSError, OpportunityQueueV2Error:
-            pass
 
     def _encode_queue(self, queue: OpportunityQueueV2) -> bytes:
         document = {
