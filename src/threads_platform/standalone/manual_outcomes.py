@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, NoReturn, cast
+from typing import Literal, NoReturn, TypeGuard, cast
 from uuid import UUID, uuid4
 
 from threads_platform.browser.contracts import BrowserContractError
@@ -26,14 +26,33 @@ ManualOutcomeValue = Literal[
     "OPERATOR_REPORTED_SENT_UNVERIFIED",
     "AMBIGUOUS",
 ]
+ManualOutcomeStatus = Literal[
+    "HANDOFF_UNRESOLVED",
+    "ABORTED_NOT_SENT",
+    "OPERATOR_REPORTED_SENT_UNVERIFIED",
+    "AMBIGUOUS",
+]
+ManualOutcomeSource = Literal["SOFTWARE_HANDOFF", "OPERATOR", "LEGACY_OPERATOR"]
 _OUTCOMES = frozenset({"ABORTED_NOT_SENT", "OPERATOR_REPORTED_SENT_UNVERIFIED", "AMBIGUOUS"})
 _BLOCKING_OUTCOMES = frozenset({"OPERATOR_REPORTED_SENT_UNVERIFIED", "AMBIGUOUS"})
+_PENDING_STATUS = "HANDOFF_UNRESOLVED"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_DOCUMENT_BYTES = 16 * 1024
 _MAX_EVENTS = 16
 _NAMESPACE = "manual_recruitment_v1"
 _DOCUMENT_KEYS = frozenset({"version", "account_uuid", "target_fingerprint", "events"})
 _EVENT_KEYS = frozenset(
+    {
+        "event_id",
+        "attempt_id",
+        "draft_sha256",
+        "recorded_at",
+        "status",
+        "source",
+        "verification",
+    }
+)
+_LEGACY_EVENT_KEYS = frozenset(
     {"event_id", "draft_sha256", "recorded_at", "operator_declaration", "verification"}
 )
 
@@ -47,6 +66,10 @@ class ManualOutcomeError(Exception):
             "MANUAL_OUTCOME_VERSION_UNSUPPORTED",
             "MANUAL_OUTCOME_BUSY",
             "MANUAL_OUTCOME_BLOCKED",
+            "MANUAL_OUTCOME_NO_PENDING",
+            "MANUAL_OUTCOME_ATTEMPT_INVALID",
+            "MANUAL_OUTCOME_ATTEMPT_MISMATCH",
+            "MANUAL_OUTCOME_APPROVAL_MISMATCH",
             "MANUAL_OUTCOME_LIMIT_REACHED",
         }
     )
@@ -61,10 +84,18 @@ class ManualOutcomeError(Exception):
 @dataclass(frozen=True, slots=True, repr=False)
 class ManualOutcomeEvent:
     event_id: str
+    attempt_id: str
     draft_sha256: str
     recorded_at: str
-    operator_declaration: ManualOutcomeValue
+    status: ManualOutcomeStatus
+    source: ManualOutcomeSource
     verification: Literal["UNVERIFIED"]
+
+    @property
+    def operator_declaration(self) -> ManualOutcomeValue | None:
+        if self.status == _PENDING_STATUS:
+            return None
+        return self.status
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -79,7 +110,7 @@ class ManualOutcomeRecord:
 
     @property
     def blocks_handoff(self) -> bool:
-        return any(event.operator_declaration in _BLOCKING_OUTCOMES for event in self.events)
+        return self.latest.status == _PENDING_STATUS or self.latest.status in _BLOCKING_OUTCOMES
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -93,6 +124,22 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _reject_constant(_: str) -> NoReturn:
     raise ValueError("non-finite JSON constant")
+
+
+def _is_outcome(value: object) -> bool:
+    return isinstance(value, str) and value in _OUTCOMES
+
+
+def _is_outcome_status(value: str) -> TypeGuard[ManualOutcomeStatus]:
+    return value in _OUTCOMES or value == _PENDING_STATUS
+
+
+def _is_event_source(value: str) -> TypeGuard[ManualOutcomeSource]:
+    return value in {"SOFTWARE_HANDOFF", "OPERATOR", "LEGACY_OPERATOR"}
+
+
+def _same_outcome(status: str, outcome: object) -> bool:
+    return status == outcome
 
 
 def _is_reparse_point(info: os.stat_result) -> bool:
@@ -197,51 +244,126 @@ class ManualOutcomeStore:
                 except OSError:
                     raise ManualOutcomeError("MANUAL_OUTCOME_INVALID") from None
 
-    def record(
+    def begin_handoff(
         self,
         account_id: UUID,
         target_url: str,
         draft_sha256: str,
-        outcome: ManualOutcomeValue,
-    ) -> tuple[ManualOutcomeEvent, bool]:
+    ) -> ManualOutcomeEvent:
         fingerprint = self.target_fingerprint(account_id, target_url)
-        if _SHA256.fullmatch(draft_sha256) is None or outcome not in _OUTCOMES:
+        if _SHA256.fullmatch(draft_sha256) is None:
             raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
 
         with self.account_lock(account_id):
             existing = self.read(account_id, target_url)
             if existing is not None:
-                latest = existing.latest
-                if latest.operator_declaration in _BLOCKING_OUTCOMES:
-                    if (
-                        latest.operator_declaration == outcome
-                        and latest.draft_sha256 == draft_sha256
-                    ):
-                        return latest, True
+                if existing.blocks_handoff:
                     raise ManualOutcomeError("MANUAL_OUTCOME_BLOCKED")
-                for event in existing.events:
-                    if event.operator_declaration == outcome and event.draft_sha256 == draft_sha256:
-                        return event, True
-                if len(existing.events) >= _MAX_EVENTS:
+                if existing.latest.status != "ABORTED_NOT_SENT":
+                    raise ManualOutcomeError("MANUAL_OUTCOME_BLOCKED")
+                # Reserve room for the matching operator resolution so a bounded journal
+                # cannot strand a newly opened browser session without room to attest it.
+                if len(existing.events) > _MAX_EVENTS - 2:
                     raise ManualOutcomeError("MANUAL_OUTCOME_LIMIT_REACHED")
-                events = (*existing.events, self._new_event(draft_sha256, outcome))
+                events = existing.events
             else:
-                events = (self._new_event(draft_sha256, outcome),)
+                events = ()
 
+            event = self._new_event(
+                draft_sha256=draft_sha256,
+                status="HANDOFF_UNRESOLVED",
+                source="SOFTWARE_HANDOFF",
+            )
             record = ManualOutcomeRecord(
                 account_uuid=str(account_id),
                 target_fingerprint=fingerprint,
-                events=events,
+                events=(*events, event),
             )
             self._write(record)
-            return record.latest, False
+            return event
 
-    def _new_event(self, draft_sha256: str, outcome: ManualOutcomeValue) -> ManualOutcomeEvent:
+    def resolve_handoff(
+        self,
+        account_id: UUID,
+        target_url: str,
+        draft_sha256: str,
+        attempt_id: str,
+        outcome: ManualOutcomeValue,
+    ) -> tuple[ManualOutcomeEvent, bool]:
+        fingerprint = self.target_fingerprint(account_id, target_url)
+        if _SHA256.fullmatch(draft_sha256) is None or not _is_outcome(outcome):
+            raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+        if not self._valid_attempt_id(attempt_id):
+            raise ManualOutcomeError("MANUAL_OUTCOME_ATTEMPT_INVALID")
+
+        with self.account_lock(account_id):
+            existing = self.read(account_id, target_url)
+            if existing is None:
+                raise ManualOutcomeError("MANUAL_OUTCOME_NO_PENDING")
+            latest = existing.latest
+            if latest.status == _PENDING_STATUS:
+                if latest.attempt_id != attempt_id:
+                    raise ManualOutcomeError("MANUAL_OUTCOME_ATTEMPT_MISMATCH")
+                if latest.draft_sha256 != draft_sha256:
+                    raise ManualOutcomeError("MANUAL_OUTCOME_APPROVAL_MISMATCH")
+                if len(existing.events) >= _MAX_EVENTS:
+                    raise ManualOutcomeError("MANUAL_OUTCOME_LIMIT_REACHED")
+            elif latest.source == "OPERATOR" and latest.attempt_id == attempt_id:
+                if latest.draft_sha256 != draft_sha256:
+                    raise ManualOutcomeError("MANUAL_OUTCOME_APPROVAL_MISMATCH")
+                if _same_outcome(latest.status, outcome):
+                    return latest, True
+                if latest.status in _BLOCKING_OUTCOMES:
+                    raise ManualOutcomeError("MANUAL_OUTCOME_BLOCKED")
+                raise ManualOutcomeError("MANUAL_OUTCOME_ATTEMPT_MISMATCH")
+            else:
+                if latest.status in _BLOCKING_OUTCOMES:
+                    raise ManualOutcomeError("MANUAL_OUTCOME_BLOCKED")
+                raise ManualOutcomeError("MANUAL_OUTCOME_ATTEMPT_MISMATCH")
+
+            if not any(
+                event.source == "SOFTWARE_HANDOFF" and event.attempt_id == attempt_id
+                for event in existing.events
+            ):
+                raise ManualOutcomeError("MANUAL_OUTCOME_ATTEMPT_MISMATCH")
+            event = self._new_event(
+                draft_sha256=draft_sha256,
+                status=outcome,
+                source="OPERATOR",
+                attempt_id=attempt_id,
+            )
+            record = ManualOutcomeRecord(
+                account_uuid=str(account_id),
+                target_fingerprint=fingerprint,
+                events=(*existing.events, event),
+            )
+            self._write(record)
+            return event, False
+
+    @staticmethod
+    def _valid_attempt_id(attempt_id: str) -> bool:
+        try:
+            parsed = UUID(attempt_id)
+        except ValueError, TypeError, AttributeError:
+            return False
+        return parsed.version == 4 and str(parsed) == attempt_id
+
+    def _new_event(
+        self,
+        *,
+        draft_sha256: str,
+        status: ManualOutcomeStatus,
+        source: ManualOutcomeSource,
+        attempt_id: str | None = None,
+    ) -> ManualOutcomeEvent:
+        event_id = str(uuid4())
         return ManualOutcomeEvent(
-            event_id=str(uuid4()),
+            event_id=event_id,
+            attempt_id=event_id if attempt_id is None else attempt_id,
             draft_sha256=draft_sha256,
             recorded_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            operator_declaration=outcome,
+            status=status,
+            source=source,
             verification="UNVERIFIED",
         )
 
@@ -357,53 +479,103 @@ class ManualOutcomeStore:
             raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
         events: list[ManualOutcomeEvent] = []
         event_ids: set[str] = set()
+        attempt_ids: set[str] = set()
+        pending: ManualOutcomeEvent | None = None
+        protocol_started = False
         for event_item in decoded_events:
             if not isinstance(event_item, dict):
                 raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
             event_value = cast(dict[str, object], event_item)
-            if event_value.keys() != _EVENT_KEYS:
+            keys = event_value.keys()
+            legacy = keys == _LEGACY_EVENT_KEYS
+            if not legacy and keys != _EVENT_KEYS:
                 raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
             event_id = event_value["event_id"]
             draft_sha256 = event_value["draft_sha256"]
             recorded_at = event_value["recorded_at"]
-            declaration = event_value["operator_declaration"]
             verification = event_value["verification"]
-            if (
-                not isinstance(event_id, str)
-                or not isinstance(draft_sha256, str)
-                or not isinstance(recorded_at, str)
-                or not isinstance(declaration, str)
-                or verification != "UNVERIFIED"
-            ):
+            if legacy:
+                status = event_value["operator_declaration"]
+                source = "LEGACY_OPERATOR"
+                attempt_id = event_id
+            else:
+                status = event_value["status"]
+                source = event_value["source"]
+                attempt_id = event_value["attempt_id"]
+            if not isinstance(event_id, str) or not isinstance(attempt_id, str):
+                raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+            if not isinstance(draft_sha256, str) or not isinstance(recorded_at, str):
+                raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+            if not isinstance(status, str) or not isinstance(source, str):
+                raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+            if verification != "UNVERIFIED":
                 raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
             try:
                 parsed_event_id = UUID(event_id)
+                parsed_attempt_id = UUID(attempt_id)
                 timestamp = (
                     datetime.fromisoformat(recorded_at) if recorded_at.endswith("Z") else None
                 )
-            except ValueError, TypeError:
+            except ValueError, TypeError, AttributeError:
                 raise ManualOutcomeError("MANUAL_OUTCOME_INVALID") from None
             if (
                 parsed_event_id.version != 4
                 or event_id in event_ids
+                or parsed_attempt_id.version != 4
+                or str(parsed_attempt_id) != attempt_id
                 or _SHA256.fullmatch(draft_sha256) is None
+                or len(recorded_at) != 20
                 or timestamp is None
                 or timestamp.utcoffset() != UTC.utcoffset(timestamp)
-                or declaration not in _OUTCOMES
             ):
                 raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
             event_ids.add(event_id)
-            events.append(
-                ManualOutcomeEvent(
-                    event_id=event_id,
-                    draft_sha256=draft_sha256,
-                    recorded_at=recorded_at,
-                    operator_declaration=declaration,  # type: ignore[arg-type]
-                    verification="UNVERIFIED",
-                )
+            if source == "LEGACY_OPERATOR":
+                if (
+                    protocol_started
+                    or pending is not None
+                    or status not in _OUTCOMES
+                    or attempt_id != event_id
+                    or (events and events[-1].status in _BLOCKING_OUTCOMES)
+                ):
+                    raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+            elif source == "SOFTWARE_HANDOFF":
+                if (
+                    status != _PENDING_STATUS
+                    or attempt_id != event_id
+                    or attempt_id in attempt_ids
+                    or pending is not None
+                    or (events and events[-1].status != "ABORTED_NOT_SENT")
+                ):
+                    raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+                protocol_started = True
+                attempt_ids.add(attempt_id)
+            elif source == "OPERATOR":
+                if (
+                    status not in _OUTCOMES
+                    or pending is None
+                    or pending.attempt_id != attempt_id
+                    or pending.draft_sha256 != draft_sha256
+                ):
+                    raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+                protocol_started = True
+                pending = None
+            else:
+                raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+            if not _is_outcome_status(status) or not _is_event_source(source):
+                raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+            event = ManualOutcomeEvent(
+                event_id=event_id,
+                attempt_id=attempt_id,
+                draft_sha256=draft_sha256,
+                recorded_at=recorded_at,
+                status=status,
+                source=source,
+                verification="UNVERIFIED",
             )
-        if any(event.operator_declaration in _BLOCKING_OUTCOMES for event in events[:-1]):
-            raise ManualOutcomeError("MANUAL_OUTCOME_INVALID")
+            events.append(event)
+            if source == "SOFTWARE_HANDOFF":
+                pending = event
         return ManualOutcomeRecord(
             account_uuid=str(account_id),
             target_fingerprint=target_fingerprint,
@@ -430,9 +602,11 @@ class ManualOutcomeStore:
                     "events": [
                         {
                             "event_id": event.event_id,
+                            "attempt_id": event.attempt_id,
                             "draft_sha256": event.draft_sha256,
                             "recorded_at": event.recorded_at,
-                            "operator_declaration": event.operator_declaration,
+                            "status": event.status,
+                            "source": event.source,
                             "verification": event.verification,
                         }
                         for event in record.events

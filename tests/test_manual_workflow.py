@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import threads_platform.standalone.__main__ as cli
+import threads_platform.standalone.manual_outcomes as outcomes_module
 import threads_platform.standalone.runtime as runtime_module
 from threads_platform.browser.contracts import BrowserEngineSession, BrowserLaunchRequest
 from threads_platform.locks.filesystem import FilesystemProcessLock
@@ -112,7 +113,18 @@ def test_manual_handoff_uses_exact_s3_approval_and_existing_s1_runtime(
         assert output is sys.stderr
         output.write(prompt + "\n")
 
-    monkeypatch.setattr(runtime_module, "PlaywrightBrowserEngine", lambda: engine)
+    def assert_reservation_precedes_browser() -> _FakeEngine:
+        pending = ManualOutcomeStore(root).read(account.id, target_url)
+        assert pending is not None
+        assert pending.latest.status == "HANDOFF_UNRESOLVED"
+        # The journal lock must be released before runtime/browser startup.
+        with ManualOutcomeStore(root).account_lock(account.id):
+            pass
+        return engine
+
+    monkeypatch.setattr(
+        runtime_module, "PlaywrightBrowserEngine", assert_reservation_precedes_browser
+    )
     monkeypatch.setattr(runtime_module, "_wait_for_interactive_operator", operator_ends_session)
     monkeypatch.setattr(cli, "_run_api_command", lambda *_args, **_kwargs: pytest.fail("API path"))
     monkeypatch.setattr(
@@ -166,6 +178,7 @@ def test_manual_handoff_uses_exact_s3_approval_and_existing_s1_runtime(
     assert "Type OPEN and press Enter" in rendered
     assert "HANDOFF_CLOSED_ACTION_UNVERIFIED" in rendered
     assert "identity=UNKNOWN_IDENTITY" in rendered
+    assert "operator RECORD is required before another handoff" in rendered
     assert len(prompts) == 1
     assert len(engine.requests) == 1
     assert engine.requests[0].headless is False
@@ -177,10 +190,42 @@ def test_manual_handoff_uses_exact_s3_approval_and_existing_s1_runtime(
     ]
     assert engine.sessions[0].closed
 
+    record = ManualOutcomeStore(root).read(account.id, target_url)
+    assert record is not None
+    assert record.latest.status == "HANDOFF_UNRESOLVED"
+    assert record.latest.source == "SOFTWARE_HANDOFF"
+    assert f"attempt_id={record.latest.attempt_id}" in rendered
+
+    retry_input, retry_stdout, retry_stderr = _streams("OPEN\n")
+    runtime_calls: list[bool] = []
+
+    def unexpected_runtime(*_args: object, **_kwargs: object) -> object:
+        runtime_calls.append(True)
+        pytest.fail("normal close without operator RECORD must block another handoff")
+
+    with pytest.raises(ManualOutcomeError) as blocked:
+        run_manual_handoff_cli(
+            account.alias,
+            targets,
+            1,
+            target_url,
+            draft,
+            approval_sha,
+            context,
+            data_root_factory=lambda: root,
+            runtime_factory=unexpected_runtime,
+            stdin=retry_input,
+            stdout=retry_stdout,
+            stderr=retry_stderr,
+            environment={},
+        )
+    assert blocked.value.code == "MANUAL_OUTCOME_BLOCKED"
+    assert runtime_calls == []
+
     browser_lock = FilesystemProcessLock(root / "locks" / f"{account.id}.lock")
     browser_lock.acquire()
     browser_lock.release()
-    assert ManualOutcomeStore(root).read(account.id, target_url) is None
+    assert ManualOutcomeStore(root).read(account.id, target_url) == record
 
 
 def test_manual_handoff_stops_if_account_identity_changes_after_approval(
@@ -226,6 +271,9 @@ def test_manual_handoff_stops_if_account_identity_changes_after_approval(
     assert mismatch.value.code == "ACCOUNT_IDENTITY_CHANGED"
     assert engine.requests == []
     assert stdout.getvalue() == ""
+    pending = ManualOutcomeStore(root).read(account.id, _target())
+    assert pending is not None
+    assert pending.latest.status == "HANDOFF_UNRESOLVED"
     probe = FilesystemProcessLock(root / "manual_recruitment_v1" / "locks" / f"{account.id}.lock")
     probe.acquire()
     probe.release()
@@ -337,6 +385,7 @@ def test_manual_outcome_journal_is_private_idempotent_separate_and_blocks_retry(
     draft_text = draft.read_text(encoding="utf-8")
     context_text = context.read_text(encoding="utf-8")
     approval_sha = _approval(account, targets, draft_text, context_text)
+    attempt = ManualOutcomeStore(root).begin_handoff(account.id, target_url, approval_sha)
     stdin, stdout, stderr = _streams("RECORD\n")
 
     assert (
@@ -347,6 +396,7 @@ def test_manual_outcome_journal_is_private_idempotent_separate_and_blocks_retry(
             target_url,
             draft,
             approval_sha,
+            attempt.attempt_id,
             "OPERATOR_REPORTED_SENT_UNVERIFIED",
             context,
             data_root_factory=lambda: root,
@@ -360,8 +410,9 @@ def test_manual_outcome_journal_is_private_idempotent_separate_and_blocks_retry(
     record_store = ManualOutcomeStore(root)
     record = record_store.read(account.id, target_url)
     assert record is not None
-    assert len(record.events) == 1
+    assert len(record.events) == 2
     assert record.latest.operator_declaration == "OPERATOR_REPORTED_SENT_UNVERIFIED"
+    assert record.latest.attempt_id == attempt.attempt_id
     assert record.latest.verification == "UNVERIFIED"
 
     record_files = tuple((root / "manual_recruitment_v1" / "records").rglob("*.json"))
@@ -382,6 +433,7 @@ def test_manual_outcome_journal_is_private_idempotent_separate_and_blocks_retry(
             target_url,
             draft,
             approval_sha,
+            attempt.attempt_id,
             "OPERATOR_REPORTED_SENT_UNVERIFIED",
             context,
             data_root_factory=lambda: root,
@@ -393,15 +445,14 @@ def test_manual_outcome_journal_is_private_idempotent_separate_and_blocks_retry(
         == 0
     )
     assert "idempotent=true" in second_stderr.getvalue()
-    assert len(record_store.read(account.id, target_url).events) == 1  # type: ignore[union-attr]
+    assert len(record_store.read(account.id, target_url).events) == 2  # type: ignore[union-attr]
+    assert record_store.read(account.id, _target("different_target")) is None
 
     other_account = accounts.add("other_synthetic")
     assert record_store.read(other_account.id, target_url) is None
-    other_event, already_recorded = record_store.record(
-        other_account.id,
-        target_url,
-        approval_sha,
-        "ABORTED_NOT_SENT",
+    other_attempt = record_store.begin_handoff(other_account.id, target_url, approval_sha)
+    other_event, already_recorded = record_store.resolve_handoff(
+        other_account.id, target_url, approval_sha, other_attempt.attempt_id, "ABORTED_NOT_SENT"
     )
     assert not already_recorded
     assert other_event.verification == "UNVERIFIED"
@@ -427,6 +478,7 @@ def test_manual_outcome_journal_is_private_idempotent_separate_and_blocks_retry(
     )
     status_output = status_stderr.getvalue()
     assert "status=OPERATOR_REPORTED_SENT_UNVERIFIED verification=UNVERIFIED" in status_output
+    assert f"attempt_id={attempt.attempt_id}" in status_output
     assert target_url not in status_output
     assert draft_text not in status_output
     assert status_stdout.getvalue() == ""
@@ -469,25 +521,305 @@ def test_manual_outcome_ambiguous_blocks_all_later_declarations(tmp_path: Path) 
     first_sha = "1" * 64
     second_sha = "2" * 64
 
-    _, idempotent = store.record(account.id, target_url, first_sha, "ABORTED_NOT_SENT")
+    first_attempt = store.begin_handoff(account.id, target_url, first_sha)
+    _, idempotent = store.resolve_handoff(
+        account.id, target_url, first_sha, first_attempt.attempt_id, "ABORTED_NOT_SENT"
+    )
     assert not idempotent
-    ambiguous, idempotent = store.record(account.id, target_url, second_sha, "AMBIGUOUS")
+    second_attempt = store.begin_handoff(account.id, target_url, second_sha)
+    ambiguous, idempotent = store.resolve_handoff(
+        account.id, target_url, second_sha, second_attempt.attempt_id, "AMBIGUOUS"
+    )
     assert not idempotent
     assert ambiguous.verification == "UNVERIFIED"
-    repeated, idempotent = store.record(account.id, target_url, second_sha, "AMBIGUOUS")
+    repeated, idempotent = store.resolve_handoff(
+        account.id, target_url, second_sha, second_attempt.attempt_id, "AMBIGUOUS"
+    )
     assert idempotent
     assert repeated.event_id == ambiguous.event_id
     with pytest.raises(ManualOutcomeError) as blocked:
-        store.record(account.id, target_url, first_sha, "ABORTED_NOT_SENT")
+        store.begin_handoff(account.id, target_url, first_sha)
     assert blocked.value.code == "MANUAL_OUTCOME_BLOCKED"
+
+
+def test_manual_record_requires_exact_pending_attempt_and_old_abort_cannot_resolve_newer(
+    tmp_path: Path,
+) -> None:
+    root, _, account, targets, draft, context = _fixture(tmp_path)
+    store = ManualOutcomeStore(root)
+    target_url = _target()
+    approval_sha = _approval(
+        account,
+        targets,
+        draft.read_text(encoding="utf-8"),
+        context.read_text(encoding="utf-8"),
+    )
+    first = store.begin_handoff(account.id, target_url, approval_sha)
+
+    status_input, status_stdout, status_stderr = _streams()
+    assert (
+        run_manual_status_cli(
+            account.alias,
+            targets,
+            1,
+            target_url,
+            data_root_factory=lambda: root,
+            stdin=status_input,
+            stdout=status_stdout,
+            stderr=status_stderr,
+            environment={},
+        )
+        == 0
+    )
+    assert "status=HANDOFF_UNRESOLVED" in status_stderr.getvalue()
+    assert f"attempt_id={first.attempt_id}" in status_stderr.getvalue()
+
+    wrong_input, wrong_stdout, wrong_stderr = _streams("RECORD\n")
+    with pytest.raises(ManualOutcomeError) as wrong_attempt:
+        run_manual_record_cli(
+            account.alias,
+            targets,
+            1,
+            target_url,
+            draft,
+            approval_sha,
+            "00000000-0000-4000-8000-000000000001",
+            "ABORTED_NOT_SENT",
+            context,
+            data_root_factory=lambda: root,
+            stdin=wrong_input,
+            stdout=wrong_stdout,
+            stderr=wrong_stderr,
+            environment={},
+        )
+    assert wrong_attempt.value.code == "MANUAL_OUTCOME_ATTEMPT_MISMATCH"
+    assert "Type RECORD" not in wrong_stderr.getvalue()
+    assert store.read(account.id, target_url).latest.status == "HANDOFF_UNRESOLVED"  # type: ignore[union-attr]
+
+    record_input, record_stdout, record_stderr = _streams("RECORD\n")
+    assert (
+        run_manual_record_cli(
+            account.alias,
+            targets,
+            1,
+            target_url,
+            draft,
+            approval_sha,
+            first.attempt_id,
+            "ABORTED_NOT_SENT",
+            context,
+            data_root_factory=lambda: root,
+            stdin=record_input,
+            stdout=record_stdout,
+            stderr=record_stderr,
+            environment={},
+        )
+        == 0
+    )
+    assert "recorded=ABORTED_NOT_SENT verification=UNVERIFIED" in record_stderr.getvalue()
+
+    second = store.begin_handoff(account.id, target_url, approval_sha)
+    assert second.attempt_id != first.attempt_id
+    with pytest.raises(ManualOutcomeError) as stale:
+        store.resolve_handoff(
+            account.id, target_url, approval_sha, first.attempt_id, "ABORTED_NOT_SENT"
+        )
+    assert stale.value.code == "MANUAL_OUTCOME_ATTEMPT_MISMATCH"
+    assert store.read(account.id, target_url).latest.attempt_id == second.attempt_id  # type: ignore[union-attr]
+
+
+def test_handoff_persistence_failure_prevents_runtime_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _, account, targets, draft, context = _fixture(tmp_path)
+    approval_sha = _approval(account, targets, draft.read_text(encoding="utf-8"))
+    stdin, stdout, stderr = _streams("OPEN\n")
+    runtime_calls: list[bool] = []
+
+    def fail_temporary_file(*_args: object, **_kwargs: object) -> tuple[int, str]:
+        raise OSError("synthetic disk failure")
+
+    def unexpected_runtime(*_args: object, **_kwargs: object) -> object:
+        runtime_calls.append(True)
+        pytest.fail("Chromium must not start unless HANDOFF_UNRESOLVED is durable")
+
+    monkeypatch.setattr(outcomes_module.tempfile, "mkstemp", fail_temporary_file)
+    with pytest.raises(ManualOutcomeError) as failed:
+        run_manual_handoff_cli(
+            account.alias,
+            targets,
+            1,
+            _target(),
+            draft,
+            approval_sha,
+            context,
+            data_root_factory=lambda: root,
+            runtime_factory=unexpected_runtime,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            environment={},
+        )
+    assert failed.value.code == "MANUAL_OUTCOME_INVALID"
+    assert runtime_calls == []
+    assert not tuple((root / "manual_recruitment_v1" / "records").rglob("*.json"))
+
+
+def test_handoff_lock_contention_after_open_prevents_runtime_startup(tmp_path: Path) -> None:
+    root, _, account, targets, draft, context = _fixture(tmp_path)
+    approval_sha = _approval(account, targets, draft.read_text(encoding="utf-8"))
+    stdin, stdout, stderr = _streams("OPEN\n")
+    runtime_calls: list[bool] = []
+
+    def unexpected_runtime(*_args: object, **_kwargs: object) -> object:
+        runtime_calls.append(True)
+        pytest.fail("a busy journal lock must block browser startup")
+
+    with (
+        ManualOutcomeStore(root).account_lock(account.id),
+        pytest.raises(ManualOutcomeError) as busy,
+    ):
+        run_manual_handoff_cli(
+            account.alias,
+            targets,
+            1,
+            _target(),
+            draft,
+            approval_sha,
+            context,
+            data_root_factory=lambda: root,
+            runtime_factory=unexpected_runtime,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            environment={},
+        )
+    assert busy.value.code == "MANUAL_OUTCOME_BUSY"
+    assert runtime_calls == []
+    assert ManualOutcomeStore(root).read(account.id, _target()) is None
+
+
+def test_crashed_browser_handoff_stays_pending_and_blocks_retry(tmp_path: Path) -> None:
+    root, _, account, targets, draft, context = _fixture(tmp_path)
+    approval_sha = _approval(account, targets, draft.read_text(encoding="utf-8"))
+    stdin, stdout, stderr = _streams("OPEN\n")
+
+    class _CrashingRuntime:
+        async def open_thread_interactive(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("synthetic browser crash")
+
+    with pytest.raises(ManualWorkflowError) as crashed:
+        run_manual_handoff_cli(
+            account.alias,
+            targets,
+            1,
+            _target(),
+            draft,
+            approval_sha,
+            context,
+            data_root_factory=lambda: root,
+            runtime_factory=lambda *_args: _CrashingRuntime(),
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            environment={},
+        )
+    assert crashed.value.code == "MANUAL_HANDOFF_FAILED"
+    pending = ManualOutcomeStore(root).read(account.id, _target())
+    assert pending is not None and pending.latest.status == "HANDOFF_UNRESOLVED"
+
+    retry_input, retry_stdout, retry_stderr = _streams("OPEN\n")
+    with pytest.raises(ManualOutcomeError) as blocked:
+        run_manual_handoff_cli(
+            account.alias,
+            targets,
+            1,
+            _target(),
+            draft,
+            approval_sha,
+            context,
+            data_root_factory=lambda: root,
+            runtime_factory=lambda *_args: pytest.fail("pending attempt cannot be retried"),
+            stdin=retry_input,
+            stdout=retry_stdout,
+            stderr=retry_stderr,
+            environment={},
+        )
+    assert blocked.value.code == "MANUAL_OUTCOME_BLOCKED"
+
+
+def test_corrupt_journal_prevents_browser_startup(tmp_path: Path) -> None:
+    root, _, account, targets, draft, context = _fixture(tmp_path)
+    store = ManualOutcomeStore(root)
+    store.begin_handoff(account.id, _target(), _approval(account, targets, "draft"))
+    record_file = next((root / "manual_recruitment_v1" / "records").rglob("*.json"))
+    record_file.write_text("{corrupt", encoding="utf-8")
+    stdin, stdout, stderr = _streams("OPEN\n")
+
+    with pytest.raises(ManualOutcomeError) as corrupt:
+        run_manual_handoff_cli(
+            account.alias,
+            targets,
+            1,
+            _target(),
+            draft,
+            _approval(account, targets, draft.read_text(encoding="utf-8")),
+            context,
+            data_root_factory=lambda: root,
+            runtime_factory=lambda *_args: pytest.fail("corrupt journal blocks runtime"),
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            environment={},
+        )
+    assert corrupt.value.code == "MANUAL_OUTCOME_INVALID"
+
+
+def test_legacy_aborted_event_cannot_resolve_a_new_attempt(tmp_path: Path) -> None:
+    root, _, account, _, _, _ = _fixture(tmp_path)
+    store = ManualOutcomeStore(root)
+    target_url = _target()
+    fingerprint = store.target_fingerprint(account.id, target_url)
+    record_directory = root / "manual_recruitment_v1" / "records" / str(account.id)
+    record_directory.mkdir(parents=True)
+    old_attempt = "00000000-0000-4000-8000-000000000002"
+    old_sha = "a" * 64
+    legacy_document = {
+        "version": 1,
+        "account_uuid": str(account.id),
+        "target_fingerprint": fingerprint,
+        "events": [
+            {
+                "event_id": old_attempt,
+                "draft_sha256": old_sha,
+                "recorded_at": "2026-10-12T00:00:00Z",
+                "operator_declaration": "ABORTED_NOT_SENT",
+                "verification": "UNVERIFIED",
+            }
+        ],
+    }
+    (record_directory / f"{fingerprint}.json").write_text(
+        json.dumps(legacy_document), encoding="utf-8"
+    )
+    legacy = store.read(account.id, target_url)
+    assert legacy is not None
+    assert legacy.latest.source == "LEGACY_OPERATOR"
+
+    new_attempt = store.begin_handoff(account.id, target_url, "b" * 64)
+    with pytest.raises(ManualOutcomeError) as stale:
+        store.resolve_handoff(account.id, target_url, "a" * 64, old_attempt, "ABORTED_NOT_SENT")
+    assert stale.value.code == "MANUAL_OUTCOME_ATTEMPT_MISMATCH"
+    current = store.read(account.id, target_url)
+    assert current is not None and current.latest.attempt_id == new_attempt.attempt_id
+    assert current.latest.status == "HANDOFF_UNRESOLVED"
 
 
 def test_manual_outcome_unknown_version_and_symlink_fail_closed(tmp_path: Path) -> None:
     root, _, account, _, _, _ = _fixture(tmp_path)
     store = ManualOutcomeStore(root)
     target_url = _target()
-    event, _ = store.record(account.id, target_url, "a" * 64, "ABORTED_NOT_SENT")
-    del event
+    store.begin_handoff(account.id, target_url, "a" * 64)
     record_file = next((root / "manual_recruitment_v1" / "records").rglob("*.json"))
     document = json.loads(record_file.read_text(encoding="utf-8"))
     document["version"] = 2
@@ -514,7 +846,7 @@ def test_manual_outcome_lock_is_account_keyed_and_busy_fails_closed(tmp_path: Pa
     root, _, account, _, _, _ = _fixture(tmp_path)
     store = ManualOutcomeStore(root)
     with store.account_lock(account.id), pytest.raises(ManualOutcomeError) as busy:
-        store.record(account.id, _target(), "b" * 64, "ABORTED_NOT_SENT")
+        store.begin_handoff(account.id, _target(), "b" * 64)
     assert busy.value.code == "MANUAL_OUTCOME_BUSY"
 
 
@@ -549,6 +881,7 @@ def test_s4_terminal_gate_precedes_root_and_operator_file_access(tmp_path: Path)
             _target(),
             tmp_path / "missing-draft.txt",
             "0" * 64,
+            "00000000-0000-4000-8000-000000000000",
             "AMBIGUOUS",
             None,
             data_root_factory=unexpected_root,
@@ -596,6 +929,29 @@ def test_manual_workflow_parser_keeps_review_compatible_and_s4_explicit() -> Non
     )
     assert parsed.recruitment_command == "manual-handoff"
     assert parsed.interactive
+    record = cli._build_parser().parse_args(
+        [
+            "recruitment",
+            "manual-record",
+            "synthetic_account",
+            "--targets-file",
+            "targets.txt",
+            "--select",
+            "1",
+            "--confirm-target",
+            _target(),
+            "--draft-file",
+            "draft.txt",
+            "--approve-sha",
+            "a" * 64,
+            "--attempt-id",
+            "00000000-0000-4000-8000-000000000001",
+            "--outcome",
+            "ABORTED_NOT_SENT",
+        ]
+    )
+    assert record.recruitment_command == "manual-record"
+    assert record.attempt_id == "00000000-0000-4000-8000-000000000001"
     with pytest.raises(SystemExit):
         cli._build_parser().parse_args(
             [

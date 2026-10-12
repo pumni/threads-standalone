@@ -794,6 +794,7 @@ def _build_parser() -> argparse.ArgumentParser:
     manual_record_parser.add_argument("--confirm-target", required=True)
     manual_record_parser.add_argument("--draft-file", required=True)
     manual_record_parser.add_argument("--approve-sha", required=True)
+    manual_record_parser.add_argument("--attempt-id", required=True)
     manual_record_parser.add_argument(
         "--outcome",
         choices=("ABORTED_NOT_SENT", "OPERATOR_REPORTED_SENT_UNVERIFIED", "AMBIGUOUS"),
@@ -878,6 +879,7 @@ def _handle_recruitment_command(args: argparse.Namespace) -> int:
             args.confirm_target,
             Path(args.draft_file),
             args.approve_sha,
+            args.attempt_id,
             args.outcome,
             None if args.context_file is None else Path(args.context_file),
             data_root_factory=resolve_standalone_data_root,

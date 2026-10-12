@@ -254,25 +254,32 @@ def run_manual_handoff_cli(
         interrupted_code="MANUAL_HANDOFF_INTERRUPTED",
     )
 
-    with outcome_store.account_lock(account.id):
-        previous = outcome_store.read(account.id, review.opportunity.target_url)
-        if previous is not None and previous.blocks_handoff:
-            raise ManualOutcomeError("MANUAL_OUTCOME_BLOCKED")
-        runtime = runtime_factory(root, accounts)
-        result = _run_s1_handoff(
-            runtime,
-            alias,
-            review.relative_thread_ref,
-            account.id,
-            private_stderr,
-        )
-        if not result.recognized or result.target_ref != review.relative_thread_ref:
-            raise ManualWorkflowError("MANUAL_HANDOFF_RESULT_MISMATCH")
-        private_stderr.write(
-            "HANDOFF_CLOSED_ACTION_UNVERIFIED "
-            f"target={result.target_ref} identity=UNKNOWN_IDENTITY\n"
-        )
-        private_stderr.flush()
+    attempt = outcome_store.begin_handoff(
+        account.id,
+        review.opportunity.target_url,
+        review.draft_sha256,
+    )
+    private_stderr.write(
+        f"HANDOFF_UNRESOLVED attempt_id={attempt.attempt_id} draft_sha256={attempt.draft_sha256}\n"
+    )
+    private_stderr.flush()
+
+    runtime = runtime_factory(root, accounts)
+    result = _run_s1_handoff(
+        runtime,
+        alias,
+        review.relative_thread_ref,
+        account.id,
+        private_stderr,
+    )
+    if not result.recognized or result.target_ref != review.relative_thread_ref:
+        raise ManualWorkflowError("MANUAL_HANDOFF_RESULT_MISMATCH")
+    private_stderr.write(
+        "HANDOFF_CLOSED_ACTION_UNVERIFIED "
+        f"attempt_id={attempt.attempt_id} target={result.target_ref} "
+        "identity=UNKNOWN_IDENTITY; operator RECORD is required before another handoff\n"
+    )
+    private_stderr.flush()
     return 0
 
 
@@ -283,6 +290,7 @@ def run_manual_record_cli(
     confirm_target: str,
     draft_file: Path,
     approve_sha: str,
+    attempt_id: str,
     outcome: ManualOutcomeValue,
     context_file: Path | None,
     *,
@@ -318,6 +326,25 @@ def run_manual_record_cli(
         approve_sha,
     )
     outcome_store = ManualOutcomeStore(root)
+    current = outcome_store.read(account.id, review.opportunity.target_url)
+    if current is None:
+        raise ManualOutcomeError("MANUAL_OUTCOME_NO_PENDING")
+    latest = current.latest
+    if latest.status == "HANDOFF_UNRESOLVED":
+        if latest.attempt_id != attempt_id:
+            raise ManualOutcomeError("MANUAL_OUTCOME_ATTEMPT_MISMATCH")
+        if latest.draft_sha256 != review.draft_sha256:
+            raise ManualOutcomeError("MANUAL_OUTCOME_APPROVAL_MISMATCH")
+    elif latest.source == "OPERATOR" and latest.attempt_id == attempt_id:
+        if latest.draft_sha256 != review.draft_sha256:
+            raise ManualOutcomeError("MANUAL_OUTCOME_APPROVAL_MISMATCH")
+        if latest.status != outcome:
+            raise ManualOutcomeError("MANUAL_OUTCOME_BLOCKED")
+    elif latest.status in {"AMBIGUOUS", "OPERATOR_REPORTED_SENT_UNVERIFIED"}:
+        raise ManualOutcomeError("MANUAL_OUTCOME_BLOCKED")
+    else:
+        raise ManualOutcomeError("MANUAL_OUTCOME_ATTEMPT_MISMATCH")
+
     fingerprint = outcome_store.target_fingerprint(account.id, review.opportunity.target_url)
     private_stderr.write(
         "MANUAL OUTCOME ATTESTATION — PRIVATE LOCAL TERMINAL\n"
@@ -325,6 +352,7 @@ def run_manual_record_cli(
         f"account UUID: {account.id}\n"
         f"exact target: {review.opportunity.target_url}\n"
         f"target fingerprint: {fingerprint}\n"
+        f"handoff attempt ID: {attempt_id}\n"
         f"draft SHA-256: {review.draft_sha256}\n"
         f"operator declaration: {outcome}\n"
         "verification: UNVERIFIED; this is not an official receipt or proof of sending\n"
@@ -337,15 +365,17 @@ def run_manual_record_cli(
         failure_code="MANUAL_RECORD_NOT_CONFIRMED",
         interrupted_code="MANUAL_RECORD_INTERRUPTED",
     )
-    event, idempotent = outcome_store.record(
+    event, idempotent = outcome_store.resolve_handoff(
         account.id,
         review.opportunity.target_url,
         review.draft_sha256,
+        attempt_id,
         outcome,
     )
     private_stderr.write(
-        f"recorded={event.operator_declaration} verification={event.verification} "
-        f"event_id={event.event_id} idempotent={str(idempotent).lower()}\n"
+        f"recorded={event.status} verification={event.verification} "
+        f"attempt_id={event.attempt_id} event_id={event.event_id} "
+        f"idempotent={str(idempotent).lower()}\n"
     )
     private_stderr.flush()
     return 0
@@ -399,8 +429,9 @@ def run_manual_status_cli(
     else:
         latest = record.latest
         private_stderr.write(
-            f"status={latest.operator_declaration} verification={latest.verification} "
-            f"event_id={latest.event_id} recorded_at={latest.recorded_at} "
+            f"status={latest.status} verification={latest.verification} "
+            f"attempt_id={latest.attempt_id} event_id={latest.event_id} "
+            f"recorded_at={latest.recorded_at} "
             f"draft_sha256={latest.draft_sha256}\n"
         )
     private_stderr.flush()

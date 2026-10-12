@@ -215,11 +215,13 @@ uv run --locked python scripts/run_recruitment.py --account test-a --observe
      --interactive
    ```
 
-   Bỏ `--context-file` nếu không dùng context. Lệnh đọc lại account, shortlist, draft và context, tính lại SHA S3, rồi in account alias/UUID, actor `UNKNOWN_IDENTITY`, exact target và draft vào `stderr` riêng tư. Chỉ dòng `OPEN` rồi Enter mới mở một browser S1 tới target đã duyệt; Enter trống, EOF hoặc nội dung khác dừng trước khi mở. Trong browser, operator tự kiểm tra account và target. Công cụ không điền nội dung, tìm composer hoặc nhấn Send. Sau khi đóng browser, `HANDOFF_CLOSED_ACTION_UNVERIFIED` chỉ cho biết phiên handoff đã đóng; nó không xác nhận có gửi hay không.
+   Bỏ `--context-file` nếu không dùng context. Lệnh đọc lại account, shortlist, draft và context, tính lại SHA S3, rồi in account alias/UUID, actor `UNKNOWN_IDENTITY`, exact target và draft vào `stderr` riêng tư. Chỉ dòng `OPEN` rồi Enter mới tiếp tục. Ngay sau xác nhận này, trước khi khởi tạo browser, lệnh ghi bền vững sự kiện `HANDOFF_UNRESOLVED` vào journal riêng và in `attempt_id`; nếu journal ghi lỗi hoặc đang bị khóa, Chromium không mở. Trong browser, operator tự kiểm tra account và target. Công cụ không điền nội dung, tìm composer hoặc nhấn Send. Đóng browser bình thường, crash hoặc mất điện đều không tự ghi outcome: attempt vẫn `HANDOFF_UNRESOLVED` và chặn handoff tiếp theo. `HANDOFF_CLOSED_ACTION_UNVERIFIED` chỉ cho biết phiên đã đóng; không xác nhận có gửi hay không.
 
-9. Nếu operator muốn lưu lời khai kết quả, chạy lại `manual-review` với cùng account/target/draft/context để lấy SHA hiện tại, cập nhật `$approvalSha`, rồi chạy `manual-record` với SHA được tính lại, chọn một outcome và nhập đúng `RECORD`:
+9. Trước khi mở lại target, operator bắt buộc phải resolve attempt hiện tại. Dùng `manual-status` để xem `status=HANDOFF_UNRESOLVED` và `attempt_id`; nhập đúng attempt ID đã in khi handoff, duyệt lại đúng account/target/draft/context để lấy SHA hiện tại, rồi chạy `manual-record` và nhập chính xác `RECORD`:
 
    ```powershell
+   $attemptId = Read-Host "Nhập attempt_id đang HANDOFF_UNRESOLVED từ manual-status"
+   $approvalSha = Read-Host "Nhập SHA-256 chính xác từ manual-review"
    uv run --locked threads-local recruitment manual-record test-a `
      --targets-file .\targets.txt `
      --select 2 `
@@ -227,10 +229,11 @@ uv run --locked python scripts/run_recruitment.py --account test-a --observe
      --draft-file .\draft.txt `
      --context-file .\context.txt `
      --approve-sha $approvalSha `
+     --attempt-id $attemptId `
      --outcome ABORTED_NOT_SENT
    ```
 
-   `--outcome` nhận `ABORTED_NOT_SENT`, `OPERATOR_REPORTED_SENT_UNVERIFIED` hoặc `AMBIGUOUS`. Đây là lời khai của operator, luôn mang `UNVERIFIED`, không phải receipt hay bằng chứng gửi. Journal nằm riêng trong `manual_recruitment_v1`; nó chỉ lưu account UUID, fingerprint target, SHA draft, thời điểm và outcome, không lưu URL, draft hay context. `AMBIGUOUS` và `OPERATOR_REPORTED_SENT_UNVERIFIED` chặn mở lại target qua S4. Chỉ `ABORTED_NOT_SENT` không chặn lần handoff sau.
+   `--attempt-id` phải khớp attempt đang pending của đúng account và target; attempt cũ không thể resolve attempt mới. `--outcome` nhận `ABORTED_NOT_SENT`, `OPERATOR_REPORTED_SENT_UNVERIFIED` hoặc `AMBIGUOUS`. Chỉ chọn `ABORTED_NOT_SENT` khi operator biết chắc chưa gửi; đây là lựa chọn duy nhất cho phép handoff mới. Nếu có thể đã gửi nhưng không xác định được, chọn `AMBIGUOUS`; nếu operator tự khai đã gửi, chọn `OPERATOR_REPORTED_SENT_UNVERIFIED`. Hai trạng thái này chặn handoff tiếp theo. Cả ba đều là lời khai của operator, luôn mang `UNVERIFIED`, không phải receipt hay bằng chứng gửi. Journal nằm riêng trong `manual_recruitment_v1`; nó chỉ lưu account UUID, fingerprint target, SHA draft, attempt/event ID, thời điểm và trạng thái, không lưu URL, draft hay context.
 
 10. Xem trạng thái target trong terminal riêng tư bằng lệnh read-only sau; shortlist và target phải khớp chính xác:
 
@@ -241,7 +244,7 @@ uv run --locked python scripts/run_recruitment.py --account test-a --observe
      --confirm-target "https://www.threads.com/@synthetic/post/fake_02"
    ```
 
-   Mọi kết quả đều là `UNVERIFIED`, kể cả lời khai `OPERATOR_REPORTED_SENT_UNVERIFIED`. S4 handoff/outcome hiện chỉ được kiểm thử với browser giả và dữ liệu tổng hợp; không chạy trên Threads thật nếu chưa có phê duyệt live riêng. Hướng dẫn này không cấp quyền truy cập tự động hay gửi nội dung. S1 vẫn không tự điền hoặc gửi reply.
+   Lệnh này chỉ đọc journal, không xóa hoặc resolve attempt. Nếu trạng thái còn `HANDOFF_UNRESOLVED`, phải dùng đúng `attempt_id` với `manual-record`; không chạy lại `manual-handoff` để thử lại. Mọi kết quả đều là `UNVERIFIED`, kể cả lời khai `OPERATOR_REPORTED_SENT_UNVERIFIED`. S4 handoff/outcome hiện chỉ được kiểm thử với browser giả và dữ liệu tổng hợp; không chạy trên Threads thật nếu chưa có phê duyệt live riêng. Hướng dẫn này không cấp quyền truy cập tự động hay gửi nội dung. S1 vẫn không tự điền hoặc gửi reply.
 
 ### API-driven Nurture
 
