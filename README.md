@@ -78,7 +78,7 @@ CI installs the built wheel with locked runtime dependencies in an isolated envi
 
 ## Release readiness
 
-This checkpoint is **synthetic-ready, not production-ready**. No live Threads UAT was run. No platform permission for automated browser reads or actions is claimed. A release still requires hosted Windows and Ubuntu QA, full-history Gitleaks, isolated installed-wheel smoke, approved local data-root/security checks, separately approved account/actor/target UAT, and confirmation of platform terms and compliance requirements. Official API features remain subject to their applicable Meta app review and permissions.
+This checkpoint is **synthetic-ready, not production-ready**. No live Threads UAT was run; the installed Browser Jobs live source is still disabled. Release readiness requires hosted Windows/Ubuntu QA, full-history Gitleaks, installed-wheel smoke, approved local data-root/security checks and separate operator-selected account/actor/target UAT. Browser development does **not** require a recurring Threads Terms clearance or API App Review. Official API capabilities separately depend on the scopes and App Review applicable to those endpoints. This repository does not claim external-platform endorsement.
 
 See [the release readiness runbook](docs/BROWSER_MVP_RELEASE_READINESS.md) for installation and stop/recovery steps, required evidence, and the outstanding release gates. S1–S5 do not provide autonomous search, scheduling, crawling, automatic replies, or unsupervised engagement.
 
