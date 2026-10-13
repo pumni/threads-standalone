@@ -13,6 +13,9 @@ from enum import StrEnum
 from typing import cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+from playwright.async_api import Error as AsyncPlaywrightError
+from playwright.async_api import Page as AsyncPage
+from playwright.async_api import TimeoutError as AsyncPlaywrightTimeoutError
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -671,6 +674,330 @@ class ThreadsJobUiReader:
             if self._page.is_closed():
                 raise BrowserProcessCrashed() from None
             raise BrowserReadTimeout() from None
+
+
+class AsyncThreadsJobUiReader:
+    """Async adapter over the same bounded DOM semantics as the B1 reader."""
+
+    def __init__(
+        self,
+        page: AsyncPage,
+        *,
+        origin: str = _DEFAULT_ORIGIN,
+        action_timeout_ms: int = 5_000,
+        max_batches: int = _MAX_BATCHES,
+        max_cards_per_batch: int = _MAX_CARDS_PER_BATCH,
+    ) -> None:
+        if not _valid_origin(origin):
+            raise BrowserAdapterError("BROWSER_ORIGIN_INVALID")
+        if (
+            type(action_timeout_ms) is not int
+            or action_timeout_ms < 1
+            or type(max_batches) is not int
+            or not 1 <= max_batches <= _MAX_BATCHES
+            or type(max_cards_per_batch) is not int
+            or not 1 <= max_cards_per_batch <= _MAX_CARDS_PER_BATCH
+        ):
+            raise BrowserAdapterError("BROWSER_LIMIT_INVALID")
+        self._page = page
+        self._origin = origin.rstrip("/")
+        self._timeout_ms = action_timeout_ms
+        self._max_batches = max_batches
+        self._max_cards_per_batch = max_cards_per_batch
+        self._scroll_count = 0
+        page.set_default_timeout(action_timeout_ms)
+        page.set_default_navigation_timeout(action_timeout_ms)
+
+    @property
+    def scroll_count(self) -> int:
+        return self._scroll_count
+
+    async def verify_signed_in(self, expected_actor: str) -> UiPageState:
+        """Verify visible account UI before beginning a search cycle."""
+
+        if not _USERNAME_RE.fullmatch(expected_actor):
+            raise BrowserAdapterError("BROWSER_ACTOR_INVALID")
+        await self._goto(f"{self._origin}/")
+        state, _ = await self._page_state(
+            expected_path="/",
+            expected_query=None,
+            expected_actor=expected_actor,
+            require_search=False,
+        )
+        return state
+
+    async def search(self, query: str, *, expected_actor: str) -> tuple[UiFeedBatch, ...]:
+        """Search bounded visible feed batches, validating account UI at each step."""
+
+        self._scroll_count = 0
+        if not query.strip() or len(query) > _MAX_QUERY_CODEPOINTS:
+            raise BrowserAdapterError("BROWSER_QUERY_INVALID")
+        if not _USERNAME_RE.fullmatch(expected_actor):
+            raise BrowserAdapterError("BROWSER_ACTOR_INVALID")
+        search_url = f"{self._origin}/search?{urlencode({'q': query})}"
+        await self._goto(search_url)
+        batches: list[UiFeedBatch] = []
+        for batch_index in range(self._max_batches):
+            page_state, page_url = await self._page_state(
+                expected_path="/search",
+                expected_query=query,
+                expected_actor=expected_actor,
+                require_search=True,
+            )
+            if page_state is not UiPageState.READY:
+                batches.append(UiFeedBatch(batch_index, page_url, page_state, (), False))
+                return tuple(batches)
+            snapshot = _object(
+                await self._evaluate(
+                    _FEED_BATCH_SCRIPT,
+                    {"batchIndex": batch_index, "maxCards": self._max_cards_per_batch},
+                )
+            )
+            if snapshot.get("ok") is not True:
+                code = (
+                    "BROWSER_CARD_LIMIT_EXCEEDED"
+                    if snapshot.get("reason") == "card_bound"
+                    else "BROWSER_SELECTOR_DRIFT"
+                )
+                raise BrowserAdapterError(code)
+            raw_cards = snapshot.get("cards")
+            if not isinstance(raw_cards, list):
+                raise BrowserAdapterError("BROWSER_CARD_LIMIT_EXCEEDED")
+            card_values = cast(list[object], raw_cards)
+            if len(card_values) > self._max_cards_per_batch:
+                raise BrowserAdapterError("BROWSER_CARD_LIMIT_EXCEEDED")
+            cards = tuple(self._decode_card(item) for item in card_values)
+            has_more = snapshot.get("hasMore")
+            if not isinstance(has_more, bool):
+                raise BrowserAdapterError("BROWSER_SELECTOR_DRIFT")
+            batches.append(UiFeedBatch(batch_index, page_url, page_state, cards, has_more))
+            if not has_more or batch_index + 1 == self._max_batches:
+                break
+            scroll = _object(await self._evaluate(_SCROLL_SCRIPT, None))
+            before, after = scroll.get("before"), scroll.get("after")
+            if type(before) is not int or type(after) is not int or after <= before:
+                raise BrowserAdapterError("BROWSER_SCROLL_FAILED")
+            self._scroll_count += 1
+            await self._wait_for_render()
+        if not batches or not any(batch.cards for batch in batches):
+            raise BrowserAdapterError("BROWSER_EMPTY_FEED")
+        return tuple(batches)
+
+    async def read_exact_post(
+        self,
+        target: str,
+        *,
+        expected_actor: str,
+    ) -> UiPostDetail:
+        """Read one exact root post with B1's same-card author/body rules."""
+
+        canonical_target, target_path, _ = _parse_post_target(target, self._origin)
+        if not _USERNAME_RE.fullmatch(expected_actor):
+            raise BrowserAdapterError("BROWSER_ACTOR_INVALID")
+        await self._goto(canonical_target)
+        state, page_url = await self._page_state(
+            expected_path=target_path,
+            expected_query=None,
+            expected_actor=expected_actor,
+            require_search=False,
+        )
+        if state is not UiPageState.READY:
+            return UiPostDetail(target, page_url, canonical_target, state)
+        snapshot = _object(
+            await self._evaluate(
+                _DETAIL_SCRIPT,
+                {"target": canonical_target, "maxBodyCodepoints": _MAX_BODY_CODEPOINTS},
+            )
+        )
+        if snapshot.get("ok") is not True:
+            code = (
+                "BROWSER_ROOT_NOT_FOUND"
+                if snapshot.get("reason") == "root"
+                else "BROWSER_SELECTOR_DRIFT"
+            )
+            raise BrowserAdapterError(code)
+        if snapshot.get("canonicalPath") != target_path:
+            raise BrowserAdapterError("BROWSER_TARGET_MISMATCH")
+        author_path = snapshot.get("authorPath")
+        if not isinstance(author_path, str):
+            raise BrowserAdapterError("BROWSER_AUTHOR_MISMATCH")
+        profile = _PROFILE_PATH_RE.fullmatch(author_path)
+        if profile is None:
+            raise BrowserAdapterError("BROWSER_AUTHOR_MISMATCH")
+        body_value = snapshot.get("body")
+        body = body_value if isinstance(body_value, str) else None
+        partial = snapshot.get("partial") is True or len(body or "") > _MAX_BODY_CODEPOINTS
+        if body is not None:
+            body = body[:_MAX_BODY_CODEPOINTS]
+        try:
+            kind = UiPostKind(snapshot.get("kind"))
+        except TypeError, ValueError:
+            kind = UiPostKind.UNKNOWN
+        visibility = (
+            UiBodyVisibility.UNKNOWN
+            if body is None
+            else UiBodyVisibility.PARTIAL
+            if partial
+            else UiBodyVisibility.FULL_VISIBLE
+        )
+        return UiPostDetail(
+            requested_url=canonical_target,
+            page_url=page_url,
+            canonical_post_url=canonical_target,
+            state=state,
+            author_username=profile.group("username"),
+            body=body,
+            body_visibility=visibility,
+            body_truncated=partial,
+            post_kind=kind,
+            image_only=snapshot.get("imageOnly") is True,
+        )
+
+    def _decode_card(self, value: object) -> UiPostTarget:
+        card = _object(value)
+        raw_posts = card.get("postLinks")
+        raw_authors = card.get("headerLinks")
+        if not isinstance(raw_posts, list) or not isinstance(raw_authors, list):
+            raise BrowserAdapterError("BROWSER_SELECTOR_DRIFT")
+        targets = {
+            _parse_post_target(item, self._origin)[0]
+            for item in cast(list[object], raw_posts)
+            if isinstance(item, str)
+        }
+        if len(targets) != 1:
+            raise BrowserAdapterError(
+                "BROWSER_PERMALINK_MISSING" if not targets else "BROWSER_PERMALINK_MISMATCH"
+            )
+        authors = {
+            author
+            for item in cast(list[object], raw_authors)
+            if isinstance(item, str)
+            and (author := _parse_profile_link(item, self._origin)) is not None
+        }
+        if len(authors) != 1:
+            raise BrowserAdapterError("BROWSER_AUTHOR_MISMATCH")
+        target = next(iter(targets))
+        _, _, permalink_author = _parse_post_target(target, self._origin)
+        author = next(iter(authors))
+        if author != permalink_author:
+            raise BrowserAdapterError("BROWSER_AUTHOR_MISMATCH")
+        return UiPostTarget(target, author)
+
+    async def _page_state(
+        self,
+        *,
+        expected_path: str,
+        expected_query: str | None,
+        expected_actor: str,
+        require_search: bool,
+    ) -> tuple[UiPageState, str]:
+        page_url = self._page.url
+        try:
+            parsed = urlsplit(page_url)
+        except ValueError:
+            return UiPageState.REDIRECTED, page_url
+        origin = urlsplit(self._origin)
+        if parsed.scheme != "https" or parsed.netloc != origin.netloc:
+            return UiPageState.REDIRECTED, page_url
+        result = _object(
+            await self._evaluate(
+                _PAGE_STATE_SCRIPT,
+                {
+                    "expectedOrigin": self._origin,
+                    "expectedPath": expected_path,
+                    "expectedQuery": expected_query,
+                    "expectedActor": expected_actor,
+                    "requireSearch": require_search,
+                },
+            )
+        )
+        try:
+            state = UiPageState(result.get("state"))
+        except TypeError, ValueError:
+            return UiPageState.UNKNOWN, page_url
+        if state is not UiPageState.READY:
+            return state, page_url
+        if result.get("mains") != 1:
+            raise BrowserAdapterError("BROWSER_SELECTOR_DRIFT")
+        banner_links = result.get("bannerLinks")
+        if not isinstance(banner_links, list):
+            raise BrowserAdapterError("BROWSER_SELECTOR_DRIFT")
+        actors = {
+            actor
+            for item in cast(list[object], banner_links)
+            if (actor := _parse_profile_link(item, self._origin)) is not None
+        }
+        if actors != {expected_actor}:
+            raise BrowserAdapterError("BROWSER_SESSION_MISMATCH")
+        if require_search:
+            try:
+                parsed_query = parse_qs(parsed.query, strict_parsing=True)
+            except ValueError:
+                return UiPageState.REDIRECTED, page_url
+            if (
+                expected_query is None
+                or parsed.path != "/search"
+                or parsed_query != {"q": [expected_query]}
+                or result.get("searchValues") != [expected_query]
+            ):
+                raise BrowserAdapterError("BROWSER_QUERY_MISMATCH")
+        elif parsed.path != expected_path or parsed.query or parsed.fragment:
+            return UiPageState.REDIRECTED, page_url
+        return UiPageState.READY, page_url
+
+    async def _goto(self, url: str) -> None:
+        try:
+            await self._page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=self._timeout_ms,
+            )
+            await self._page.wait_for_timeout(min(50, self._timeout_ms))
+        except AsyncPlaywrightTimeoutError:
+            if self._page.is_closed():
+                raise BrowserProcessCrashed() from None
+            raise NavigationTimeout() from None
+        except AsyncPlaywrightError:
+            if self._page.is_closed():
+                raise BrowserProcessCrashed() from None
+            actual = _page_origin(self._page.url)
+            if actual != self._origin:
+                return
+            raise BrowserAdapterError("BROWSER_NAVIGATION_FAILED") from None
+        except Exception:  # noqa: BLE001 - browser backend details stay private.
+            if self._page.is_closed():
+                raise BrowserProcessCrashed() from None
+            raise BrowserAdapterError("BROWSER_NAVIGATION_FAILED") from None
+
+    async def _evaluate(self, script: str, argument: object) -> object:
+        try:
+            return await self._page.evaluate(script, argument)
+        except AsyncPlaywrightTimeoutError:
+            raise BrowserReadTimeout() from None
+        except AsyncPlaywrightError:
+            if self._page.is_closed():
+                raise BrowserProcessCrashed() from None
+            raise BrowserAdapterError("BROWSER_READ_FAILED") from None
+        except Exception:  # noqa: BLE001 - browser backend details stay private.
+            if self._page.is_closed():
+                raise BrowserProcessCrashed() from None
+            raise BrowserAdapterError("BROWSER_READ_FAILED") from None
+
+    async def _wait_for_render(self) -> None:
+        try:
+            await self._page.wait_for_timeout(min(100, self._timeout_ms))
+        except AsyncPlaywrightError:
+            if self._page.is_closed():
+                raise BrowserProcessCrashed() from None
+            raise BrowserReadTimeout() from None
+
+
+def _page_origin(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _parse_post_target(value: object, origin: str) -> tuple[str, str, str]:

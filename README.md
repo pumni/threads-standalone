@@ -59,6 +59,8 @@ The `manual-handoff`, `account login`, `profile`, `thread`, `feed`, and `browser
 | `post`, `reply`, media publishing, moderation, Nurture `--apply` | Can cause remote effects; use only with separate authorization for account, target, and content |
 | `workflow`, `recurrence`, other Nurture commands | Follow their documented local/API boundaries; they do not make the browser MVP autonomous |
 
+Browser Nurture has its own bounded, read-only workflow. Its live browser source currently returns `DISABLED_PERMISSION_PENDING`; see [the operator notes](docs/BROWSER_NURTURE.md) for configuration, offline fixture use, state, and Windows Task Scheduler setup.
+
 The API, mutation, Nurture, Workflow, and Recurrence commands remain separate existing capabilities. They retain their existing v1 account and operation schemas. S5 adds no production dependency and changes no existing schema.
 
 ## Setup and development
@@ -75,6 +77,8 @@ uv build
 ```
 
 CI installs the built wheel with locked runtime dependencies in an isolated environment outside the checkout, clears `PYTHONPATH`, verifies the `threads-local` entry point and package contents, and runs the synthetic suite against the installed wheel. The integrated S1–S5 test uses a fake browser engine and temporary synthetic roots.
+
+Browser Nurture also has an installed-CLI acceptance test that launches local Playwright Chromium against generated `.invalid` pages. It makes no Threads request; see [the Browser Nurture notes](docs/BROWSER_NURTURE.md).
 
 ## Release readiness
 

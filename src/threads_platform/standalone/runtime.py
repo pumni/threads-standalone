@@ -6,7 +6,9 @@ import asyncio
 import os
 import re
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, TextIO, cast
 from uuid import UUID
@@ -122,6 +124,37 @@ class StandaloneRuntimeError(Exception):
         super().__init__(code)
 
 
+@dataclass(slots=True, repr=False)
+class BrowserProfileLease:
+    """One account-locked persistent profile owner, restartable without releasing its lock."""
+
+    account: LocalAccount
+    profile_directory: Path = field(repr=False)
+    request: BrowserLaunchRequest = field(repr=False)
+    engine: BrowserEngine = field(repr=False)
+    session: BrowserEngineSession | None = field(default=None, repr=False)
+    open_count: int = 0
+
+    def __repr__(self) -> str:
+        return f"BrowserProfileLease(account=<redacted>, open_count={self.open_count})"
+
+    async def start(self) -> None:
+        if self.session is not None:
+            raise StandaloneRuntimeError("BROWSER_SESSION_ALREADY_OPEN")
+        self.session = await self.engine.open(self.request)
+        self.open_count += 1
+
+    async def restart(self) -> None:
+        await self.close_browser()
+        await self.start()
+
+    async def close_browser(self) -> None:
+        session = self.session
+        self.session = None
+        if session is not None:
+            await session.close()
+
+
 class LocalRuntime:
     def __init__(
         self,
@@ -134,6 +167,56 @@ class LocalRuntime:
         self._browser_engine = (
             browser_engine if browser_engine is not None else PlaywrightBrowserEngine()
         )
+
+    @contextmanager
+    def account_lock(self, account: LocalAccount) -> Generator[None]:
+        """Use the same UUID lock as one-shot browser/profile commands."""
+
+        lock = FilesystemProcessLock(self._lock_path(account))
+        try:
+            lock.acquire()
+        except ProcessAlreadyRunning:
+            raise StandaloneRuntimeError("ACCOUNT_BUSY") from None
+        except OSError:
+            raise StandaloneRuntimeError("LOCAL_PROFILE_UNAVAILABLE") from None
+        try:
+            yield
+        finally:
+            try:
+                lock.release()
+            except OSError:
+                raise StandaloneRuntimeError("LOCAL_PROFILE_UNAVAILABLE") from None
+
+    @asynccontextmanager
+    async def own_browser_profile(
+        self,
+        alias: str,
+        *,
+        headless: bool = False,
+    ) -> AsyncGenerator[BrowserProfileLease]:
+        """Hold the account profile lock for the full async browser session."""
+
+        account = await asyncio.to_thread(self._accounts.get, alias)
+        profile_directory = self._profile_directory(account)
+        if not profile_directory.is_dir():
+            raise StandaloneRuntimeError("LOCAL_PROFILE_UNAVAILABLE")
+        request = BrowserLaunchRequest(
+            profile_directory=profile_directory,
+            network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
+            proxy_credentials=None,
+            headless=headless,
+        )
+        with self.account_lock(account):
+            lease = BrowserProfileLease(
+                account=account,
+                profile_directory=profile_directory,
+                request=request,
+                engine=self._browser_engine,
+            )
+            try:
+                yield lease
+            finally:
+                await lease.close_browser()
 
     async def login(
         self,

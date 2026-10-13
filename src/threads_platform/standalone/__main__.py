@@ -8,8 +8,9 @@ import re
 import sys
 from collections.abc import Sequence
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal, NoReturn, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -657,6 +658,183 @@ def _handle_nurture_cli_command(args: argparse.Namespace) -> int:
     return 0
 
 
+class _BrowserNurtureRunResultView(Protocol):
+    @property
+    def status(self) -> StrEnum: ...
+
+    @property
+    def reason_code(self) -> str | None: ...
+
+    @property
+    def cycles(self) -> int: ...
+
+    @property
+    def feed_candidates(self) -> int: ...
+
+    @property
+    def scanned(self) -> int: ...
+
+    @property
+    def relevant(self) -> int: ...
+
+    @property
+    def irrelevant(self) -> int: ...
+
+    @property
+    def unknown(self) -> int: ...
+
+    @property
+    def duplicates(self) -> int: ...
+
+    @property
+    def scrolls(self) -> int: ...
+
+    @property
+    def sessions_opened(self) -> int: ...
+
+    @property
+    def checkpoint_cycles(self) -> int: ...
+
+
+def _format_browser_nurture_result(result: _BrowserNurtureRunResultView, *, source: str) -> str:
+    status = result.status.value
+    reason = result.reason_code or "-"
+    return (
+        f"BROWSER_NURTURE status={status} source={source} reason={reason} "
+        f"cycles={result.cycles} "
+        f"feed_candidates={result.feed_candidates} "
+        f"scanned={result.scanned} "
+        f"relevant={result.relevant} "
+        f"irrelevant={result.irrelevant} "
+        f"unknown={result.unknown} "
+        f"duplicates={result.duplicates} "
+        f"scrolls={result.scrolls} "
+        f"sessions_opened={result.sessions_opened} "
+        f"checkpoint_cycles={result.checkpoint_cycles}\n"
+    )
+
+
+def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
+    if args.browser_nurture_command == "run" and args.source == "browser":
+        sys.stdout.write(
+            "BROWSER_NURTURE status=DISABLED_PERMISSION_PENDING source=BROWSER_UI "
+            "reason=SOURCE_DISABLED cycles=0 feed_candidates=0 scanned=0 relevant=0 "
+            "irrelevant=0 unknown=0 duplicates=0 scrolls=0 sessions_opened=0 "
+            "checkpoint_cycles=0\n"
+        )
+        return 1
+
+    from threads_platform.standalone.browser_nurture import (
+        BrowserNurtureError,
+        BrowserNurtureRunner,
+        load_synthetic_nurture_fixture,
+        validate_synthetic_nurture_root,
+    )
+    from threads_platform.standalone.browser_nurture_state import (
+        BrowserNurtureStateError,
+        BrowserNurtureStateStore,
+        validate_browser_nurture_config,
+    )
+    from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
+
+    if args.browser_nurture_command == "configure":
+        try:
+            root = resolve_standalone_data_root()
+            accounts = LocalAccountStore(root)
+            account = accounts.get(args.alias)
+            config = validate_browser_nurture_config(
+                {
+                    "schema_version": 1,
+                    "account_uuid": str(account.id),
+                    "expected_username": args.expected_username,
+                    "topics": args.topic,
+                    "relevance_terms": args.relevance_term or args.topic,
+                    "max_posts_per_cycle": args.max_posts_per_cycle,
+                    "idle_seconds": args.idle_seconds,
+                }
+            )
+            state = BrowserNurtureStateStore(root)
+            with LocalRuntime(root, accounts).account_lock(account):
+                state.save_config(config)
+        except (
+            BrowserNurtureError,
+            BrowserNurtureStateError,
+            StandaloneRuntimeError,
+            StandaloneAccountError,
+        ) as error:
+            sys.stderr.write(f"ERROR {error.code}\n")
+            return 1
+        sys.stdout.write(
+            "BROWSER_NURTURE_CONFIG status=SAVED "
+            f"topics={len(config.topics)} relevance_terms={len(config.relevance_terms)} "
+            f"max_posts_per_cycle={config.max_posts_per_cycle} "
+            f"idle_seconds={config.idle_seconds}\n"
+        )
+        return 0
+
+    try:
+        if args.source != "ui-fixture":
+            raise BrowserNurtureError("SOURCE_INVALID")
+        if not isinstance(args.data_root, str) or not args.data_root.strip():
+            raise BrowserNurtureError("DATA_ROOT_REQUIRED")
+        if not isinstance(args.fixture_file, str) or not args.fixture_file.strip():
+            raise BrowserNurtureError("FIXTURE_REQUIRED")
+        data_root_candidate = Path(args.data_root).expanduser()
+        if not data_root_candidate.is_absolute():
+            raise BrowserNurtureError("DATA_ROOT_INVALID")
+        data_root = validate_synthetic_nurture_root(data_root_candidate)
+        accounts = LocalAccountStore(data_root)
+        account = accounts.get(args.alias)
+        if re.fullmatch(r"(?:test|synthetic)-[a-z0-9](?:[a-z0-9-]{0,29})", account.alias) is None:
+            raise BrowserNurtureError("SYNTHETIC_ACCOUNT_REQUIRED")
+        state = BrowserNurtureStateStore(data_root)
+        config = state.load_config(account.id)
+        if config is None:
+            raise BrowserNurtureError("CONFIG_NOT_FOUND")
+        if (
+            re.fullmatch(
+                r"(?:test|synthetic|fixture)[._-][A-Za-z0-9._-]{1,28}",
+                config.expected_username,
+            )
+            is None
+        ):
+            raise BrowserNurtureError("SYNTHETIC_ACTOR_REQUIRED")
+        fixture = load_synthetic_nurture_fixture(Path(args.fixture_file), config)
+        cycles = args.max_cycles
+        if cycles is None and not args.continuous:
+            cycles = 1
+        result = asyncio.run(
+            BrowserNurtureRunner(LocalRuntime(data_root, accounts), state).run(
+                account.alias,
+                fixture,
+                max_cycles=cycles,
+                continuous=args.continuous,
+                idle_seconds=args.idle_seconds,
+            )
+        )
+    except (
+        BrowserNurtureError,
+        BrowserNurtureStateError,
+        StandaloneRuntimeError,
+        StandaloneAccountError,
+    ) as error:
+        sys.stderr.write(f"ERROR {error.code}\n")
+        return 1
+    except KeyboardInterrupt:
+        sys.stdout.write(
+            "BROWSER_NURTURE status=STOPPED source=SYNTHETIC_FIXTURE "
+            "reason=INTERRUPTED cycles=0 feed_candidates=0 scanned=0 relevant=0 "
+            "irrelevant=0 unknown=0 duplicates=0 scrolls=0 sessions_opened=0 "
+            "checkpoint_cycles=preserved\n"
+        )
+        return 130
+    except Exception:  # noqa: BLE001 - fixed safe CLI boundary for fixture failures.
+        sys.stderr.write("ERROR BROWSER_NURTURE_FAILED\n")
+        return 1
+    sys.stdout.write(_format_browser_nurture_result(result, source="SYNTHETIC_FIXTURE"))
+    return 0 if result.status.value == "COMPLETE" else 1
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="threads-local")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -785,6 +963,45 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_insights_parser = nurture_insights_commands.add_parser("refresh")
     refresh_insights_parser.add_argument("alias")
     refresh_insights_parser.add_argument("--preset", required=True)
+
+    browser_nurture_parser = commands.add_parser(
+        "browser-nurture",
+        help="configure and run account-scoped read-only Browser Nurture",
+    )
+    browser_nurture_parser.error = lambda message: _redacted_parser_error(
+        browser_nurture_parser,
+        message,
+    )
+    browser_nurture_commands = browser_nurture_parser.add_subparsers(
+        dest="browser_nurture_command",
+        required=True,
+    )
+    configure_browser_nurture = browser_nurture_commands.add_parser(
+        "configure",
+        help="store private topic, relevance and expected-account settings",
+    )
+    configure_browser_nurture.add_argument("alias")
+    configure_browser_nurture.add_argument("--expected-username", required=True)
+    configure_browser_nurture.add_argument("--topic", action="append", required=True)
+    configure_browser_nurture.add_argument("--relevance-term", action="append")
+    configure_browser_nurture.add_argument("--max-posts-per-cycle", type=int, default=20)
+    configure_browser_nurture.add_argument("--idle-seconds", type=int, default=900)
+    run_browser_nurture = browser_nurture_commands.add_parser(
+        "run",
+        help="run one bounded cycle or remain in the foreground until stopped",
+    )
+    run_browser_nurture.add_argument("alias")
+    run_browser_nurture.add_argument(
+        "--source",
+        choices=("browser", "ui-fixture"),
+        default="browser",
+        help="browser is permission-gated; ui-fixture is local synthetic Chromium only",
+    )
+    run_browser_nurture.add_argument("--fixture-file")
+    run_browser_nurture.add_argument("--data-root")
+    run_browser_nurture.add_argument("--continuous", action="store_true")
+    run_browser_nurture.add_argument("--max-cycles", type=int)
+    run_browser_nurture.add_argument("--idle-seconds", type=int)
 
     recruitment_parser = commands.add_parser("recruitment")
     recruitment_commands = recruitment_parser.add_subparsers(
@@ -1097,10 +1314,18 @@ def _handle_recruitment_command(args: argparse.Namespace) -> int:
     )
 
 
+def _handle_nurture_family_command(args: argparse.Namespace) -> int:
+    if args.command == "nurture":
+        return _handle_nurture_command(args)
+    return _handle_browser_nurture_command(args)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     command_args = list(sys.argv[1:] if argv is None else argv)
     if command_args[:2] == ["recruitment", "browser-watch"]:
+        parser.error = lambda message: _redacted_parser_error(parser, message)
+    if command_args[:1] == ["browser-nurture"]:
         parser.error = lambda message: _redacted_parser_error(parser, message)
     args = parser.parse_args(command_args)
     try:
@@ -1163,8 +1388,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
 
-        if args.command == "nurture":
-            return _handle_nurture_command(args)
+        if args.command in {"nurture", "browser-nurture"}:
+            return _handle_nurture_family_command(args)
 
         if args.command == "recruitment":
             return _handle_recruitment_command(args)
