@@ -28,10 +28,13 @@ class _FakeSession:
         self,
         *,
         feed_batch: tuple[str, ...] = (),
+        feed_batches: tuple[tuple[str, ...], ...] | None = None,
         browser_error: BrowserAdapterError | None = None,
         thread_error: BrowserAdapterError | None = None,
     ) -> None:
         self.feed_batch = feed_batch
+        self.feed_batches = feed_batches
+        self.feed_collections = 0
         self.browser_error = browser_error
         self.thread_error = thread_error
         self.navigations: list[tuple[str, frozenset[str]]] = []
@@ -52,7 +55,12 @@ class _FakeSession:
         assert candidate_bound == 100
         if self.browser_error is not None:
             raise self.browser_error
-        return self.feed_batch
+        if self.feed_batches is None:
+            batch = self.feed_batch
+        else:
+            batch = self.feed_batches[min(self.feed_collections, len(self.feed_batches) - 1)]
+        self.feed_collections += 1
+        return batch
 
     async def scroll_feed(self) -> None:
         self.scrolls += 1
@@ -163,6 +171,45 @@ def test_profile_thread_and_feed_reads_use_the_same_account_profile(tmp_path: Pa
     assert engine.sessions[0].profile_checks == [("/@synthetic", 8)]
     assert engine.sessions[1].thread_checks == [("/@synthetic/post/fake_1", "synthetic")]
     assert all(session.closed for session in engine.sessions)
+
+
+def test_browse_feed_waits_through_a_duplicate_batch_for_a_later_post(tmp_path: Path) -> None:
+    accounts = _add_account(tmp_path)
+    account = accounts.get("synthetic_account")
+    first_post = "/@synthetic/post/fake_1"
+    second_post = "/@synthetic/post/fake_2"
+    engine = _FakeEngine(
+        lambda: _FakeSession(feed_batches=((first_post,), (first_post,), (first_post, second_post)))
+    )
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+
+    result = asyncio.run(runtime.browse_feed("synthetic_account", max_items=2))
+
+    assert [item.thread_ref for item in result.observations] == [
+        "https://www.threads.com/@synthetic/post/fake_1",
+        "https://www.threads.com/@synthetic/post/fake_2",
+    ]
+    assert result.truncated
+    assert engine.sessions[0].feed_collections == 3
+    assert engine.sessions[0].scrolls == 2
+    assert engine.sessions[0].closed
+
+
+def test_browse_feed_duplicate_batches_stop_at_the_iteration_bound(tmp_path: Path) -> None:
+    accounts = _add_account(tmp_path)
+    account = accounts.get("synthetic_account")
+    engine = _FakeEngine(lambda: _FakeSession(feed_batch=("/@synthetic/post/fake_1",)))
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+
+    result = asyncio.run(runtime.browse_feed("synthetic_account", max_items=3))
+
+    assert len(result.observations) == 1
+    assert result.truncated
+    assert engine.sessions[0].feed_collections == runtime_module.BROWSER_FEED_ITERATION_BOUND
+    assert engine.sessions[0].scrolls == runtime_module.BROWSER_FEED_ITERATION_BOUND - 1
+    assert engine.sessions[0].closed
 
 
 def test_interactive_thread_holds_account_lock_until_operator_ends_session(

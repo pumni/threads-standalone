@@ -293,10 +293,10 @@ class LocalRuntime:
                             truncated = True
                             break
                         if not batch:
-                            if observations:
-                                truncated = True
-                                break
                             if iteration == BROWSER_FEED_ITERATION_BOUND - 1:
+                                if observations:
+                                    truncated = True
+                                    break
                                 raise RemoteSessionStateUncertain()
                             continue
                         if iteration == BROWSER_FEED_ITERATION_BOUND - 1:
