@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
@@ -37,6 +38,15 @@ from threads_platform.browser.contracts import (
     RemoteSessionStateUncertain,
     UnsupportedUIState,
 )
+from threads_platform.browser.threads_job_ui_reader import (
+    AsyncThreadsJobUiReader,
+    UiFeedBatch,
+    UiPageState,
+    UiPostDetail,
+)
+
+_MAX_SYNTHETIC_FIXTURE_PAGES = 128
+_MAX_SYNTHETIC_FIXTURE_HTML_CODEPOINTS = 1_100_000
 
 _FEED_SCAN_SCRIPT = r"""
 ({allowedOrigin, candidateBound}) => {
@@ -301,8 +311,109 @@ class _PlaywrightBrowserSession:
         self._allowed_navigation_origins: frozenset[str] = frozenset()
         self._navigation_guard_installed = False
         self._remote_state_uncertain = False
+        self._synthetic_fixture_pages: dict[str, str] | None = None
+        self._synthetic_fixture_missing = False
+        self._synthetic_blocked_request_count = 0
+        self._async_ui_reader: AsyncThreadsJobUiReader | None = None
+        self._async_ui_reader_origin: str | None = None
         page.on("crash", self._on_page_crash)
         context.on("close", self._on_context_close)
+
+    @property
+    def synthetic_blocked_request_count(self) -> int:
+        return self._synthetic_blocked_request_count
+
+    @property
+    def ui_scroll_count(self) -> int:
+        return 0 if self._async_ui_reader is None else self._async_ui_reader.scroll_count
+
+    async def install_synthetic_fixture_pages(
+        self,
+        pages: Mapping[str, str],
+        *,
+        origin: str,
+    ) -> None:
+        """Route a reserved local fixture map through this persistent profile session."""
+
+        self._ensure_alive()
+        normalized_origin = _normalized_browser_origin(origin)
+        if (
+            self._navigation_guard_installed
+            or self._synthetic_fixture_pages is not None
+            or normalized_origin != "https://threads.example.invalid"
+            or not pages
+            or len(pages) > _MAX_SYNTHETIC_FIXTURE_PAGES
+        ):
+            raise UnsupportedUIState()
+        validated: dict[str, str] = {}
+        for url, html in pages.items():
+            parsed_origin = _normalized_browser_origin(url)
+            if (
+                parsed_origin != normalized_origin
+                or not html
+                or len(html) > _MAX_SYNTHETIC_FIXTURE_HTML_CODEPOINTS
+                or url in validated
+            ):
+                raise UnsupportedUIState()
+            validated[url] = html
+        if f"{normalized_origin}/" not in validated:
+            raise UnsupportedUIState()
+        self._synthetic_fixture_pages = validated
+        self._async_ui_reader_origin = normalized_origin
+
+    async def verify_ui_account(self, expected_actor: str, *, origin: str) -> UiPageState:
+        self._ensure_alive()
+        try:
+            state = await self._get_async_ui_reader(origin).verify_signed_in(expected_actor)
+        except BrowserAdapterError:
+            self._ensure_alive()
+            await self._raise_ui_policy_error()
+            raise
+        self._ensure_alive()
+        await self._raise_ui_policy_error()
+        return state
+
+    async def search_ui_feed(
+        self,
+        query: str,
+        *,
+        expected_actor: str,
+        origin: str,
+    ) -> tuple[UiFeedBatch, ...]:
+        self._ensure_alive()
+        try:
+            result = await self._get_async_ui_reader(origin).search(
+                query,
+                expected_actor=expected_actor,
+            )
+        except BrowserAdapterError:
+            self._ensure_alive()
+            await self._raise_ui_policy_error()
+            raise
+        self._ensure_alive()
+        await self._raise_ui_policy_error()
+        return result
+
+    async def read_exact_ui_post(
+        self,
+        target: str,
+        *,
+        expected_actor: str,
+        origin: str,
+    ) -> UiPostDetail:
+        self._ensure_alive()
+        try:
+            result = await self._get_async_ui_reader(origin).read_exact_post(
+                target,
+                expected_actor=expected_actor,
+            )
+        except BrowserAdapterError:
+            self._ensure_alive()
+            await self._raise_ui_policy_error()
+            raise
+        self._ensure_alive()
+        await self._raise_ui_policy_error()
+        return result
 
     async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
         self._ensure_alive()
@@ -349,6 +460,23 @@ class _PlaywrightBrowserSession:
             )
         except PlaywrightError:
             is_main_navigation = True
+        if self._synthetic_fixture_pages is not None:
+            html = self._synthetic_fixture_pages.get(request.url)
+            if html is not None:
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html; charset=utf-8",
+                    body=html,
+                )
+            else:
+                self._synthetic_blocked_request_count += 1
+                if is_main_navigation:
+                    if _normalized_browser_origin(request.url) != self._async_ui_reader_origin:
+                        self._remote_state_uncertain = True
+                    else:
+                        self._synthetic_fixture_missing = True
+                await route.abort("blockedbyclient")
+            return
         if not is_main_navigation:
             await route.continue_()
             return
@@ -366,6 +494,27 @@ class _PlaywrightBrowserSession:
             and _normalized_browser_origin(self._page.url) not in self._allowed_navigation_origins
         ):
             raise RemoteSessionStateUncertain()
+
+    async def _raise_ui_policy_error(self) -> None:
+        await self._raise_navigation_policy_error()
+        if self._synthetic_fixture_missing:
+            raise BrowserAdapterError("SYNTHETIC_FIXTURE_PAGE_MISSING")
+
+    def _get_async_ui_reader(self, origin: str) -> AsyncThreadsJobUiReader:
+        normalized_origin = _normalized_browser_origin(origin)
+        if (
+            normalized_origin is None
+            or self._allowed_navigation_origins != frozenset({normalized_origin})
+            or (
+                self._async_ui_reader_origin is not None
+                and normalized_origin != self._async_ui_reader_origin
+            )
+        ):
+            raise UnsupportedUIState()
+        if self._async_ui_reader is None:
+            self._async_ui_reader = AsyncThreadsJobUiReader(self._page, origin=normalized_origin)
+            self._async_ui_reader_origin = normalized_origin
+        return self._async_ui_reader
 
     async def _raise_guard_rejection(self) -> None:
         if self._remote_state_uncertain:

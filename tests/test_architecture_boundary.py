@@ -113,6 +113,41 @@ def test_playwright_imports_are_confined_to_explicit_browser_adapters() -> None:
     }
 
 
+def test_standalone_cli_keeps_browser_nurture_and_runtime_imports_lazy() -> None:
+    entrypoint = _ROOT / "src" / "threads_platform" / "standalone" / "__main__.py"
+    tree = ast.parse(entrypoint.read_text(encoding="utf-8"), filename=str(entrypoint))
+    top_level_imports: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            top_level_imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            top_level_imports.add(node.module)
+
+    assert "threads_platform.standalone.browser_nurture" not in top_level_imports
+    assert "threads_platform.standalone.browser_nurture_state" not in top_level_imports
+    assert "threads_platform.standalone.runtime" not in top_level_imports
+    assert "threads_platform.browser.playwright_engine" not in top_level_imports
+
+
+def test_browser_nurture_does_not_depend_on_the_official_api_nurture_pipeline() -> None:
+    paths = (
+        _ROOT / "src" / "threads_platform" / "standalone" / "browser_nurture.py",
+        _ROOT / "src" / "threads_platform" / "standalone" / "browser_nurture_state.py",
+    )
+    imports: set[str] = set()
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imports.add(node.module)
+
+    assert not any(module.startswith("threads_platform.api") for module in imports)
+    assert "threads_platform.standalone.nurture_runner" not in imports
+    assert "threads_platform.standalone.nurture_store" not in imports
+
+
 @pytest.mark.parametrize("command", ["publish", "reply", "quote", "browser", "worker"])
 def test_api_cli_does_not_expose_mutation_or_distributed_commands(command: str) -> None:
     with pytest.raises(SystemExit):

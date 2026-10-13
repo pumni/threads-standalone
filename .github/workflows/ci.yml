@@ -53,6 +53,14 @@ jobs:
       - name: Sync locked environment
         run: uv sync --locked
 
+      - name: Install Chromium and Linux browser dependencies
+        if: runner.os == 'Linux'
+        run: uv run --locked playwright install --with-deps chromium
+
+      - name: Install Chromium
+        if: runner.os == 'Windows'
+        run: uv run --locked playwright install chromium
+
       - name: Audit locked runtime dependency tree
         run: uv tree --locked --no-dev
 
