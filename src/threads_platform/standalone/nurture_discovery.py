@@ -17,6 +17,10 @@ from threads_platform.api.contracts import (
 )
 from threads_platform.standalone.api import LocalThreadsApiRuntime
 from threads_platform.standalone.nurture import NurturePresetV1
+from threads_platform.standalone.nurture_policy import (
+    matches_nurture_terms,
+    normalize_nurture_text,
+)
 from threads_platform.standalone.nurture_store import (
     NurtureStateError,
     NurtureTargetStateV1,
@@ -735,21 +739,11 @@ def nurture_target_suppression_reason(
 
 
 def _normalize_text(text: str | None) -> str | None:
-    if text is None:
-        return None
-    bounded_text = text[:_MAX_REMOTE_TEXT_CHARS]
-    try:
-        return unicodedata.normalize("NFKC", bounded_text).casefold()
-    except UnicodeError:
-        return None
+    return normalize_nurture_text(text)
 
 
 def _matches_any(normalized_text: str, terms: tuple[str, ...]) -> bool:
-    return any(
-        normalized_term in normalized_text
-        for term in terms
-        if (normalized_term := _normalize_text(term)) is not None and normalized_term
-    )
+    return matches_nurture_terms(normalized_text, terms)
 
 
 def _include_score(normalized_text: str, terms: tuple[str, ...]) -> int:
