@@ -612,7 +612,7 @@ def _normalize_context_text(
     except UnicodeError, ValueError:
         return None, PrivateReviewReason.CONTEXT_INVALID
     if any(
-        (unicodedata.category(character) in {"Cc", "Cf", "Cs"} and character != "\n")
+        (unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"} and character != "\n")
         for character in normalized
     ):
         return None, PrivateReviewReason.CONTEXT_INVALID

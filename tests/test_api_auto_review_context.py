@@ -468,23 +468,27 @@ def test_changed_context_evidence_cannot_rebind_an_existing_packet() -> None:
 
 
 @pytest.mark.parametrize(
-    ("field_name", "value"),
+    ("field_name", "value", "expected_reason"),
     [
-        ("reply_text", None),
-        ("root_text", None),
-        ("parent_text", None),
-        ("reply_text", "  \n "),
-        ("root_text", ""),
-        ("parent_text", "\t"),
-        ("reply_text", "x" * 4097),
-        ("root_text", "danger\x1b[31mred"),
-        ("parent_text", "danger\u202eoverride"),
-        ("reply_text", "invalid\ud800surrogate"),
+        ("reply_text", None, PrivateReviewReason.CONTEXT_INCOMPLETE),
+        ("root_text", None, PrivateReviewReason.CONTEXT_INCOMPLETE),
+        ("parent_text", None, PrivateReviewReason.CONTEXT_INCOMPLETE),
+        ("reply_text", "  \n ", PrivateReviewReason.CONTEXT_INCOMPLETE),
+        ("root_text", "", PrivateReviewReason.CONTEXT_INCOMPLETE),
+        ("parent_text", "\t", PrivateReviewReason.CONTEXT_INVALID),
+        ("reply_text", "x" * 4097, PrivateReviewReason.CONTEXT_TOO_LONG),
+        ("root_text", "danger\x1b[31mred", PrivateReviewReason.CONTEXT_INVALID),
+        ("parent_text", "danger\u202eoverride", PrivateReviewReason.CONTEXT_INVALID),
+        ("reply_text", "invalid\ud800surrogate", PrivateReviewReason.CONTEXT_INVALID),
+        ("reply_text", "A\u2028B", PrivateReviewReason.CONTEXT_INVALID),
+        ("root_text", "A\u2029B", PrivateReviewReason.CONTEXT_INVALID),
+        ("parent_text", "A\u2028B", PrivateReviewReason.CONTEXT_INVALID),
     ],
 )
 def test_missing_blank_oversize_or_unsafe_context_never_creates_preview(
     field_name: str,
     value: str | None,
+    expected_reason: PrivateReviewReason,
 ) -> None:
     scope, candidate, display = _reply_scenario()
     packet = _packet(scope, candidate)
@@ -493,6 +497,7 @@ def test_missing_blank_oversize_or_unsafe_context_never_creates_preview(
     result = _build(packet, scope, (candidate,), invalid)
 
     assert result.decision is PrivateReviewDecision.STOP
+    assert result.reason_codes == (expected_reason,)
     assert result.preview is None
     assert review_display_context_sha256(invalid) == ""
     rendered = repr(result)
@@ -500,6 +505,18 @@ def test_missing_blank_oversize_or_unsafe_context_never_creates_preview(
     assert ACTOR_ID not in rendered
     assert "Synthetic" not in rendered
     assert "surrogate" not in rendered
+
+
+def test_normalized_lf_context_remains_valid_and_hashes_crlf_identically() -> None:
+    _scope_value, _candidate, display = _reply_scenario()
+    lf_display = replace(display, root_text="First line\nSecond line")
+    crlf_display = replace(display, root_text="First line\r\nSecond line")
+
+    lf_digest = review_display_context_sha256(lf_display)
+    crlf_digest = review_display_context_sha256(crlf_display)
+
+    assert len(lf_digest) == 64
+    assert crlf_digest == lf_digest
 
 
 def test_reply_observation_text_must_match_display_even_with_matching_display_digest() -> None:
