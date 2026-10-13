@@ -70,6 +70,22 @@ _FEED_SCAN_SCRIPT = r"""
 _THREAD_OPEN_SCRIPT = r"""
 ({allowedOrigin, targetRef, targetAuthor}) => {
   const normalizePath = (path) => path.endsWith('/') ? path.slice(0, -1) : path;
+  const postPathPattern = /^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}$/;
+  const profilePathPattern = /^\/@[A-Za-z0-9._]{1,30}$/;
+  const postLink = (href) => {
+    if (typeof href !== 'string') return null;
+    try {
+      const url = new URL(href, allowedOrigin);
+      if (!url.pathname.includes('/post/')) return null;
+      if (url.origin !== allowedOrigin || url.search || url.hash) {
+        return {path: null};
+      }
+      const path = normalizePath(url.pathname);
+      return postPathPattern.test(path) ? {path} : {path: null};
+    } catch (_) {
+      return href.includes('/post/') ? {path: null} : null;
+    }
+  };
   const semanticPath = (href) => {
     if (typeof href !== 'string') return null;
     try {
@@ -83,17 +99,75 @@ _THREAD_OPEN_SCRIPT = r"""
   if (window.location.origin !== allowedOrigin) return {outcome: 'uncertain'};
   if (normalizePath(window.location.pathname) !== targetRef) return {outcome: 'uncertain'};
 
-  const anchors = document.querySelectorAll('a[href]');
+  const anchors = Array.from(document.querySelectorAll('a[href]'));
   if (anchors.length > 1000) return {outcome: 'invalid'};
-  const hasTargetPermalink = Array.from(anchors).some(
+  const mainLandmarks = Array.from(document.querySelectorAll('main, [role="main"]'));
+  if (mainLandmarks.length !== 1) return {outcome: 'uncertain'};
+  const main = mainLandmarks[0];
+  const cardSelector = 'article, [role="article"]';
+  const cards = Array.from(main.querySelectorAll(cardSelector));
+  if (cards.length > 1000) return {outcome: 'invalid'};
+  const isInAuxiliaryRegion = (card) => {
+    let current = card.parentElement;
+    while (current && current !== main) {
+      if (current.matches('aside, nav, footer')) return true;
+      current = current.parentElement;
+    }
+    return current !== main;
+  };
+  const rootCards = cards.filter((card) => {
+    const parent = card.parentElement;
+    return (!parent || !parent.closest(cardSelector)) && !isInAuxiliaryRegion(card);
+  });
+  const owns = (element, card) => element.closest(cardSelector) === card;
+  const targetPermalinkOnPage = anchors.some(
     (anchor) => semanticPath(anchor.getAttribute('href')) === targetRef
   );
-  if (!hasTargetPermalink) return {outcome: 'missing_permalink'};
+  const targetCards = [];
+  for (const card of rootCards) {
+    const ownAnchors = anchors.filter((anchor) => owns(anchor, card));
+    const postPaths = new Set();
+    let hasInvalidPostLink = false;
+    for (const anchor of ownAnchors) {
+      const result = postLink(anchor.getAttribute('href'));
+      if (result === null) continue;
+      if (result.path === null) {
+        hasInvalidPostLink = true;
+      } else {
+        postPaths.add(result.path);
+      }
+    }
+    if (postPaths.has(targetRef)) {
+      targetCards.push({card, postPaths, hasInvalidPostLink});
+    }
+  }
+  if (targetCards.length === 0) {
+    return targetPermalinkOnPage
+      ? {outcome: 'uncertain'}
+      : {outcome: 'missing_permalink'};
+  }
+  if (targetCards.length !== 1) return {outcome: 'invalid'};
+  const candidate = targetCards[0];
+  if (candidate.hasInvalidPostLink || candidate.postPaths.size !== 1) {
+    return {outcome: 'invalid'};
+  }
+
   const authorPath = `/@${targetAuthor}`;
-  const hasTargetAuthor = Array.from(anchors).some(
-    (anchor) => semanticPath(anchor.getAttribute('href')) === authorPath
-  );
-  if (!hasTargetAuthor) return {outcome: 'missing_author'};
+  const authorPaths = new Set();
+  const headers = Array.from(candidate.card.querySelectorAll('header'));
+  for (const header of headers) {
+    if (!owns(header, candidate.card) || header.closest('blockquote')) continue;
+    const sectioningOwner = header.closest('article, section, aside, nav');
+    if (sectioningOwner !== null && sectioningOwner !== candidate.card) continue;
+    if (candidate.card.matches('article') && sectioningOwner !== candidate.card) continue;
+    for (const anchor of header.querySelectorAll('a[href]')) {
+      if (!owns(anchor, candidate.card)) continue;
+      const path = semanticPath(anchor.getAttribute('href'));
+      if (path !== null && profilePathPattern.test(path)) authorPaths.add(path);
+    }
+  }
+  if (authorPaths.size > 1) return {outcome: 'invalid'};
+  if (!authorPaths.has(authorPath)) return {outcome: 'missing_author'};
   return {outcome: 'recognized'};
 }
 """

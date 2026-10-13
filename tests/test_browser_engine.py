@@ -453,6 +453,189 @@ def test_profile_and_thread_semantics_accept_only_recognized_synthetic_targets(
     asyncio.run(exercise())
 
 
+def test_thread_open_script_binds_permalink_and_author_to_one_synthetic_root_card() -> None:
+    from playwright.async_api import async_playwright
+
+    target_ref = "/@synthetic/post/fake_1"
+    script_args = {
+        "allowedOrigin": "https://www.threads.com",
+        "targetRef": target_ref,
+        "targetAuthor": "synthetic",
+    }
+
+    async def exercise() -> None:
+        playwright = await async_playwright().start()
+        browser = None
+        try:
+            if not Path(playwright.chromium.executable_path).is_file():
+                pytest.skip("local Chromium is not installed; synthetic DOM script test skipped")
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page()
+            location = {
+                "origin": "https://www.threads.com",
+                "pathname": target_ref,
+            }
+
+            async def inspect(html: str) -> object:
+                await page.set_content(html)
+                return await page.evaluate(
+                    """({script, args, location}) => {
+                      const run = new Function('window', 'document', `return (${script});`)(
+                        {location}, document
+                      );
+                      return run(args);
+                    }""",
+                    {
+                        "script": engine_module._THREAD_OPEN_SCRIPT,
+                        "args": script_args,
+                        "location": location,
+                    },
+                )
+
+            matching_root = """
+              <main><article>
+                <header><a href="/@synthetic">synthetic</a></header>
+                <a href="/@synthetic/post/fake_1">synthetic permalink</a>
+              </article></main>
+            """
+            assert await inspect(matching_root) == {"outcome": "recognized"}
+
+            sidebar_author = """
+              <main><article>
+                <header><a href="/@other">other author</a></header>
+                <a href="/@synthetic/post/fake_1">synthetic permalink</a>
+              </article>
+              <article>
+                <header><a href="/@synthetic">other post author</a></header>
+                <a href="/@synthetic/post/reply_1">other post permalink</a>
+              </article></main>
+              <aside><a href="/@synthetic">sidebar author</a></aside>
+            """
+            assert await inspect(sidebar_author) == {"outcome": "missing_author"}
+
+            quoted_author = """
+              <main><article>
+                <header><a href="/@other">root author</a></header>
+                <a href="/@synthetic/post/fake_1">synthetic permalink</a>
+                <blockquote>
+                  <header><a href="/@synthetic">quoted author</a></header>
+                </blockquote>
+              </article></main>
+            """
+            assert await inspect(quoted_author) == {"outcome": "missing_author"}
+
+            nested_reply_author = """
+              <main><article>
+                <header><a href="/@other">root author</a></header>
+                <a href="/@synthetic/post/fake_1">synthetic permalink</a>
+                <article>
+                  <header><a href="/@synthetic">reply author</a></header>
+                  <a href="/@synthetic/post/reply_1">reply permalink</a>
+                </article>
+              </article></main>
+            """
+            assert await inspect(nested_reply_author) == {"outcome": "missing_author"}
+
+            duplicate_roots = """
+              <main>
+                <article>
+                  <header><a href="/@synthetic">first author</a></header>
+                  <a href="/@synthetic/post/fake_1">first permalink</a>
+                </article>
+                <article>
+                  <header><a href="/@synthetic">second author</a></header>
+                  <a href="/@synthetic/post/fake_1">second permalink</a>
+                </article>
+              </main>
+            """
+            assert await inspect(duplicate_roots) == {"outcome": "invalid"}
+
+            malformed_permalink = """
+              <main><article>
+                <header><a href="/@synthetic">synthetic</a></header>
+                <a href="/@synthetic/post/fake_1?unexpected=1">malformed permalink</a>
+              </article></main>
+            """
+            assert await inspect(malformed_permalink) == {"outcome": "missing_permalink"}
+
+            cross_origin_permalink = """
+              <main><article>
+                <header><a href="/@synthetic">synthetic</a></header>
+                <a href="https://synthetic.invalid/@synthetic/post/fake_1">
+                  off-origin permalink
+                </a>
+              </article></main>
+            """
+            assert await inspect(cross_origin_permalink) == {"outcome": "missing_permalink"}
+
+            missing_permalink = """
+              <main><article>
+                <header><a href="/@synthetic">synthetic</a></header>
+              </article></main>
+            """
+            assert await inspect(missing_permalink) == {"outcome": "missing_permalink"}
+
+            missing_author = """
+              <main><article>
+                <header>no displayed author link</header>
+                <a href="/@synthetic/post/fake_1">synthetic permalink</a>
+              </article></main>
+            """
+            assert await inspect(missing_author) == {"outcome": "missing_author"}
+
+            ambiguous_authors = """
+              <main><article>
+                <header>
+                  <a href="/@synthetic">synthetic</a>
+                  <a href="/@other">other profile</a>
+                </header>
+                <a href="/@synthetic/post/fake_1">synthetic permalink</a>
+              </article></main>
+            """
+            assert await inspect(ambiguous_authors) == {"outcome": "invalid"}
+
+            no_semantic_container = """
+              <main><div>
+                <header><a href="/@synthetic">synthetic</a></header>
+                <a href="/@synthetic/post/fake_1">synthetic permalink</a>
+              </div></main>
+            """
+            assert await inspect(no_semantic_container) == {"outcome": "uncertain"}
+
+            no_main_landmark = """
+              <article>
+                <header><a href="/@synthetic">synthetic</a></header>
+                <a href="/@synthetic/post/fake_1">synthetic permalink</a>
+              </article>
+            """
+            assert await inspect(no_main_landmark) == {"outcome": "uncertain"}
+
+            off_origin_redirect = {
+                "origin": "https://synthetic.invalid",
+                "pathname": "/redirected",
+            }
+            await page.set_content("<!doctype html><main></main>")
+            assert await page.evaluate(
+                """({script, args, location}) => {
+                  const run = new Function('window', 'document', `return (${script});`)(
+                    {location}, document
+                  );
+                  return run(args);
+                }""",
+                {
+                    "script": engine_module._THREAD_OPEN_SCRIPT,
+                    "args": script_args,
+                    "location": off_origin_redirect,
+                },
+            ) == {"outcome": "uncertain"}
+        finally:
+            if browser is not None:
+                await browser.close()
+            await playwright.stop()
+
+    asyncio.run(exercise())
+
+
 def test_off_origin_redirect_and_invalid_navigation_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
