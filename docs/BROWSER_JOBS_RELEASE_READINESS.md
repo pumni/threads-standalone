@@ -29,7 +29,7 @@ The installed CLI's `fixture` source accepts an ordered list of selected fake ta
 | Limits and negative capabilities | Source-level synthetic tests | Reject more than 20 posts per cycle, more than five cycles, and `--source browser` before creating archive/checkpoint state. `--source manual` returns `UNKNOWN / NO_TEXT` without reading a body or target. No HTTP, Playwright, login, hidden API, or account effect is authorized. |
 | Contact and export privacy | Synthetic archive/export test | Only fixed placeholders such as `[SYNTHETIC_PHONE_001]` are allowed. Verify ambiguous contact evidence has no value or source span after raw expiry, selected JSON/CSV exports omit contact and source URLs, and CSV formula-like values are escaped. This is not permission to store real contact information. |
 | Feed scrolling, virtualization, selectors, challenges, redirects | Fake adapter tests only / unsupported in installed CLI | `tests/test_browser_job_observation.py` may cover fake 3-to-8-card scrolling, eviction, and exact selected-post opening through in-process fake objects. The installed fixture command does not claim these UI features. There is no live browser or Threads test. |
-| Hosted release gates | Exact PR head | Windows, Ubuntu, and full-history Gitleaks must all pass on the same head SHA submitted for review. The PR checks and review record are the source of truth for the moving head SHA and CI run URLs; this candidate document does not claim those checks passed before they exist. |
+| Hosted release gates | Live [Draft PR #139 check rollup](https://github.com/pumni/threads-standalone/pull/139) | Verify the check rollup belongs to the PR's current head SHA and that Windows, Ubuntu, and full-history Gitleaks all pass before coordinator review. |
 
 ## Local validation commands
 
@@ -60,9 +60,9 @@ The PR must include the local command results, pass/skip counts, wheel smoke res
 | Full synthetic pytest | PASS — 1,976 passed, 17 skipped; skips are host symlink/permission limits |
 | `uv build` | PASS — source distribution and wheel built |
 | Isolated installed-wheel smoke | PASS — top-level and nested help, one fixture cycle from outside the checkout with `PYTHONPATH` unset, archive/checkpoint creation, and output redaction |
-| Exact-head hosted Windows, Ubuntu, Gitleaks | Pending Draft PR checks |
+| Exact-head hosted Windows, Ubuntu, Gitleaks | Live check rollup on [Draft PR #139](https://github.com/pumni/threads-standalone/pull/139); verify its head SHA before citing status |
 
-The test suite collected 1,993 tests, including the ten BJ-07 acceptance tests. The exact committed head SHA, two-file manifest, and hosted run links belong to the Draft PR record; no hosted pass or coordinator acceptance is claimed in this document.
+The test suite collected 1,993 tests, including the ten BJ-07 acceptance tests. The exact committed head SHA, two-file manifest, and hosted run links belong to the live Draft PR record. This document does not claim coordinator acceptance.
 
 ## Operator limits and recovery
 
