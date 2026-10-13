@@ -1337,7 +1337,7 @@ def _run_browser_command(args: argparse.Namespace, root: Path, store: LocalAccou
             return 0
         if args.command == "account":
             asyncio.run(runtime.login(args.alias))
-            sys.stdout.write(f"login browser closed {args.alias}\n")
+            sys.stdout.write("login browser closed authentication=NOT_VERIFIED\n")
             return 0
         if args.command == "profile":
             result = asyncio.run(runtime.open_profile(args.alias, args.username))

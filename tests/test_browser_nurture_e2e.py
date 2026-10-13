@@ -18,6 +18,7 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 from threads_platform.browser import playwright_engine as playwright_engine_module
+from threads_platform.browser import threads_job_ui_reader as ui_reader_module
 from threads_platform.browser.contracts import (
     BROWSER_FEED_ORIGIN,
     BrowserEngineSession,
@@ -31,6 +32,7 @@ from threads_platform.browser.threads_job_ui_reader import (
     UiPostDetail,
     UiPostTarget,
 )
+from threads_platform.standalone import browser_nurture as browser_nurture_module
 from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
 from threads_platform.standalone.browser_nurture import (
     BrowserNurtureError,
@@ -264,6 +266,11 @@ def _fixture_document(
         )
     elif scenario == "challenge":
         pages[0]["html"] = _shell(_ACTOR, '<main><iframe title="challenge"></iframe></main>')
+    elif scenario == "rate-limit":
+        pages[0]["html"] = _shell(
+            _ACTOR,
+            '<main><div role="alert" aria-label="Rate limit">Synthetic wait</div></main>',
+        )
     elif scenario == "redirect":
         pages[0]["html"] = (
             '<!doctype html><html><head><meta http-equiv="refresh" '
@@ -535,7 +542,8 @@ def test_installed_cli_starts_new_policy_epoch_after_configuration_change(tmp_pa
         ("wrong-account", "BROWSER_SESSION_MISMATCH"),
         ("logged-out", "SESSION_EXPIRED"),
         ("challenge", "CHALLENGE_REQUIRED"),
-        ("selector-drift", "BROWSER_SELECTOR_DRIFT"),
+        ("rate-limit", "RATE_LIMITED"),
+        ("selector-drift", "SEARCH_ROOT_UNRECOGNIZED"),
         ("session-expired-during-search", "SESSION_EXPIRED"),
         ("redirect", "REMOTE_STATE_UNCERTAIN"),
     ),
@@ -708,6 +716,34 @@ def _create_browser_source_account(root: Path, expected_actor: str) -> LocalAcco
     return account
 
 
+def _run_offline_browser_source_cli(
+    root: Path,
+    account: LocalAccount,
+    pages: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> tuple[int, Any, list[str]]:
+    requested_urls = _install_offline_live_browser_transport(monkeypatch, pages)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", os.fspath(root))
+
+    from threads_platform.standalone import __main__ as cli_module
+
+    monkeypatch.setattr(cli_module, "_browser_nurture_interactive_console", lambda: True)
+    exit_code = cli_module.main(
+        (
+            "browser-nurture",
+            "run",
+            account.alias,
+            "--source",
+            "browser",
+            "--confirm-live-read-only",
+            "--max-cycles",
+            "1",
+        )
+    )
+    return exit_code, capsys.readouterr(), requested_urls
+
+
 def test_first_live_cli_cycle_rejects_multiple_cycles_before_browser_or_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -864,8 +900,401 @@ def test_browser_source_stops_on_visible_actor_mismatch_before_search(
     output = capsys.readouterr()
     assert exit_code == 1
     assert "ERROR BROWSER_SESSION_MISMATCH" in output.err
-    assert requested_urls == [f"{BROWSER_FEED_ORIGIN}/"] * 2
+    assert requested_urls == [f"{BROWSER_FEED_ORIGIN}/"]
     assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+
+
+def test_browser_source_waits_for_delayed_home_hydration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    monkeypatch.setattr(ui_reader_module, "_READINESS_TIMEOUT_MS", 1_000)
+    root = tmp_path / "delayed-home-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    pages[f"{BROWSER_FEED_ORIGIN}/"] = (
+        "<!doctype html><html><body><div id=app></div><script>"
+        "setTimeout(() => {"
+        "const header = document.createElement('header');"
+        "const link = document.createElement('a');"
+        f"link.href = '/@{actor}'; link.setAttribute('aria-label', 'Your profile'); "
+        "link.textContent = 'Profile'; header.append(link);"
+        "document.body.append(header);"
+        "const main = document.createElement('main');"
+        "main.textContent = 'Synthetic Home'; document.body.append(main);"
+        "}, 250);</script></body></html>"
+    )
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    assert exit_code == 0, output.out + output.err
+    assert "status=COMPLETE source=BROWSER_UI" in output.out
+    assert requested_urls[0] == f"{BROWSER_FEED_ORIGIN}/"
+    assert requested_urls.count(f"{BROWSER_FEED_ORIGIN}/") == 1
+    assert set(requested_urls).issubset(pages)
+    assert BrowserNurtureStateStore(root).load_checkpoint(account.id).completed_cycles == 1
+
+
+def test_browser_source_accepts_unique_self_profile_marker_in_semantic_header(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "semantic-header-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    pages[f"{BROWSER_FEED_ORIGIN}/"] = (
+        "<!doctype html><html><body>"
+        f'<header><a href="/@{actor}" aria-label="Your profile">Profile</a></header>'
+        "<section>Visible synthetic Home content</section>"
+        "</body></html>"
+    )
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    assert exit_code == 0, output.out + output.err
+    assert "status=COMPLETE source=BROWSER_UI" in output.out
+    assert requested_urls[0] == f"{BROWSER_FEED_ORIGIN}/"
+    assert set(requested_urls).issubset(pages)
+    assert BrowserNurtureStateStore(root).load_checkpoint(account.id).completed_cycles == 1
+
+
+@pytest.mark.parametrize(
+    ("home_html", "reason"),
+    (
+        ("<!doctype html><html><body></body></html>", "HOME_UI_NOT_READY"),
+        (
+            (
+                "<!doctype html><html><body><div style='width:120px;height:30px'>"
+                "Synthetic unsupported shell</div></body></html>"
+            ),
+            "HOME_ROOT_UNRECOGNIZED",
+        ),
+        (
+            "<!doctype html><html><body><main>Synthetic Home</main></body></html>",
+            "HOME_ACTOR_UNVERIFIED",
+        ),
+        (
+            (
+                "<!doctype html><html><body>"
+                '<header><a href="/@offline.operator">Profile</a></header>'
+                "<section>Synthetic Home</section></body></html>"
+            ),
+            "HOME_ACTOR_UNVERIFIED",
+        ),
+        (
+            (
+                "<!doctype html><html><body><main>Synthetic Home</main>"
+                '<header role="banner"><a href="/@offline.operator">Profile</a>'
+                '<a href="/@offline.other">Other</a></header></body></html>'
+            ),
+            "HOME_ACTOR_UNVERIFIED",
+        ),
+    ),
+)
+def test_browser_source_fails_closed_without_unique_home_actor_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    home_html: str,
+    reason: str,
+) -> None:
+    _require_local_chromium()
+    monkeypatch.setattr(ui_reader_module, "_READINESS_TIMEOUT_MS", 250)
+    root = tmp_path / "unverified-home-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    pages = _offline_live_pages("offline.operator")
+    pages[f"{BROWSER_FEED_ORIGIN}/"] = home_html
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    assert exit_code == 1
+    assert f"ERROR {reason}" in output.err
+    assert all(
+        private_value not in output.out + output.err
+        for private_value in (
+            "offline.operator",
+            "threads.com",
+            "Synthetic Home",
+            "design",
+            "/@synthetic.author/post/001",
+        )
+    )
+    assert requested_urls == [f"{BROWSER_FEED_ORIGIN}/"]
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+
+
+def test_browser_source_waits_for_delayed_search_cards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    monkeypatch.setattr(ui_reader_module, "_READINESS_TIMEOUT_MS", 1_000)
+    root = tmp_path / "delayed-search-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    card = _card("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = (
+        "<!doctype html><html><body>"
+        f'<header role="banner"><a href="/@{actor}">Profile</a></header>'
+        '<main><form role="search"><input type="search" value="design"></form></main>'
+        "<script>setTimeout(() => document.querySelector('main').insertAdjacentHTML('beforeend', "
+        f"{json.dumps(card)}), 250);</script></body></html>"
+    )
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    assert exit_code == 0, output.out + output.err
+    assert "status=COMPLETE source=BROWSER_UI" in output.out
+    assert f"{BROWSER_FEED_ORIGIN}/search?q=design" in requested_urls
+    assert set(requested_urls).issubset(pages)
+    assert BrowserNurtureStateStore(root).load_checkpoint(account.id).completed_cycles == 1
+
+
+@pytest.mark.parametrize(
+    "variant", ("missing-permalink", "ambiguous-permalink", "missing-author", "ambiguous-author")
+)
+def test_browser_source_rejects_unbound_search_cards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variant: str,
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / f"search-card-{variant}-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    card = _card("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    target = _target("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    if variant == "missing-permalink":
+        card = card.replace(f'<a href="{target}">time</a>', "<span>time</span>")
+    elif variant == "ambiguous-permalink":
+        card = card.replace(
+            "</header>",
+            '<a href="/@synthetic.author/post/002">another time</a></header>',
+        )
+    elif variant == "missing-author":
+        card = card.replace(
+            '<a href="/@synthetic.author">@synthetic.author</a>',
+            "<span>@synthetic.author</span>",
+        )
+    else:
+        card = card.replace(
+            "</header>",
+            '<a href="/@offline.other">Other author</a></header>',
+        )
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _shell(
+        actor,
+        f'<main><form role="search"><input type="search" value="design"></form>{card}</main>',
+    ).replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    assert exit_code == 1
+    assert "ERROR SEARCH_CARD_UNRECOGNIZED" in output.err
+    assert not any("/post/" in url for url in requested_urls)
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ("missing-root", "missing-author", "mismatched-author", "ambiguous-author", "ambiguous-body"),
+)
+def test_browser_source_rejects_unproven_exact_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variant: str,
+) -> None:
+    _require_local_chromium()
+    monkeypatch.setattr(ui_reader_module, "_READINESS_TIMEOUT_MS", 250)
+    root = tmp_path / f"detail-{variant}-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    target = _target("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    detail = _detail_for_actor("001", actor).replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    reason = (
+        "DETAIL_ROOT_UNRECOGNIZED" if variant == "missing-root" else "DETAIL_PROVENANCE_UNVERIFIED"
+    )
+    if variant == "missing-root":
+        detail = _shell(actor, "<main><p>Synthetic unrelated detail</p></main>").replace(
+            _ORIGIN,
+            BROWSER_FEED_ORIGIN,
+        )
+    elif variant == "missing-author":
+        detail = detail.replace(
+            '<a href="/@synthetic.author">@synthetic.author</a>',
+            "<span>synthetic.author</span>",
+        )
+    elif variant == "mismatched-author":
+        detail = detail.replace(
+            'href="/@synthetic.author">@synthetic.author',
+            'href="/@offline.other">@offline.other',
+            1,
+        )
+    elif variant == "ambiguous-author":
+        detail = detail.replace(
+            '<a href="/@synthetic.author">@synthetic.author</a>',
+            '<a href="/@synthetic.author">@synthetic.author</a>'
+            '<a href="/@offline.other">@offline.other</a>',
+            1,
+        )
+    else:
+        detail = detail.replace(
+            "</article>",
+            '<div dir="auto">Synthetic second body</div></article>',
+        )
+    pages[target] = detail
+
+    exit_code, output, _ = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    assert exit_code == 1
+    assert f"ERROR {reason}" in output.err
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+
+
+def test_browser_source_keeps_missing_visible_body_unknown_and_checkpoints_exact_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "detail-missing-body-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    target = _target("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    detail = _detail_for_actor("001", actor).replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    detail = detail.replace(
+        '<div dir="auto">A synthetic design engineer opportunity is available.</div>',
+        "",
+    )
+    pages[target] = detail
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    checkpoint = BrowserNurtureStateStore(root).load_checkpoint(account.id)
+    assert exit_code == 0, output.out + output.err
+    assert "status=COMPLETE source=BROWSER_UI" in output.out
+    assert checkpoint.completed_cycles == 1
+    assert checkpoint.unknown >= 1
+    assert target in requested_urls
+
+
+@pytest.mark.parametrize("failure", ("crash", "timeout"))
+def test_browser_source_does_not_advance_checkpoint_when_cycle_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / f"interrupted-cycle-{failure}-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    if failure == "crash":
+
+        async def crash_before_detail(self: Any, target: str, **kwargs: Any) -> Any:
+            await self._context.close()
+            raise BrowserProcessCrashed()
+
+        monkeypatch.setattr(
+            playwright_engine_module._PlaywrightBrowserSession,
+            "read_exact_ui_post",
+            crash_before_detail,
+        )
+    else:
+        original_read = playwright_engine_module._PlaywrightBrowserSession.read_exact_ui_post
+
+        async def timeout_before_detail(self: Any, target: str, **kwargs: Any) -> Any:
+            await asyncio.sleep(0.2)
+            return await original_read(self, target, **kwargs)
+
+        monkeypatch.setattr(
+            playwright_engine_module._PlaywrightBrowserSession,
+            "read_exact_ui_post",
+            timeout_before_detail,
+        )
+        monkeypatch.setattr(browser_nurture_module, "MAX_NURTURE_CYCLE_SECONDS", 0.05)
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    checkpoint = BrowserNurtureStateStore(root).load_checkpoint(account.id)
+    assert exit_code == 1
+    assert checkpoint.completed_cycles == 0
+    assert set(requested_urls).issubset(pages)
+    if failure == "crash":
+        assert "CRASH_RECOVERY_EXHAUSTED" in output.out
+        assert checkpoint.crash_recovery_pending is True
+    else:
+        assert "ERROR CYCLE_TIMEOUT" in output.err
+        assert checkpoint.crash_recovery_pending is False
 
 
 class _FakeNurtureSession:

@@ -252,8 +252,11 @@ class LocalRuntime:
             try:
                 session = await self._browser_engine.open(request)
                 prompt = (
-                    f"Browser opened for {alias}. Log in to Threads manually, complete any normal "
-                    "challenge, then press Enter here to close the browser: "
+                    "Browser opened in the selected account profile. Navigate to "
+                    "https://www.threads.com/ using the address bar. Sign in manually if needed, "
+                    "complete any normal challenge, then press Enter here to close the browser. "
+                    "This command does not verify authentication; Browser Nurture checks the "
+                    "configured actor: "
                 )
                 wait_for_operator(prompt)
             finally:
