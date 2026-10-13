@@ -1,5 +1,7 @@
 # HƯỚNG DẪN SỬ DỤNG THREADS STANDALONE — TIẾNG VIỆT
 
+> **Cập nhật định hướng phát triển:** Browser automation và official Threads API là hai luồng độc lập vĩnh viễn. Việc xây dựng, tích hợp và kiểm thử Browser không cần xin App Review, không cần token/scopes API, và không phải lặp lại bước phân tích Terms của Meta như một điều kiện phát triển. Các đoạn `PENDING`/`NO_GO` bên dưới ghi nhận checkpoint lịch sử, không chặn viết code Browser. Chế độ Browser live hiện còn chặn trong code; muốn bật phải có thay đổi riêng với giới hạn account và UAT thực tế. Quy định này không tuyên bố Meta đã cấp quyền hoặc miễn nghĩa vụ bên ngoài. Xem [AGENTS.md](AGENTS.md) và [định hướng sản phẩm](docs/PRODUCT_DIRECTION.md).
+
 > **Phiên bản tài liệu:** 2026-10-12. **Đối tượng:** operator dùng CLI cục bộ trên Windows.
 >
 > **Đọc trước:** Micro-slice S1–S6 cung cấp quy trình offline để operator nhập permalink, lưu shortlist riêng theo account, tự viết draft và duyệt target. S2 search/conversation chỉ dùng fixture synthetic; **không có tìm kiếm/thu thập Threads thật bằng browser**. S4 handoff có thể mở browser thật tới đúng URL sau xác nhận `OPEN`, nhưng chưa chạy live UAT. Không có browser auto-fill hoặc auto-send. Không hiểu tài liệu/test synthetic là sự cho phép của Meta hay bằng chứng đã qua App Review.
