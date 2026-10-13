@@ -24,9 +24,15 @@ from threads_platform.standalone.api_auto_plan import (
     CandidateSource,
     CandidateState,
     CapabilitySnapshot,
+    CyclePlan,
     ObservationProvenance,
+    ObservedCandidate,
     PlanDecision,
+    PlanItem,
+    PlanReason,
     QuotaSnapshot,
+    ReviewIntent,
+    plan_cycle,
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -108,6 +114,7 @@ class ContentReason(StrEnum):
     WINDOW_NOT_ACTIVE = "WINDOW_NOT_ACTIVE"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
     PROVENANCE_MISMATCH = "PROVENANCE_MISMATCH"
+    REVIEW_INTENT_MISMATCH = "REVIEW_INTENT_MISMATCH"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -236,6 +243,91 @@ class ContentEvaluation:
             "ContentEvaluation("
             f"decision={self.decision.value}, "
             f"reason_codes={tuple(reason.value for reason in self.reason_codes)!r}, "
+            f"packet_present={self.packet is not None})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReviewIntentBinding:
+    """Digest-only binding to a planner-verified, unapproved review intent."""
+
+    account_id: UUID = field(repr=False)
+    actor_sha256: str = field(repr=False)
+    action: ActionKind
+    source: CandidateSource
+    provenance: ObservationProvenance
+    candidate_fingerprint: str = field(repr=False)
+    target_sha256: str = field(repr=False)
+    context_sha256: str = field(repr=False)
+    root_sha256: str | None = field(repr=False)
+    parent_sha256: str | None = field(repr=False)
+    reply_sha256: str | None = field(repr=False)
+    context_evidence_sha256: str = field(repr=False)
+    policy_sha256: str = field(repr=False)
+    required_permissions: tuple[ApiPermission, ...]
+    quota_used: int
+    quota_total: int
+    capabilities_observed_at: datetime
+    quota_observed_at: datetime
+    candidate_observed_at: datetime
+    binding_observed_at: datetime
+    expires_at: datetime
+
+    def __repr__(self) -> str:
+        permission_count = (
+            len(self.required_permissions)
+            if type(self.required_permissions) is tuple
+            else "INVALID"
+        )
+        return (
+            "ReviewIntentBinding("
+            f"action={self.action.value if type(self.action) is ActionKind else 'INVALID'}, "
+            f"source={self.source.value if type(self.source) is CandidateSource else 'INVALID'}, "
+            f"provenance={self.provenance.value if type(self.provenance) is ObservationProvenance else 'INVALID'}, "
+            f"permission_count={permission_count}, "
+            f"expires_at={self.expires_at.isoformat() if type(self.expires_at) is datetime else 'INVALID'}, "
+            "private_binding=<redacted>)"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReviewContentPacket:
+    """Immutable content packet for operator review with no approval authority."""
+
+    binding: ReviewIntentBinding = field(repr=False)
+    prepared_content: PreparedContent = field(repr=False)
+    content_sha256: str = field(repr=False)
+    packet_revision_sha256: str = field(repr=False)
+    normalization_version: str
+    review_state: PacketReviewState = PacketReviewState.NEEDS_OPERATOR_REVIEW
+    dispatchable: bool = field(default=False, init=False)
+
+    def __repr__(self) -> str:
+        action = self.binding.action if type(self.binding) is ReviewIntentBinding else None
+        return (
+            "ReviewContentPacket("
+            f"action={action.value if type(action) is ActionKind else 'INVALID'}, "
+            f"review_state={self.review_state.value if type(self.review_state) is PacketReviewState else 'INVALID'}, "
+            "private_binding_and_content=<redacted>)"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReviewPacketEvaluation:
+    decision: ContentDecision
+    reason_codes: tuple[ContentReason, ...]
+    packet: ReviewContentPacket | None = field(repr=False)
+
+    def __repr__(self) -> str:
+        reasons = (
+            tuple(reason.value for reason in self.reason_codes if type(reason) is ContentReason)
+            if type(self.reason_codes) is tuple
+            else ("INVALID",)
+        )
+        return (
+            "ReviewPacketEvaluation("
+            f"decision={self.decision.value if type(self.decision) is ContentDecision else 'INVALID'}, "
+            f"reason_codes={reasons!r}, "
             f"packet_present={self.packet is not None})"
         )
 
@@ -384,6 +476,132 @@ def prepare_packet(
         now=now,
         known_packet_revisions=known_packet_revisions,
     )
+
+
+def prepare_review_packet(
+    intent: ReviewIntent,
+    prepared_content: PreparedContent | None,
+    scope: CampaignScope,
+    candidates: tuple[ObservedCandidate, ...],
+    *,
+    now: datetime,
+    known_packet_revisions: frozenset[str] = frozenset(),
+) -> ReviewPacketEvaluation:
+    """Bind operator-supplied text to a freshly planner-verified ReviewIntent."""
+
+    invalid_seen = _known_revisions_failure(known_packet_revisions)
+    if invalid_seen is not None:
+        return _review_result(ContentDecision.STOP, invalid_seen)
+
+    current, candidate, failure = _select_review_intent(scope, candidates, now=now)
+    if failure is not None:
+        return failure
+    if current is None or candidate is None:
+        return _review_result(ContentDecision.STOP, ContentReason.REVIEW_INTENT_MISMATCH)
+    if type(intent) is not ReviewIntent or intent != current:
+        return _review_result(ContentDecision.STOP, ContentReason.REVIEW_INTENT_MISMATCH)
+
+    scope_result = _scope_gate(scope, current, now)
+    if scope_result is not None:
+        return _review_from_content_result(scope_result)
+    state_result = _candidate_state_gate(candidate.state)
+    if state_result is not None:
+        return _review_from_content_result(state_result)
+    if prepared_content is None:
+        return _review_result(ContentDecision.UNAVAILABLE, ContentReason.PROVIDER_UNAVAILABLE)
+
+    content_result = _prepared_content_gate(prepared_content, current, now)
+    if content_result is not None:
+        return _review_from_content_result(content_result)
+    normalized, text_reason = _normalize_text(prepared_content.text)
+    if text_reason is not None:
+        return _review_result(ContentDecision.STOP, text_reason)
+
+    content_sha256 = _sha256_text(normalized)
+    normalized_content = replace(prepared_content, text=normalized)
+    binding = _review_intent_binding(current)
+    binding_failure = _review_binding_failure(binding)
+    if binding_failure is not None:
+        return _review_result(ContentDecision.STOP, binding_failure)
+    revision_sha256 = _review_packet_revision_digest(
+        binding,
+        normalized_content,
+        content_sha256=content_sha256,
+    )
+    if revision_sha256 in known_packet_revisions:
+        return _review_result(ContentDecision.STOP, ContentReason.DUPLICATE_PACKET)
+
+    packet = ReviewContentPacket(
+        binding=binding,
+        prepared_content=normalized_content,
+        content_sha256=content_sha256,
+        packet_revision_sha256=revision_sha256,
+        normalization_version=_NORMALIZATION_VERSION,
+    )
+    return ReviewPacketEvaluation(ContentDecision.NEEDS_REVIEW, (), packet)
+
+
+def revalidate_review_packet(
+    packet: ReviewContentPacket,
+    scope: CampaignScope,
+    candidates: tuple[ObservedCandidate, ...],
+    *,
+    now: datetime,
+    known_packet_revisions: frozenset[str] = frozenset(),
+) -> ReviewPacketEvaluation:
+    """Recheck a review packet against a fresh planner selection and local inputs."""
+
+    invalid_seen = _known_revisions_failure(known_packet_revisions)
+    if invalid_seen is not None:
+        return _review_result(ContentDecision.STOP, invalid_seen)
+    if type(packet) is not ReviewContentPacket:
+        return _review_result(ContentDecision.STOP, ContentReason.INVALID_INPUT)
+    packet_failure = _review_packet_internal_failure(packet)
+    if packet_failure is not None:
+        return _review_result(ContentDecision.STOP, packet_failure)
+    if packet.packet_revision_sha256 in known_packet_revisions:
+        return _review_result(ContentDecision.STOP, ContentReason.DUPLICATE_PACKET)
+
+    current, candidate, failure = _select_review_intent(scope, candidates, now=now)
+    if failure is not None:
+        return failure
+    assert current is not None and candidate is not None
+
+    scope_result = _scope_gate(scope, current, now)
+    if scope_result is not None:
+        return _review_from_content_result(scope_result)
+    state_result = _candidate_state_gate(candidate.state)
+    if state_result is not None:
+        return _review_from_content_result(state_result)
+
+    binding_failure = _review_binding_revalidation_failure(
+        packet.binding, _review_intent_binding(current)
+    )
+    if binding_failure is not None:
+        return _review_result(ContentDecision.STOP, binding_failure)
+    if packet.binding.expires_at <= now:
+        return _review_result(ContentDecision.STOP, ContentReason.WINDOW_EXPIRED)
+
+    content_result = _prepared_content_gate(packet.prepared_content, current, now)
+    if content_result is not None:
+        return _review_from_content_result(content_result)
+    normalized, text_reason = _normalize_text(packet.prepared_content.text)
+    if text_reason is not None:
+        return _review_result(ContentDecision.STOP, text_reason)
+    if normalized != packet.prepared_content.text:
+        return _review_result(ContentDecision.STOP, ContentReason.TEXT_NOT_NORMALIZED)
+    content_sha256 = _sha256_text(normalized)
+    if content_sha256 != packet.content_sha256:
+        return _review_result(ContentDecision.STOP, ContentReason.CONTENT_HASH_MISMATCH)
+    expected_revision = _review_packet_revision_digest(
+        packet.binding,
+        packet.prepared_content,
+        content_sha256=content_sha256,
+    )
+    if packet.packet_revision_sha256 != expected_revision:
+        return _review_result(ContentDecision.STOP, ContentReason.PACKET_REVISION_MISMATCH)
+
+    return ReviewPacketEvaluation(ContentDecision.NEEDS_REVIEW, (), packet)
 
 
 def evaluate_review_eligibility(
@@ -541,6 +759,37 @@ def approval_input_for_review(evaluation: ContentEvaluation) -> ApprovalInput | 
     )
 
 
+def approval_input_for_review_packet(
+    evaluation: ReviewPacketEvaluation,
+) -> ApprovalInput | None:
+    """Project inert approval fields from an internally valid review packet."""
+
+    if (
+        type(evaluation) is not ReviewPacketEvaluation
+        or evaluation.decision is not ContentDecision.NEEDS_REVIEW
+        or type(evaluation.reason_codes) is not tuple
+        or evaluation.reason_codes
+        or type(evaluation.packet) is not ReviewContentPacket
+    ):
+        return None
+    packet = evaluation.packet
+    if _review_packet_internal_failure(packet) is not None:
+        return None
+    binding = packet.binding
+    return ApprovalInput(
+        account_id=binding.account_id,
+        candidate_fingerprint=binding.candidate_fingerprint,
+        action=binding.action,
+        target_sha256=binding.target_sha256,
+        context_sha256=binding.context_sha256,
+        content_sha256=packet.content_sha256,
+        packet_revision_sha256=packet.packet_revision_sha256,
+        policy_sha256=binding.policy_sha256,
+        expires_at=packet.prepared_content.expires_at,
+        review_state=PacketReviewState.NEEDS_OPERATOR_REVIEW,
+    )
+
+
 def _proposal_failure(proposal: object) -> ContentReason | None:
     if type(proposal) is not ActionProposal:
         return ContentReason.INVALID_PROPOSAL
@@ -584,7 +833,9 @@ def _proposal_failure(proposal: object) -> ContentReason | None:
     return None
 
 
-def _scope_gate(scope: object, proposal: ActionProposal, now: datetime) -> ContentEvaluation | None:
+def _scope_gate(
+    scope: object, proposal: ActionProposal | ReviewIntent, now: datetime
+) -> ContentEvaluation | None:
     if (
         type(now) is not datetime
         or not _is_utc(now)
@@ -658,7 +909,7 @@ def _candidate_state_gate(state: object) -> ContentEvaluation | None:
 
 
 def _prepared_content_gate(
-    prepared: object, proposal: ActionProposal, now: datetime
+    prepared: object, proposal: ActionProposal | ReviewIntent, now: datetime
 ) -> ContentEvaluation | None:
     if type(prepared) is not PreparedContent:
         return _result(ContentDecision.STOP, ContentReason.INVALID_CONTENT)
@@ -699,7 +950,10 @@ def _prepared_content_gate(
     return None
 
 
-def _rights_gate(prepared: PreparedContent, proposal: ActionProposal) -> ContentEvaluation | None:
+def _rights_gate(
+    prepared: PreparedContent,
+    proposal: ActionProposal | ReviewIntent | ReviewIntentBinding,
+) -> ContentEvaluation | None:
     rights = prepared.rights
     if type(rights) is not RightsEvidence:
         return _result(ContentDecision.NOT_ELIGIBLE, ContentReason.RIGHTS_NOT_DECLARED)
@@ -750,6 +1004,412 @@ def _known_revisions_failure(revisions: object) -> ContentReason | None:
     if any(not _is_sha256(item) for item in known_revisions):
         return ContentReason.INVALID_INPUT
     return None
+
+
+def _select_review_intent(
+    scope: object,
+    candidates: object,
+    *,
+    now: object,
+) -> tuple[ReviewIntent | None, ObservedCandidate | None, ReviewPacketEvaluation | None]:
+    if (
+        type(scope) is not CampaignScope
+        or type(candidates) is not tuple
+        or type(now) is not datetime
+        or not _is_utc(now)
+    ):
+        return None, None, _review_result(ContentDecision.STOP, ContentReason.INVALID_INPUT)
+    typed_candidates = cast(tuple[ObservedCandidate, ...], candidates)
+    if any(type(candidate) is not ObservedCandidate for candidate in typed_candidates):
+        return None, None, _review_result(ContentDecision.STOP, ContentReason.INVALID_INPUT)
+
+    plan = plan_cycle(scope, typed_candidates, None, now=now)
+    if type(plan) is not CyclePlan:
+        return None, None, _review_result(ContentDecision.STOP, ContentReason.INVALID_INPUT)
+    if plan.decision is PlanDecision.NEEDS_CONTEXT:
+        return None, None, _review_result(ContentDecision.STOP, ContentReason.CONTEXT_MISMATCH)
+    if plan.decision is PlanDecision.STOP or plan.reason_codes:
+        return None, None, _review_plan_failure(plan)
+    if plan.decision not in {PlanDecision.OBSERVE_ONLY, PlanDecision.NOT_ELIGIBLE}:
+        return None, None, _review_plan_failure(plan)
+
+    if type(plan.items) is not tuple or any(type(item) is not PlanItem for item in plan.items):
+        return None, None, _review_result(ContentDecision.STOP, ContentReason.INVALID_INPUT)
+    intent_items = tuple(item for item in plan.items if item.review_intent is not None)
+    if len(intent_items) != 1:
+        return None, None, _review_plan_failure(plan)
+    item = intent_items[0]
+    if (
+        item.decision is not PlanDecision.OBSERVE_ONLY
+        or item.reason_codes != (PlanReason.DRAFT_UNAVAILABLE,)
+        or item.proposal is not None
+        or type(item.review_intent) is not ReviewIntent
+        or item.review_intent.dispatchable is not False
+    ):
+        return None, None, _review_result(ContentDecision.STOP, ContentReason.INVALID_INPUT)
+    allowed_ineligible_reasons = {
+        (PlanReason.COOLDOWN,),
+        (PlanReason.NOT_ELIGIBLE,),
+        (PlanReason.QUOTA_EXHAUSTED,),
+    }
+    for other in plan.items:
+        if other is item:
+            continue
+        if other.proposal is not None or other.review_intent is not None:
+            return (
+                None,
+                None,
+                _review_result(ContentDecision.STOP, ContentReason.REVIEW_INTENT_MISMATCH),
+            )
+        if other.decision is PlanDecision.OBSERVE_ONLY and other.reason_codes == (
+            PlanReason.DRAFT_UNAVAILABLE,
+        ):
+            continue
+        if (
+            other.decision is PlanDecision.NOT_ELIGIBLE
+            and other.reason_codes in allowed_ineligible_reasons
+        ):
+            continue
+        return (
+            None,
+            None,
+            _review_result(ContentDecision.STOP, ContentReason.REVIEW_INTENT_MISMATCH),
+        )
+
+    intent = item.review_intent
+    matching = tuple(
+        candidate
+        for candidate in typed_candidates
+        if candidate.account_id == intent.account_id
+        and candidate.action is intent.action
+        and candidate.source is intent.source
+        and candidate.provenance is intent.provenance
+        and candidate.fingerprint == intent.candidate_fingerprint
+    )
+    if len(matching) != 1:
+        return (
+            None,
+            None,
+            _review_result(ContentDecision.STOP, ContentReason.REVIEW_INTENT_MISMATCH),
+        )
+    candidate = matching[0]
+    return intent, candidate, None
+
+
+def _review_plan_failure(plan: CyclePlan) -> ReviewPacketEvaluation:
+    reasons = plan.reason_codes or tuple(
+        reason for item in plan.items for reason in item.reason_codes
+    )
+    mapping: dict[PlanReason, tuple[ContentDecision, ContentReason]] = {
+        PlanReason.AMBIGUOUS_PRIOR_ACTION: (
+            ContentDecision.STOP,
+            ContentReason.AMBIGUOUS_PRIOR_ACTION,
+        ),
+        PlanReason.API_PERMISSION_MISSING: (
+            ContentDecision.STOP,
+            ContentReason.API_PERMISSION_MISSING,
+        ),
+        PlanReason.CANDIDATE_LIMIT_EXCEEDED: (ContentDecision.STOP, ContentReason.INVALID_INPUT),
+        PlanReason.CONTEXT_INCOMPLETE: (ContentDecision.STOP, ContentReason.CONTEXT_MISMATCH),
+        PlanReason.CONTEXT_STALE: (ContentDecision.STOP, ContentReason.EVIDENCE_STALE),
+        PlanReason.COOLDOWN: (ContentDecision.NOT_ELIGIBLE, ContentReason.COOLDOWN),
+        PlanReason.DRAFT_UNAVAILABLE: (
+            ContentDecision.NOT_ELIGIBLE,
+            ContentReason.ACTION_NOT_ALLOWED,
+        ),
+        PlanReason.INVALID_SCOPE: (ContentDecision.STOP, ContentReason.INVALID_SCOPE),
+        PlanReason.NOT_ELIGIBLE: (ContentDecision.NOT_ELIGIBLE, ContentReason.INELIGIBLE_CANDIDATE),
+        PlanReason.POLICY_NOT_APPROVED: (ContentDecision.STOP, ContentReason.POLICY_MISMATCH),
+        PlanReason.QUOTA_EXHAUSTED: (ContentDecision.NOT_ELIGIBLE, ContentReason.QUOTA_EXHAUSTED),
+        PlanReason.QUOTA_UNAVAILABLE: (ContentDecision.STOP, ContentReason.QUOTA_UNAVAILABLE),
+        PlanReason.TARGET_ACCOUNT_MISMATCH: (
+            ContentDecision.STOP,
+            ContentReason.TARGET_ACCOUNT_MISMATCH,
+        ),
+        PlanReason.TARGET_SOURCE_MISMATCH: (
+            ContentDecision.STOP,
+            ContentReason.PROVENANCE_MISMATCH,
+        ),
+    }
+    target_failures = {
+        PlanReason.DUPLICATE_FINGERPRINT,
+        PlanReason.REPLY_TARGET_COLLISION,
+        PlanReason.TARGET_ACTOR_MISMATCH,
+        PlanReason.TARGET_NOT_REACQUIRED,
+        PlanReason.TARGET_UNAVAILABLE,
+        PlanReason.TARGET_UNVERIFIED,
+        PlanReason.FINGERPRINT_BINDING_CONFLICT,
+        PlanReason.APPROVAL_TARGET_MISMATCH,
+    }
+    for reason in reasons:
+        if reason in target_failures:
+            return _review_result(ContentDecision.STOP, ContentReason.TARGET_MISMATCH)
+        if reason in {
+            PlanReason.ACTION_CAP_REACHED,
+            PlanReason.ACTION_NOT_ALLOWED,
+            PlanReason.UNSUPPORTED_SOURCE,
+        }:
+            return _review_result(ContentDecision.NOT_ELIGIBLE, ContentReason.ACTION_NOT_ALLOWED)
+        if type(reason) is PlanReason and reason in mapping:
+            decision, content_reason = mapping[reason]
+            return _review_result(decision, content_reason)
+    if plan.decision is PlanDecision.NOT_ELIGIBLE:
+        return _review_result(ContentDecision.NOT_ELIGIBLE, ContentReason.INELIGIBLE_CANDIDATE)
+    if plan.decision is PlanDecision.NEEDS_CONTEXT:
+        return _review_result(ContentDecision.STOP, ContentReason.CONTEXT_MISMATCH)
+    return _review_result(ContentDecision.STOP, ContentReason.REVIEW_INTENT_MISMATCH)
+
+
+def _review_intent_binding(intent: ReviewIntent) -> ReviewIntentBinding:
+    return ReviewIntentBinding(
+        account_id=intent.account_id,
+        actor_sha256=_review_actor_sha256(intent.actor_id),
+        action=intent.action,
+        source=intent.source,
+        provenance=intent.provenance,
+        candidate_fingerprint=intent.candidate_fingerprint,
+        target_sha256=intent.target_sha256,
+        context_sha256=intent.context_sha256,
+        root_sha256=intent.root_sha256,
+        parent_sha256=intent.parent_sha256,
+        reply_sha256=intent.reply_sha256,
+        context_evidence_sha256=intent.context_evidence_sha256,
+        policy_sha256=intent.policy_sha256,
+        required_permissions=intent.required_permissions,
+        quota_used=intent.quota_used,
+        quota_total=intent.quota_total,
+        capabilities_observed_at=intent.capabilities_observed_at,
+        quota_observed_at=intent.quota_observed_at,
+        candidate_observed_at=intent.candidate_observed_at,
+        binding_observed_at=intent.binding_observed_at,
+        expires_at=intent.expires_at,
+    )
+
+
+def _review_binding_failure(binding: object) -> ContentReason | None:
+    if type(binding) is not ReviewIntentBinding:
+        return ContentReason.INVALID_INPUT
+    if (
+        type(binding.account_id) is not UUID
+        or not _is_sha256(binding.actor_sha256)
+        or type(binding.action) is not ActionKind
+        or type(binding.source) is not CandidateSource
+        or type(binding.provenance) is not ObservationProvenance
+        or not all(
+            _is_sha256(value)
+            for value in (
+                binding.candidate_fingerprint,
+                binding.target_sha256,
+                binding.context_sha256,
+                binding.context_evidence_sha256,
+                binding.policy_sha256,
+            )
+        )
+        or any(
+            value is not None and not _is_sha256(value)
+            for value in (binding.root_sha256, binding.parent_sha256, binding.reply_sha256)
+        )
+        or type(binding.required_permissions) is not tuple
+        or any(type(permission) is not ApiPermission for permission in binding.required_permissions)
+        or binding.required_permissions != _required_permissions(binding.action)
+        or type(binding.quota_used) is not int
+        or type(binding.quota_total) is not int
+        or binding.quota_used < 0
+        or binding.quota_total <= binding.quota_used
+        or not all(
+            _is_utc(value)
+            for value in (
+                binding.capabilities_observed_at,
+                binding.quota_observed_at,
+                binding.candidate_observed_at,
+                binding.binding_observed_at,
+                binding.expires_at,
+            )
+        )
+    ):
+        return ContentReason.INVALID_INPUT
+    if any(
+        binding.expires_at <= observed_at
+        for observed_at in (
+            binding.capabilities_observed_at,
+            binding.quota_observed_at,
+            binding.candidate_observed_at,
+            binding.binding_observed_at,
+        )
+    ):
+        return ContentReason.INVALID_INPUT
+    if binding.action is ActionKind.POST_TEXT:
+        if (
+            binding.source is not CandidateSource.OWN_ACCOUNT
+            or binding.provenance
+            not in {
+                ObservationProvenance.LOCAL_OPERATOR_PACKET,
+                ObservationProvenance.SYNTHETIC_FIXTURE,
+            }
+            or any(
+                value is not None
+                for value in (binding.root_sha256, binding.parent_sha256, binding.reply_sha256)
+            )
+        ):
+            return ContentReason.INVALID_INPUT
+    elif (
+        binding.action is not ActionKind.REPLY
+        or binding.source is not CandidateSource.INBOUND_REPLY
+        or binding.provenance
+        not in {ObservationProvenance.OFFICIAL_API, ObservationProvenance.SYNTHETIC_FIXTURE}
+        or any(
+            value is None
+            for value in (binding.root_sha256, binding.parent_sha256, binding.reply_sha256)
+        )
+    ):
+        return ContentReason.INVALID_INPUT
+    return None
+
+
+def _review_binding_revalidation_failure(
+    stored: ReviewIntentBinding,
+    current: ReviewIntentBinding,
+) -> ContentReason | None:
+    if stored.account_id != current.account_id:
+        return ContentReason.TARGET_ACCOUNT_MISMATCH
+    if (
+        stored.action is not current.action
+        or stored.source is not current.source
+        or stored.provenance is not current.provenance
+        or stored.candidate_fingerprint != current.candidate_fingerprint
+    ):
+        return ContentReason.REVIEW_INTENT_MISMATCH
+    if (
+        stored.actor_sha256 != current.actor_sha256
+        or stored.target_sha256 != current.target_sha256
+        or stored.root_sha256 != current.root_sha256
+        or stored.parent_sha256 != current.parent_sha256
+        or stored.reply_sha256 != current.reply_sha256
+    ):
+        return ContentReason.TARGET_MISMATCH
+    if (
+        stored.context_sha256 != current.context_sha256
+        or stored.context_evidence_sha256 != current.context_evidence_sha256
+    ):
+        return ContentReason.CONTEXT_MISMATCH
+    if stored.policy_sha256 != current.policy_sha256:
+        return ContentReason.POLICY_MISMATCH
+    if stored.required_permissions != current.required_permissions:
+        return ContentReason.API_PERMISSION_MISSING
+    if (stored.quota_used, stored.quota_total) != (current.quota_used, current.quota_total):
+        return ContentReason.QUOTA_UNAVAILABLE
+    return None
+
+
+def _review_packet_internal_failure(packet: object) -> ContentReason | None:
+    if type(packet) is not ReviewContentPacket:
+        return ContentReason.INVALID_INPUT
+    binding_failure = _review_binding_failure(packet.binding)
+    if binding_failure is not None:
+        return binding_failure
+    prepared = packet.prepared_content
+    if (
+        type(prepared) is not PreparedContent
+        or type(prepared.origin) is not ContentOrigin
+        or type(packet.review_state) is not PacketReviewState
+        or packet.review_state is not PacketReviewState.NEEDS_OPERATOR_REVIEW
+        or packet.dispatchable is not False
+        or packet.normalization_version != _NORMALIZATION_VERSION
+        or not _is_sha256(packet.content_sha256)
+        or not _is_sha256(packet.packet_revision_sha256)
+        or type(prepared.rights) is not RightsEvidence
+        or not all(
+            _is_utc(value)
+            for value in (prepared.prepared_at, prepared.effective_at, prepared.expires_at)
+        )
+        or prepared.prepared_at > prepared.effective_at
+        or prepared.effective_at >= prepared.expires_at
+        or prepared.expires_at > packet.binding.expires_at
+        or prepared.expires_at - prepared.prepared_at > _MAX_PACKET_WINDOW
+    ):
+        return ContentReason.INVALID_INPUT
+    rights_result = _rights_gate(prepared, packet.binding)
+    if rights_result is not None:
+        return rights_result.reason_codes[0]
+    normalized, reason = _normalize_text(prepared.text)
+    if reason is not None:
+        return reason
+    if normalized != prepared.text:
+        return ContentReason.TEXT_NOT_NORMALIZED
+    content_sha256 = _sha256_text(normalized)
+    if content_sha256 != packet.content_sha256:
+        return ContentReason.CONTENT_HASH_MISMATCH
+    if packet.packet_revision_sha256 != _review_packet_revision_digest(
+        packet.binding, prepared, content_sha256=content_sha256
+    ):
+        return ContentReason.PACKET_REVISION_MISMATCH
+    return None
+
+
+def _review_packet_revision_digest(
+    binding: ReviewIntentBinding,
+    prepared: PreparedContent,
+    *,
+    content_sha256: str,
+) -> str:
+    rights = prepared.rights
+    assert type(rights) is RightsEvidence
+    payload = {
+        "schema": "api-auto-review-packet/v1",
+        "account": str(binding.account_id),
+        "actor_sha256": binding.actor_sha256,
+        "action": binding.action.value,
+        "source": binding.source.value,
+        "provenance": binding.provenance.value,
+        "candidate_fingerprint": binding.candidate_fingerprint,
+        "target_sha256": binding.target_sha256,
+        "context_sha256": binding.context_sha256,
+        "root_sha256": binding.root_sha256,
+        "parent_sha256": binding.parent_sha256,
+        "reply_sha256": binding.reply_sha256,
+        "context_evidence_sha256": binding.context_evidence_sha256,
+        "policy_sha256": binding.policy_sha256,
+        "required_permissions": tuple(
+            permission.value for permission in binding.required_permissions
+        ),
+        "quota_used": binding.quota_used,
+        "quota_total": binding.quota_total,
+        "capabilities_observed_at": binding.capabilities_observed_at.isoformat(),
+        "quota_observed_at": binding.quota_observed_at.isoformat(),
+        "candidate_observed_at": binding.candidate_observed_at.isoformat(),
+        "binding_observed_at": binding.binding_observed_at.isoformat(),
+        "intent_expires_at": binding.expires_at.isoformat(),
+        "content_sha256": content_sha256,
+        "origin": prepared.origin.value,
+        "source_attribution_sha256": _sha256_text(rights.source_attribution or ""),
+        "rights_basis": rights.rights_basis.value,
+        "right_to_use_declared": rights.right_to_use_declared,
+        "job_facts_sha256": rights.job_facts_sha256,
+        "job_facts_declaration": rights.job_facts_declaration.value,
+        "normalization_version": _NORMALIZATION_VERSION,
+        "prepared_at": prepared.prepared_at.isoformat(),
+        "effective_at": prepared.effective_at.isoformat(),
+        "expires_at": prepared.expires_at.isoformat(),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(b"threads-standalone:api-auto-review-packet:v1\0" + encoded).hexdigest()
+
+
+def _review_actor_sha256(actor_id: str) -> str:
+    return hashlib.sha256(
+        b"threads-standalone:api-auto-review-actor:v1\0" + actor_id.encode("utf-8")
+    ).hexdigest()
+
+
+def _review_from_content_result(result: ContentEvaluation) -> ReviewPacketEvaluation:
+    return ReviewPacketEvaluation(result.decision, result.reason_codes, None)
+
+
+def _review_result(
+    decision: ContentDecision,
+    reason: ContentReason,
+) -> ReviewPacketEvaluation:
+    return ReviewPacketEvaluation(decision, (reason,), None)
 
 
 def _proposal_binding(proposal: ActionProposal) -> ProposalBinding:
