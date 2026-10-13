@@ -9,7 +9,7 @@ import sys
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -790,6 +790,51 @@ def _build_parser() -> argparse.ArgumentParser:
     recruitment_commands = recruitment_parser.add_subparsers(
         dest="recruitment_command", required=True
     )
+    browser_watch_parser = recruitment_commands.add_parser(
+        "browser-watch",
+        help="run a finite synthetic-only foreground Browser Jobs watch",
+    )
+    browser_watch_parser.error = lambda message: _redacted_parser_error(
+        browser_watch_parser, message
+    )
+    browser_watch_parser.add_argument(
+        "--source",
+        choices=("fixture", "manual"),
+        required=True,
+        help="fixture uses local synthetic JSON; manual returns UNKNOWN / NO_TEXT",
+    )
+    browser_watch_parser.add_argument(
+        "--account",
+        help="synthetic alias beginning with test- or synthetic- (fixture only)",
+    )
+    browser_watch_parser.add_argument(
+        "--data-root",
+        help="caller-created empty private synthetic directory outside the checkout",
+    )
+    browser_watch_parser.add_argument(
+        "--fixture-file",
+        help="bounded private UTF-8 synthetic fixture outside the checkout",
+    )
+    browser_watch_parser.add_argument("--run-id", help="stable local synthetic run ID")
+    browser_watch_parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=1,
+        help="finite cycle cap from 1 to 5 (default: 1)",
+    )
+    browser_watch_parser.add_argument(
+        "--max-posts-per-cycle",
+        type=int,
+        default=20,
+        help="fixture post cap from 1 to 20 (default: 20)",
+    )
+    browser_watch_parser.add_argument(
+        "--interval-minutes",
+        type=int,
+        default=15,
+        help="foreground interval; at least 15 minutes for multiple cycles",
+    )
+
     manual_review_parser = recruitment_commands.add_parser("manual-review")
     manual_review_parser.add_argument("alias")
     manual_review_parser.add_argument("--targets-file", required=True)
@@ -882,6 +927,11 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _redacted_parser_error(parser: argparse.ArgumentParser, message: str) -> NoReturn:
+    del message
+    parser.exit(2, "ERROR CLI_ARGUMENT_INVALID\n")
+
+
 def _format_feed_result(result: Any) -> str:
     lines = [f"feed count={len(result.observations)} truncated={str(result.truncated).lower()}\n"]
     for item in result.observations:
@@ -927,6 +977,12 @@ def _run_browser_command(args: argparse.Namespace, root: Path, store: LocalAccou
 
 
 def _handle_recruitment_command(args: argparse.Namespace) -> int:
+    if args.recruitment_command == "browser-watch":
+        from threads_platform.standalone.recruitment_browser_jobs_cli import (
+            run_recruitment_browser_jobs_cli,
+        )
+
+        return run_recruitment_browser_jobs_cli(args)
     if args.recruitment_command.startswith("content-"):
         return run_recruitment_content_cli(
             args.recruitment_command,
@@ -1037,7 +1093,11 @@ def _handle_recruitment_command(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    command_args = list(sys.argv[1:] if argv is None else argv)
+    if command_args[:2] == ["recruitment", "browser-watch"]:
+        parser.error = lambda message: _redacted_parser_error(parser, message)
+    args = parser.parse_args(command_args)
     try:
         if args.command == "workflow":
             plan = load_workflow(Path(args.file))
