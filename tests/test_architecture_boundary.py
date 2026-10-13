@@ -86,7 +86,7 @@ def test_runtime_dependencies_have_no_old_repo_or_distributed_stack() -> None:
     )
 
 
-def test_playwright_import_is_confined_to_its_lazy_engine_adapter() -> None:
+def test_playwright_imports_are_confined_to_explicit_browser_adapters() -> None:
     source_root = _ROOT / "src" / "threads_platform"
     imports: list[Path] = []
     for path in source_root.rglob("*.py"):
@@ -104,7 +104,11 @@ def test_playwright_import_is_confined_to_its_lazy_engine_adapter() -> None:
             if module == "playwright" or (module is not None and module.startswith("playwright.")):
                 imports.append(path.relative_to(source_root))
 
-    assert set(imports) == {Path("browser/playwright_engine.py")}
+    assert set(imports) == {
+        Path("browser/playwright_engine.py"),
+        Path("browser/synthetic_dom_session.py"),
+        Path("browser/ui_card_snapshot.py"),
+    }
 
 
 @pytest.mark.parametrize("command", ["publish", "reply", "quote", "browser", "worker"])

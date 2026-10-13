@@ -799,13 +799,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     browser_watch_parser.add_argument(
         "--source",
-        choices=("fixture", "manual"),
+        choices=("fixture", "dom-fixture", "manual"),
         required=True,
-        help="fixture uses local synthetic JSON; manual returns UNKNOWN / NO_TEXT",
+        help=(
+            "fixture maps synthetic JSON to BJ-02; dom-fixture renders local synthetic HTML; "
+            "manual returns UNKNOWN / NO_TEXT"
+        ),
     )
     browser_watch_parser.add_argument(
         "--account",
-        help="synthetic alias beginning with test- or synthetic- (fixture only)",
+        help="synthetic alias beginning with test- or synthetic- (fixture sources only)",
     )
     browser_watch_parser.add_argument(
         "--data-root",
@@ -813,7 +816,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     browser_watch_parser.add_argument(
         "--fixture-file",
-        help="bounded private UTF-8 synthetic fixture outside the checkout",
+        help="bounded private UTF-8 synthetic manifest outside the checkout",
     )
     browser_watch_parser.add_argument("--run-id", help="stable local synthetic run ID")
     browser_watch_parser.add_argument(
