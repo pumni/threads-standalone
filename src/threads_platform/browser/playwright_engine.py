@@ -25,6 +25,7 @@ from playwright.async_api import (
 from threads_platform.browser.contracts import (
     BROWSER_FEED_CANDIDATE_BOUND,
     BROWSER_FEED_ORIGIN,
+    BrowserAdapterError,
     BrowserContractError,
     BrowserEngineSession,
     BrowserLaunchRequest,
@@ -42,8 +43,7 @@ _FEED_SCAN_SCRIPT = r"""
   if (window.location.origin !== allowedOrigin) {
     return {ok: false, reason: 'origin_mismatch'};
   }
-  const anchors = document.querySelectorAll('a[href]');
-  if (anchors.length > 1000) return {ok: false};
+  const anchors = document.querySelectorAll('a[href*="/post/"]');
   const permalinks = [];
   for (const anchor of anchors) {
     const href = anchor.getAttribute('href');
@@ -55,7 +55,9 @@ _FEED_SCAN_SCRIPT = r"""
         continue;
       }
       permalinks.push(url.pathname);
-      if (permalinks.length > candidateBound) return {ok: false};
+      if (permalinks.length > candidateBound) {
+        return {ok: false, reason: 'candidate_bound_exceeded'};
+      }
     } catch (_) {
       continue;
     }
@@ -221,6 +223,7 @@ class _PlaywrightBrowserSession:
         self._navigation_timeout_ms = navigation_timeout_ms
         self._crashed = False
         self._closed = False
+        self._last_feed_permalinks: frozenset[str] = frozenset()
         self._allowed_navigation_origins: frozenset[str] = frozenset()
         self._navigation_guard_installed = False
         self._remote_state_uncertain = False
@@ -308,22 +311,10 @@ class _PlaywrightBrowserSession:
             self._navigation_timeout_ms / 1000,
         )
         deadline = loop.time() + readiness_timeout_seconds
-        script_args = {
-            "allowedOrigin": BROWSER_FEED_ORIGIN,
-            "candidateBound": candidate_bound,
-        }
         while True:
-            self._ensure_alive()
-            await self._raise_navigation_policy_error()
-            try:
-                payload = await self._page.evaluate(_FEED_SCAN_SCRIPT, script_args)
-            except PlaywrightError:
-                self._ensure_alive()
-                await self._raise_navigation_policy_error()
-                raise BrowserRuntimeUnavailable("BROWSER_FEED_INSPECTION_FAILED") from None
-            await self._raise_navigation_policy_error()
-            permalinks = _feed_permalinks(payload)
+            permalinks = await self._scan_feed_permalinks(candidate_bound=candidate_bound)
             if permalinks:
+                self._last_feed_permalinks = frozenset(permalinks)
                 return permalinks
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -421,11 +412,51 @@ class _PlaywrightBrowserSession:
     async def scroll_feed(self) -> None:
         self._ensure_alive()
         await self._raise_navigation_policy_error()
+        previous_permalinks = self._last_feed_permalinks
         try:
             await self._page.evaluate("() => window.scrollBy(0, Math.max(window.innerHeight, 1))")
         except PlaywrightError:
             self._ensure_alive()
             raise BrowserRuntimeUnavailable("BROWSER_FEED_SCROLL_FAILED") from None
+
+        loop = asyncio.get_running_loop()
+        readiness_timeout_seconds = min(
+            _BROWSER_READ_READINESS_TIMEOUT_SECONDS,
+            self._navigation_timeout_ms / 1000,
+        )
+        deadline = loop.time() + readiness_timeout_seconds
+        while True:
+            permalinks = await self._scan_feed_permalinks(
+                candidate_bound=BROWSER_FEED_CANDIDATE_BOUND
+            )
+            if permalinks:
+                self._last_feed_permalinks = frozenset(permalinks)
+                if self._last_feed_permalinks.difference(previous_permalinks):
+                    return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(_BROWSER_READ_READINESS_POLL_SECONDS, remaining))
+            if loop.time() >= deadline:
+                return
+
+    async def _scan_feed_permalinks(self, *, candidate_bound: int) -> tuple[str, ...]:
+        self._ensure_alive()
+        await self._raise_navigation_policy_error()
+        try:
+            payload = await self._page.evaluate(
+                _FEED_SCAN_SCRIPT,
+                {
+                    "allowedOrigin": BROWSER_FEED_ORIGIN,
+                    "candidateBound": candidate_bound,
+                },
+            )
+        except PlaywrightError:
+            self._ensure_alive()
+            await self._raise_navigation_policy_error()
+            raise BrowserRuntimeUnavailable("BROWSER_FEED_INSPECTION_FAILED") from None
+        await self._raise_navigation_policy_error()
+        return _feed_permalinks(payload)
 
     async def close(self) -> None:
         if self._closed:
@@ -466,6 +497,8 @@ def _feed_permalinks(payload: object) -> tuple[str, ...]:
     data = cast(dict[str, object], payload)
     if data.get("reason") == "origin_mismatch":
         raise RemoteSessionStateUncertain()
+    if data.get("reason") == "candidate_bound_exceeded":
+        raise BrowserAdapterError("BROWSER_FEED_CANDIDATE_BOUND_EXCEEDED")
     permalink_value = data.get("permalinks")
     if data.get("ok") is not True or not isinstance(permalink_value, list):
         raise BrowserContractError()

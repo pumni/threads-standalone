@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import threads_platform.browser.playwright_engine as engine_module
 from threads_platform.browser.contracts import (
+    BROWSER_FEED_CANDIDATE_BOUND,
+    BrowserAdapterError,
     BrowserContractError,
     BrowserEngineSession,
     BrowserLaunchRequest,
@@ -62,6 +66,10 @@ class _FakePage:
         self.timeout_on_goto = False
         self.goto_calls: list[tuple[str, str, int]] = []
         self.events: dict[str, Any] = {}
+        self.feed_payloads: list[object] = []
+        self.feed_anchor_hrefs: tuple[str, ...] | None = None
+        self.feed_scan_calls = 0
+        self.scroll_dispatches = 0
 
     def on(self, event: str, handler: Any) -> None:
         self.events[event] = handler
@@ -84,13 +92,21 @@ class _FakePage:
 
     async def evaluate(self, script: str, arguments: object = None) -> object:
         if "candidateBound" in script:
-            assert arguments == {
-                "allowedOrigin": "https://www.threads.com",
-                "candidateBound": 25,
-            }
+            self.feed_scan_calls += 1
+            assert isinstance(arguments, dict)
+            assert arguments.get("allowedOrigin") == "https://www.threads.com"
+            candidate_bound = arguments.get("candidateBound")
+            assert type(candidate_bound) is int
+            assert 1 <= candidate_bound <= BROWSER_FEED_CANDIDATE_BOUND
+            if self.feed_payloads:
+                self.payload = self.feed_payloads.pop(0)
+            if self.feed_anchor_hrefs is not None:
+                return _fake_feed_scan(self.url, self.feed_anchor_hrefs, arguments)
             return self.payload
         if "targetAuthor" in script or "ancestorBound" in script:
             return self.payload
+        if "window.scrollBy" in script:
+            self.scroll_dispatches += 1
         return None
 
     def is_closed(self) -> bool:
@@ -158,6 +174,30 @@ def _request(profile: Path) -> BrowserLaunchRequest:
     )
 
 
+def _fake_feed_scan(url: str, hrefs: tuple[str, ...], arguments: object) -> object:
+    assert isinstance(arguments, dict)
+    allowed_origin = arguments.get("allowedOrigin")
+    candidate_bound = arguments.get("candidateBound")
+    assert isinstance(allowed_origin, str)
+    assert type(candidate_bound) is int
+    current_url = urlsplit(url)
+    current_origin = f"{current_url.scheme}://{current_url.netloc}"
+    if current_origin != allowed_origin:
+        return {"ok": False, "reason": "origin_mismatch"}
+
+    permalinks: list[str] = []
+    for href in hrefs:
+        candidate = urlsplit(urljoin(url, href))
+        candidate_origin = f"{candidate.scheme}://{candidate.netloc}"
+        if candidate_origin != allowed_origin:
+            continue
+        if re.fullmatch(r"/@[A-Za-z0-9._]{1,30}/post/[A-Za-z0-9_-]{1,120}/?", candidate.path):
+            permalinks.append(candidate.path)
+            if len(permalinks) > candidate_bound:
+                return {"ok": False, "reason": "candidate_bound_exceeded"}
+    return {"ok": True, "permalinks": permalinks}
+
+
 def _install_fake_playwright(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -219,6 +259,103 @@ def test_persistent_context_opens_headed_profile_and_reads_synthetic_feed(
     assert page.goto_calls == [("https://www.threads.com/", "domcontentloaded", 30_000)]
     assert context.closed
     assert playwright.stopped
+
+
+def test_scroll_feed_waits_for_a_new_synthetic_tranche(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_payload = {"ok": True, "permalinks": ["/@synthetic/post/fake_1"]}
+    new_payload = {
+        "ok": True,
+        "permalinks": ["/@synthetic/post/fake_1", "/@synthetic/post/fake_2"],
+    }
+    page, _, _, _ = _install_fake_playwright(tmp_path, monkeypatch, payload=old_payload)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+
+    async def exercise() -> tuple[str, ...]:
+        session = await engine_module.PlaywrightBrowserEngine().open(_request(profile))
+        try:
+            await session.navigate(
+                "https://www.threads.com/",
+                allowed_origins=frozenset({"https://www.threads.com"}),
+            )
+            assert await session.collect_feed_permalinks(candidate_bound=25) == (
+                "/@synthetic/post/fake_1",
+            )
+            page.feed_payloads = [old_payload, new_payload]
+            await session.scroll_feed()
+            return await session.collect_feed_permalinks(candidate_bound=25)
+        finally:
+            await session.close()
+
+    assert asyncio.run(exercise()) == (
+        "/@synthetic/post/fake_1",
+        "/@synthetic/post/fake_2",
+    )
+    assert page.scroll_dispatches == 1
+    assert page.feed_scan_calls == 4
+
+
+def test_feed_scan_uses_post_candidates_and_fails_on_candidate_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page, _, _, _ = _install_fake_playwright(tmp_path, monkeypatch)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    non_post_hrefs = tuple(f"/@synthetic/profile/fake_{index}" for index in range(1001))
+    post_hrefs = tuple(f"/@synthetic/post/fake_{index}" for index in range(25))
+    page.feed_anchor_hrefs = non_post_hrefs + post_hrefs
+
+    async def exercise() -> None:
+        session = await engine_module.PlaywrightBrowserEngine().open(_request(profile))
+        try:
+            await session.navigate(
+                "https://www.threads.com/",
+                allowed_origins=frozenset({"https://www.threads.com"}),
+            )
+            result = await session.collect_feed_permalinks(candidate_bound=25)
+            assert result == post_hrefs
+
+            page.feed_anchor_hrefs = non_post_hrefs + post_hrefs + ("/@synthetic/post/fake_25",)
+            with pytest.raises(BrowserAdapterError) as caught:
+                await session.collect_feed_permalinks(candidate_bound=25)
+            assert caught.value.code == "BROWSER_FEED_CANDIDATE_BOUND_EXCEEDED"
+        finally:
+            await session.close()
+
+    asyncio.run(exercise())
+    assert "document.querySelectorAll('a[href*=\"/post/\"]')" in engine_module._FEED_SCAN_SCRIPT
+    assert "anchors.length > 1000" not in engine_module._FEED_SCAN_SCRIPT
+    assert "permalinks.length > candidateBound" in engine_module._FEED_SCAN_SCRIPT
+
+
+def test_feed_scan_rejects_a_changed_off_origin_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page, _, _, _ = _install_fake_playwright(
+        tmp_path,
+        monkeypatch,
+        payload={"ok": True, "permalinks": ["/@synthetic/post/fake_1"]},
+    )
+    profile = tmp_path / "profile"
+    profile.mkdir()
+
+    async def exercise() -> None:
+        session = await engine_module.PlaywrightBrowserEngine().open(_request(profile))
+        try:
+            await session.navigate(
+                "https://www.threads.com/",
+                allowed_origins=frozenset({"https://www.threads.com"}),
+            )
+            page.url = "https://evil.invalid/"
+            with pytest.raises(RemoteSessionStateUncertain):
+                await session.collect_feed_permalinks(candidate_bound=25)
+            assert page.feed_scan_calls == 0
+        finally:
+            await session.close()
+
+    asyncio.run(exercise())
 
 
 def test_cleanup_failures_are_suppressed_repeated_close_is_safe_and_login_releases_lock(
