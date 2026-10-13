@@ -60,6 +60,25 @@ with `dispatchable=False`. Missing packet content produces `OBSERVE_ONLY` with
 `ContentSource` and `ActionDispatcher` are Protocol seams only and are not
 called or implemented in this slice.
 
+When `plan_cycle(scope, candidates, None)` accepts an eligible, fully bound
+candidate, it keeps the `OBSERVE_ONLY / DRAFT_UNAVAILABLE` result and may attach
+one frozen `ReviewIntent` to the first eligible item in the existing stable
+order. The intent is an ephemeral review request: it carries no content,
+approval, raw target IDs, or dispatch authority. It binds the planner's target
+and context digests, verified action permissions and quota, policy, and the
+freshness evidence; its expiry is the earliest evidence timestamp plus the
+scope context-age limit. For inbound replies, root, parent, and reply reference
+digests are separately domain-separated and derived only after the planner
+checks the exact API reply relationship. Own-account posts have no prior
+remote target reference. If the evidence lifetime is already over, the planner
+keeps its existing result and emits no intent.
+
+Supplying an `ApprovedPacketSummary` keeps the accepted proposal path and never
+emits a `ReviewIntent`. The intent does not create a packet or serve as approval.
+The separate #135-B slice must connect an intent to operator-prepared content
+through its own inert review-packet type before any separately authorized
+approval-store work can begin.
+
 Every remote ID, account UUID, fingerprint, context hash, and content hash is
 excluded from DTO representations. The planner has no journal or persistence
 path. It cannot send, retry, reserve, or claim a result such as “sent.”
