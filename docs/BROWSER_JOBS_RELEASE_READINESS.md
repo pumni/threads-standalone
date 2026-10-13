@@ -1,12 +1,14 @@
 # Browser Jobs release readiness
 
+**Historical runtime checkpoint, not a Browser coding policy.** Under the current [owner product decision](PRODUCT_DIRECTION.md) and [AGENTS.md](../AGENTS.md), API and Browser are independent. Requiring written Meta authority or renewed Terms adjudication is not a development prerequisite. Keep the installed live Browser source disabled until a separate implemented/operator-scoped UAT change is accepted; do not claim real Threads execution from synthetic evidence.
+
 ## Decision snapshot
 
 | Capability | State | Evidence required to change state |
 | --- | --- | --- |
 | `SYNTHETIC_READY` | **CANDIDATE — pending coordinator review** | The BJ-07 Draft PR's exact head must pass the synthetic tests, lint, type check, build, installed-wheel smoke, hosted Windows and Ubuntu checks, and full-history Gitleaks. Coordinator acceptance is still required. |
 | `MANUAL_INPUT_READY` | **NOT READY** | The installed CLI's `manual` source deliberately returns `UNKNOWN / NO_TEXT`. It has no authorized manual text or provenance import and has not passed private customer-root deployment acceptance. |
-| `AUTHORIZED_BROWSER_READ_READY` | **NO_GO — DISABLED** | Requires separate written Meta authority and accepted, scoped work for #64 and #103, the production reader in #106, reader-to-CLI integration and authorized private UAT in #109. Synthetic evidence does not satisfy those gates. |
+| `AUTHORIZED_BROWSER_READ_READY` | **NO_GO — DISABLED** | Installed live source is still disabled. A future scoped code change can enable the production reader and CLI with operator-selected account/session controls and bounded private UAT. #64/#103 are historical policy discussions, not prerequisites for Browser development; synthetic evidence does not establish live functionality. |
 | `BROWSER_ENGAGEMENT_READY` | **NO_GO** | Requires separate rights, effect review and one-shot approvals under #67. No like, reply, follow, or other account effect is covered here. |
 
 This document records a synthetic release candidate. It does not approve customer delivery, live collection, real account use, or production operation. Source provenance and redistribution/license decision #2, deployment gates #18 and #46, and the separate API/AI/CRM/media gate #25 remain unresolved. No license or EXE/self-contained distribution claim is made.
