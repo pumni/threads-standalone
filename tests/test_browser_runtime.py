@@ -9,7 +9,6 @@ import pytest
 import threads_platform.standalone.runtime as runtime_module
 from threads_platform.browser.capabilities import BrowserFeedResultV1, BrowserTargetOpenResultV1
 from threads_platform.browser.contracts import (
-    BROWSER_FEED_ORIGIN,
     BrowserAdapterError,
     BrowserEngineSession,
     BrowserLaunchRequest,
@@ -131,10 +130,11 @@ def test_login_creates_an_isolated_headed_profile_and_waits_for_operator(tmp_pat
     assert request.headless is False
     assert request.proxy_credentials is None
     assert request.profile_directory.is_dir()
-    assert engine.sessions[0].navigations == [
-        (f"{BROWSER_FEED_ORIGIN}/", frozenset({BROWSER_FEED_ORIGIN}))
-    ]
+    # Login leaves the page unrestricted so manual sign-in can follow its normal
+    # provider navigation without the Browser Nurture same-origin route guard.
+    assert engine.sessions[0].navigations == []
     assert len(prompts) == 1
+    assert "Navigate to https://www.threads.com/ using the address bar" in prompts[0]
     assert "Sign in manually if needed" in prompts[0]
     assert "does not verify authentication" in prompts[0]
     assert "synthetic_account" not in prompts[0]

@@ -34,7 +34,7 @@ threads-local browser-nurture configure <alias> `
 
 Use the existing manually logged-in UUID profile for that alias. Do not copy the profile or paste cookies or tokens. The alias selects the local profile; only the visible UI actor check proves the signed-in account matches `--expected-username`.
 
-For new profile onboarding, `threads-local account login <alias>` opens a headed browser at Threads Home and waits for manual sign-in. It never enters a password. The command ends with `authentication=NOT_VERIFIED`; use the supervised Browser Nurture run below to verify the configured actor.
+For new profile onboarding, `threads-local account login <alias>` opens a headed browser in the selected account profile. Use the browser address bar to open `https://www.threads.com/`, then sign in manually if needed. The command never enters a password and does not restrict navigation during onboarding. It ends with `authentication=NOT_VERIFIED`; use the supervised Browser Nurture run below to verify the configured actor.
 
 Run one headed cycle from an interactive PowerShell console:
 
