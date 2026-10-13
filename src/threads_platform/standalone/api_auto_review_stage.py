@@ -993,6 +993,8 @@ def _atomic_create_record(account_dir: Path, staged: StagedReviewV1, record: byt
         _stage_failpoint("after_directory_fsync")
         _verify_private_regular_file(final_path)
     except _StoreFault:
+        if published:
+            raise _StoreFault(ReviewStageReason.PUBLICATION_AMBIGUOUS) from None
         raise
     except Exception:  # noqa: BLE001 - a post-rename failure has an ambiguous durable outcome
         if published:

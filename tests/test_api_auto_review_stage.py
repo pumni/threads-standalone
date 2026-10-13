@@ -678,6 +678,62 @@ def test_crash_boundaries_never_create_approval_and_restart_fails_closed(
         assert reopened.reason_codes == (ReviewStageReason.INCOMPLETE_TEMPORARY_RECORD,)
 
 
+@pytest.mark.parametrize(
+    ("failure_point", "underlying_reason"),
+    [
+        ("directory_fsync", ReviewStageReason.IO_FAILURE),
+        ("final_validation", ReviewStageReason.ACL_UNSAFE),
+    ],
+)
+def test_post_publish_store_faults_are_ambiguous_and_restart_review_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    underlying_reason: ReviewStageReason,
+) -> None:
+    root = _store_root(tmp_path)
+    generated_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    monkeypatch.setattr(stage_module, "uuid4", lambda: generated_id)
+    record_path = _record_path(root, generated_id)
+
+    original_sync_directory = stage_module._sync_directory
+    original_verify = stage_module._verify_private_regular_file
+    if failure_point == "directory_fsync":
+
+        def fail_directory_fsync(path: Path) -> None:
+            if path == record_path.parent and record_path.is_file():
+                raise stage_module._StoreFault(underlying_reason)
+            original_sync_directory(path)
+
+        monkeypatch.setattr(stage_module, "_sync_directory", fail_directory_fsync)
+    else:
+
+        def fail_final_validation(path: Path) -> None:
+            if path == record_path:
+                assert record_path.is_file()
+                raise stage_module._StoreFault(underlying_reason)
+            original_verify(path)
+
+        monkeypatch.setattr(stage_module, "_verify_private_regular_file", fail_final_validation)
+
+    result = _stage(root, _scenario())
+
+    assert result.decision is ReviewStageDecision.STOP
+    assert result.reason_codes == (ReviewStageReason.PUBLICATION_AMBIGUOUS,)
+    assert record_path.is_file()
+    assert not record_path.with_name(f".stage-{generated_id}.tmp").exists()
+
+    monkeypatch.setattr(stage_module, "_sync_directory", original_sync_directory)
+    monkeypatch.setattr(stage_module, "_verify_private_regular_file", original_verify)
+    reopened = PrivateReviewStageStore(root).get_stage(ACCOUNT_ID, generated_id, now=NOW)
+
+    assert reopened.decision is ReviewStageDecision.LOADED
+    assert reopened.stage is not None
+    assert reopened.stage.state is ReviewStageState.REVIEW_ONLY
+    assert reopened.stage.dispatchable is False
+    assert not hasattr(reopened.stage, "approval_id")
+
+
 def test_hard_link_alias_is_rejected(tmp_path: Path) -> None:
     root = _store_root(tmp_path)
     result = _stage(root, _scenario())
