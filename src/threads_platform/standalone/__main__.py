@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import re
+import signal
 import sys
 from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from types import FrameType
 from typing import Any, Literal, NoReturn, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -702,37 +704,30 @@ def _format_browser_nurture_result(result: _BrowserNurtureRunResultView, *, sour
     return (
         f"BROWSER_NURTURE status={status} source={source} reason={reason} "
         f"cycles={result.cycles} "
-        f"feed_candidates={result.feed_candidates} "
-        f"scanned={result.scanned} "
-        f"relevant={result.relevant} "
-        f"irrelevant={result.irrelevant} "
-        f"unknown={result.unknown} "
-        f"duplicates={result.duplicates} "
-        f"scrolls={result.scrolls} "
+        f"search_candidates={result.feed_candidates} "
+        f"search_scanned={result.scanned} "
+        f"search_relevant={result.relevant} "
+        f"search_irrelevant={result.irrelevant} "
+        f"search_unknown={result.unknown} "
+        f"search_duplicates={result.duplicates} "
+        f"search_scrolls={result.scrolls} "
         f"sessions_opened={result.sessions_opened} "
         f"checkpoint_cycles={result.checkpoint_cycles}\n"
     )
 
 
 def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
-    if args.browser_nurture_command == "run" and args.source == "browser":
-        sys.stdout.write(
-            "BROWSER_NURTURE status=DISABLED_PERMISSION_PENDING source=BROWSER_UI "
-            "reason=SOURCE_DISABLED cycles=0 feed_candidates=0 scanned=0 relevant=0 "
-            "irrelevant=0 unknown=0 duplicates=0 scrolls=0 sessions_opened=0 "
-            "checkpoint_cycles=0\n"
-        )
-        return 1
-
     from threads_platform.standalone.browser_nurture import (
         BrowserNurtureError,
         BrowserNurtureRunner,
+        BrowserNurtureSource,
         load_synthetic_nurture_fixture,
         validate_synthetic_nurture_root,
     )
     from threads_platform.standalone.browser_nurture_state import (
         BrowserNurtureStateError,
         BrowserNurtureStateStore,
+        browser_nurture_policy_fingerprint,
         validate_browser_nurture_config,
     )
     from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
@@ -772,46 +767,147 @@ def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if args.browser_nurture_command == "enable-continuous":
+        try:
+            if not args.confirm_supervised_read_only:
+                raise BrowserNurtureError("SUPERVISED_READ_CONFIRMATION_REQUIRED")
+            if not _browser_nurture_interactive_console():
+                raise BrowserNurtureError("INTERACTIVE_CONSOLE_REQUIRED")
+            root = resolve_standalone_data_root()
+            accounts = LocalAccountStore(root)
+            account = accounts.get(args.alias)
+            state = BrowserNurtureStateStore(root)
+            with LocalRuntime(root, accounts).account_lock(account):
+                if (
+                    re.fullmatch(r"(?:test|synthetic)-[a-z0-9](?:[a-z0-9-]{0,29})", account.alias)
+                    is not None
+                ):
+                    raise BrowserNurtureError("LIVE_ACCOUNT_REQUIRED")
+                config = state.load_config(account.id)
+                if config is None:
+                    raise BrowserNurtureError("CONFIG_NOT_FOUND")
+                policy_fingerprint = browser_nurture_policy_fingerprint(config)
+                checkpoint = state.load_checkpoint(account.id)
+                if (
+                    checkpoint.completed_cycles < 1
+                    or checkpoint.policy_fingerprint != policy_fingerprint
+                ):
+                    raise BrowserNurtureError("SUPERVISED_CYCLE_REQUIRED")
+                state.set_continuous_opt_in(
+                    account.id,
+                    policy_fingerprint=policy_fingerprint,
+                    enabled=True,
+                )
+        except (
+            BrowserNurtureError,
+            BrowserNurtureStateError,
+            StandaloneRuntimeError,
+            StandaloneAccountError,
+        ) as error:
+            sys.stderr.write(f"ERROR {error.code}\n")
+            return 1
+        sys.stdout.write("BROWSER_NURTURE_CONTINUOUS status=ENABLED\n")
+        return 0
+
+    if args.browser_nurture_command == "disable-continuous":
+        try:
+            root = resolve_standalone_data_root()
+            accounts = LocalAccountStore(root)
+            account = accounts.get(args.alias)
+            state = BrowserNurtureStateStore(root)
+            with LocalRuntime(root, accounts).account_lock(account):
+                state.disable_continuous_opt_in(account.id)
+        except (
+            BrowserNurtureStateError,
+            StandaloneRuntimeError,
+            StandaloneAccountError,
+        ) as error:
+            sys.stderr.write(f"ERROR {error.code}\n")
+            return 1
+        sys.stdout.write("BROWSER_NURTURE_CONTINUOUS status=DISABLED\n")
+        return 0
+
     try:
-        if args.source != "ui-fixture":
-            raise BrowserNurtureError("SOURCE_INVALID")
-        if not isinstance(args.data_root, str) or not args.data_root.strip():
-            raise BrowserNurtureError("DATA_ROOT_REQUIRED")
-        if not isinstance(args.fixture_file, str) or not args.fixture_file.strip():
-            raise BrowserNurtureError("FIXTURE_REQUIRED")
-        data_root_candidate = Path(args.data_root).expanduser()
-        if not data_root_candidate.is_absolute():
-            raise BrowserNurtureError("DATA_ROOT_INVALID")
-        data_root = validate_synthetic_nurture_root(data_root_candidate)
-        accounts = LocalAccountStore(data_root)
-        account = accounts.get(args.alias)
-        if re.fullmatch(r"(?:test|synthetic)-[a-z0-9](?:[a-z0-9-]{0,29})", account.alias) is None:
-            raise BrowserNurtureError("SYNTHETIC_ACCOUNT_REQUIRED")
-        state = BrowserNurtureStateStore(data_root)
-        config = state.load_config(account.id)
-        if config is None:
-            raise BrowserNurtureError("CONFIG_NOT_FOUND")
-        if (
-            re.fullmatch(
-                r"(?:test|synthetic|fixture)[._-][A-Za-z0-9._-]{1,28}",
-                config.expected_username,
-            )
-            is None
-        ):
-            raise BrowserNurtureError("SYNTHETIC_ACTOR_REQUIRED")
-        fixture = load_synthetic_nurture_fixture(Path(args.fixture_file), config)
-        cycles = args.max_cycles
-        if cycles is None and not args.continuous:
-            cycles = 1
-        result = asyncio.run(
-            BrowserNurtureRunner(LocalRuntime(data_root, accounts), state).run(
+        if args.source == "browser":
+            if not args.continuous and args.max_cycles not in (None, 1):
+                raise BrowserNurtureError("RUN_POLICY_INVALID")
+            if args.fixture_file is not None or args.data_root is not None:
+                raise BrowserNurtureError("LIVE_DATA_ROOT_NOT_ALLOWED")
+            if args.continuous:
+                if args.confirm_live_read_only:
+                    raise BrowserNurtureError("RUN_POLICY_INVALID")
+            else:
+                if not args.confirm_live_read_only:
+                    raise BrowserNurtureError("LIVE_CONFIRMATION_REQUIRED")
+                if not _browser_nurture_interactive_console():
+                    raise BrowserNurtureError("INTERACTIVE_CONSOLE_REQUIRED")
+            data_root = resolve_standalone_data_root()
+            accounts = LocalAccountStore(data_root)
+            account = accounts.get(args.alias)
+            if (
+                re.fullmatch(r"(?:test|synthetic)-[a-z0-9](?:[a-z0-9-]{0,29})", account.alias)
+                is not None
+            ):
+                raise BrowserNurtureError("LIVE_ACCOUNT_REQUIRED")
+            state = BrowserNurtureStateStore(data_root)
+            cycles = args.max_cycles
+            if cycles is None and not args.continuous:
+                cycles = 1
+            result = _run_browser_nurture_with_stop(
+                BrowserNurtureRunner(LocalRuntime(data_root, accounts), state),
                 account.alias,
-                fixture,
+                source=BrowserNurtureSource.BROWSER_UI,
                 max_cycles=cycles,
                 continuous=args.continuous,
                 idle_seconds=args.idle_seconds,
             )
-        )
+            output_source = "BROWSER_UI"
+        else:
+            if args.confirm_live_read_only:
+                raise BrowserNurtureError("RUN_POLICY_INVALID")
+            if args.source != "ui-fixture":
+                raise BrowserNurtureError("SOURCE_INVALID")
+            if not isinstance(args.data_root, str) or not args.data_root.strip():
+                raise BrowserNurtureError("DATA_ROOT_REQUIRED")
+            if not isinstance(args.fixture_file, str) or not args.fixture_file.strip():
+                raise BrowserNurtureError("FIXTURE_REQUIRED")
+            data_root_candidate = Path(args.data_root).expanduser()
+            if not data_root_candidate.is_absolute():
+                raise BrowserNurtureError("DATA_ROOT_INVALID")
+            data_root = validate_synthetic_nurture_root(data_root_candidate)
+            accounts = LocalAccountStore(data_root)
+            account = accounts.get(args.alias)
+            if (
+                re.fullmatch(r"(?:test|synthetic)-[a-z0-9](?:[a-z0-9-]{0,29})", account.alias)
+                is None
+            ):
+                raise BrowserNurtureError("SYNTHETIC_ACCOUNT_REQUIRED")
+            state = BrowserNurtureStateStore(data_root)
+            config = state.load_config(account.id)
+            if config is None:
+                raise BrowserNurtureError("CONFIG_NOT_FOUND")
+            if (
+                re.fullmatch(
+                    r"(?:test|synthetic|fixture)[._-][A-Za-z0-9._-]{1,28}",
+                    config.expected_username,
+                )
+                is None
+            ):
+                raise BrowserNurtureError("SYNTHETIC_ACTOR_REQUIRED")
+            fixture = load_synthetic_nurture_fixture(Path(args.fixture_file), config)
+            cycles = args.max_cycles
+            if cycles is None and not args.continuous:
+                cycles = 1
+            result = _run_browser_nurture_with_stop(
+                BrowserNurtureRunner(LocalRuntime(data_root, accounts), state),
+                account.alias,
+                fixture,
+                source=BrowserNurtureSource.UI_FIXTURE,
+                max_cycles=cycles,
+                continuous=args.continuous,
+                idle_seconds=args.idle_seconds,
+            )
+            output_source = "SYNTHETIC_FIXTURE"
     except (
         BrowserNurtureError,
         BrowserNurtureStateError,
@@ -821,18 +917,59 @@ def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
         sys.stderr.write(f"ERROR {error.code}\n")
         return 1
     except KeyboardInterrupt:
+        output_source = "BROWSER_UI" if args.source == "browser" else "SYNTHETIC_FIXTURE"
         sys.stdout.write(
-            "BROWSER_NURTURE status=STOPPED source=SYNTHETIC_FIXTURE "
-            "reason=INTERRUPTED cycles=0 feed_candidates=0 scanned=0 relevant=0 "
-            "irrelevant=0 unknown=0 duplicates=0 scrolls=0 sessions_opened=0 "
+            f"BROWSER_NURTURE status=STOPPED source={output_source} "
+            "reason=INTERRUPTED cycles=0 search_candidates=0 search_scanned=0 "
+            "search_relevant=0 search_irrelevant=0 search_unknown=0 "
+            "search_duplicates=0 search_scrolls=0 sessions_opened=0 "
             "checkpoint_cycles=preserved\n"
         )
         return 130
     except Exception:  # noqa: BLE001 - fixed safe CLI boundary for fixture failures.
         sys.stderr.write("ERROR BROWSER_NURTURE_FAILED\n")
         return 1
-    sys.stdout.write(_format_browser_nurture_result(result, source="SYNTHETIC_FIXTURE"))
+    sys.stdout.write(_format_browser_nurture_result(result, source=output_source))
     return 0 if result.status.value == "COMPLETE" else 1
+
+
+def _browser_nurture_interactive_console() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _run_browser_nurture_with_stop(
+    runner: Any,
+    alias: str,
+    fixture: Any = None,
+    *,
+    source: Any,
+    max_cycles: int | None,
+    continuous: bool,
+    idle_seconds: int | None,
+) -> Any:
+    async def run() -> Any:
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+        previous_handler = signal.getsignal(signal.SIGINT)
+
+        def request_stop(_signal_number: int, _frame: FrameType | None) -> None:
+            loop.call_soon_threadsafe(stop_event.set)
+
+        signal.signal(signal.SIGINT, request_stop)
+        try:
+            return await runner.run(
+                alias,
+                fixture,
+                source=source,
+                max_cycles=max_cycles,
+                continuous=continuous,
+                idle_seconds=idle_seconds,
+                stop_event=stop_event,
+            )
+        finally:
+            signal.signal(signal.SIGINT, previous_handler)
+
+    return asyncio.run(run())
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -986,6 +1123,21 @@ def _build_parser() -> argparse.ArgumentParser:
     configure_browser_nurture.add_argument("--relevance-term", action="append")
     configure_browser_nurture.add_argument("--max-posts-per-cycle", type=int, default=20)
     configure_browser_nurture.add_argument("--idle-seconds", type=int, default=900)
+    enable_browser_nurture_continuous = browser_nurture_commands.add_parser(
+        "enable-continuous",
+        help="enable headed continuous runs after a supervised live cycle",
+    )
+    enable_browser_nurture_continuous.add_argument("alias")
+    enable_browser_nurture_continuous.add_argument(
+        "--confirm-supervised-read-only",
+        action="store_true",
+        help="confirm the supervised, read-only cycle was reviewed on screen",
+    )
+    disable_browser_nurture_continuous = browser_nurture_commands.add_parser(
+        "disable-continuous",
+        help="disable the account-scoped continuous-run opt-in",
+    )
+    disable_browser_nurture_continuous.add_argument("alias")
     run_browser_nurture = browser_nurture_commands.add_parser(
         "run",
         help="run one bounded cycle or remain in the foreground until stopped",
@@ -994,12 +1146,17 @@ def _build_parser() -> argparse.ArgumentParser:
     run_browser_nurture.add_argument(
         "--source",
         choices=("browser", "ui-fixture"),
-        default="browser",
-        help="browser is permission-gated; ui-fixture is local synthetic Chromium only",
+        required=True,
+        help="browser is live headed UI; ui-fixture is local synthetic Chromium only",
     )
     run_browser_nurture.add_argument("--fixture-file")
     run_browser_nurture.add_argument("--data-root")
     run_browser_nurture.add_argument("--continuous", action="store_true")
+    run_browser_nurture.add_argument(
+        "--confirm-live-read-only",
+        action="store_true",
+        help="confirm this interactive one-shot may read the selected account UI",
+    )
     run_browser_nurture.add_argument("--max-cycles", type=int)
     run_browser_nurture.add_argument("--idle-seconds", type=int)
 

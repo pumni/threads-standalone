@@ -59,7 +59,7 @@ The `manual-handoff`, `account login`, `profile`, `thread`, `feed`, and `browser
 | `post`, `reply`, media publishing, moderation, Nurture `--apply` | Can cause remote effects; use only with separate authorization for account, target, and content |
 | `workflow`, `recurrence`, other Nurture commands | Follow their documented local/API boundaries; they do not make the browser MVP autonomous |
 
-Browser Nurture has its own bounded, read-only workflow. Its live browser source currently returns `DISABLED_PERMISSION_PENDING`; hosted synthetic Chromium E2E verifies only the offline CLI path. It is not a usable real-account workflow and its search-result relevance counts are not a home/For You recommendation baseline. See [the operator notes](docs/BROWSER_NURTURE.md) for the capability boundary, configuration, offline fixture use, state, and Windows Task Scheduler setup.
+Browser Nurture has its own bounded, read-only browser workflow. The explicitly selected `browser` source opens the registered account's existing headed Chromium profile after an interactive one-shot confirmation; continuous mode requires a separate account and policy scoped opt-in after a successful supervised cycle. Automated Chromium tests use synthetic pages and an offline transport only. Private Windows live UAT has not yet been verified, and topic-search relevance counts are not a home/For You recommendation baseline. See [the operator notes](docs/BROWSER_NURTURE.md) for the UAT runbook, offline fixture use, state, and Windows Task Scheduler setup.
 
 The API, mutation, Nurture, Workflow, and Recurrence commands remain separate existing capabilities. They retain their existing v1 account and operation schemas. S5 adds no production dependency and changes no existing schema.
 
@@ -76,9 +76,9 @@ uv run --locked pytest
 uv build
 ```
 
-CI installs Playwright Chromium for offline browser acceptance and installs the built wheel with locked runtime dependencies in an isolated environment outside the checkout. It clears `PYTHONPATH`, verifies the `threads-local` entry point and package contents, and runs the synthetic suite against the installed wheel. Chromium-dependent Browser Nurture E2E fails instead of skipping when the browser is unavailable; all fixture routes use the reserved synthetic origin and temporary synthetic roots.
+CI installs Playwright Chromium for offline browser acceptance and installs the built wheel with locked runtime dependencies in an isolated environment outside the checkout. It clears `PYTHONPATH`, verifies the `threads-local` entry point and package contents, and runs the synthetic suite against the installed wheel. Chromium-dependent Browser Nurture E2E fails instead of skipping when the browser is unavailable; synthetic fixtures use temporary roots and the live-source routing test intercepts every browser request locally.
 
-Browser Nurture also has an installed-CLI acceptance test that launches local Playwright Chromium against generated `.invalid` pages. It makes no Threads request; see [the Browser Nurture notes](docs/BROWSER_NURTURE.md).
+Browser Nurture acceptance launches local Playwright Chromium against generated synthetic pages. Both the fixture source and the live-source routing test block all real network access; neither uses a Threads account or sends a Threads request. See [the Browser Nurture notes](docs/BROWSER_NURTURE.md).
 
 ## Release readiness
 

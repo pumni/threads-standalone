@@ -7,8 +7,9 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from urllib.parse import urlencode
 from uuid import UUID
 
@@ -16,7 +17,9 @@ import pytest
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
+from threads_platform.browser import playwright_engine as playwright_engine_module
 from threads_platform.browser.contracts import (
+    BROWSER_FEED_ORIGIN,
     BrowserEngineSession,
     BrowserLaunchRequest,
     BrowserProcessCrashed,
@@ -30,13 +33,16 @@ from threads_platform.browser.threads_job_ui_reader import (
 )
 from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
 from threads_platform.standalone.browser_nurture import (
+    BrowserNurtureError,
     BrowserNurtureRunner,
+    BrowserNurtureSource,
     BrowserNurtureStatus,
     SyntheticBrowserNurtureFixtureV1,
 )
 from threads_platform.standalone.browser_nurture_state import (
     BrowserNurtureCheckpointV1,
     BrowserNurtureStateStore,
+    browser_nurture_policy_fingerprint,
     validate_browser_nurture_checkpoint,
     validate_browser_nurture_config,
 )
@@ -80,6 +86,53 @@ def test_browser_nurture_checkpoint_v1_contract_is_preserved() -> None:
     }
     assert document["schema_version"] == 1
     assert validate_browser_nurture_checkpoint(document).to_document() == document
+
+
+def test_continuous_opt_in_is_versioned_account_and_policy_scoped(tmp_path: Path) -> None:
+    root = tmp_path / "continuous-opt-in-root"
+    _secure_directory(root)
+    account_id = UUID("00000000-0000-4000-8000-000000000002")
+    config = validate_browser_nurture_config(
+        {
+            "schema_version": 1,
+            "account_uuid": str(account_id),
+            "expected_username": "offline.operator",
+            "topics": ["engineering"],
+            "relevance_terms": ["engineer"],
+            "max_posts_per_cycle": 10,
+            "idle_seconds": 60,
+        }
+    )
+    state = BrowserNurtureStateStore(root)
+    fingerprint = browser_nurture_policy_fingerprint(config)
+
+    assert not state.continuous_opt_in_enabled(
+        account_id,
+        policy_fingerprint=fingerprint,
+    )
+    state.set_continuous_opt_in(
+        account_id,
+        policy_fingerprint=fingerprint,
+        enabled=True,
+    )
+    path = root / "browser_nurture_v2" / "continuous_opt_in" / f"{account_id}.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert set(document) == {
+        "schema_version",
+        "account_uuid",
+        "policy_fingerprint",
+        "continuous_enabled",
+    }
+    assert document["schema_version"] == 1
+    assert state.continuous_opt_in_enabled(account_id, policy_fingerprint=fingerprint)
+    assert not state.continuous_opt_in_enabled(account_id, policy_fingerprint="0" * 64)
+    assert not state.continuous_opt_in_enabled(
+        UUID("00000000-0000-4000-8000-000000000003"),
+        policy_fingerprint=fingerprint,
+    )
+
+    state.disable_continuous_opt_in(account_id)
+    assert not state.continuous_opt_in_enabled(account_id, policy_fingerprint=fingerprint)
 
 
 def _secure_directory(path: Path) -> None:
@@ -153,13 +206,17 @@ def _card(post_id: str) -> str:
 
 
 def _detail(post_id: str) -> str:
+    return _detail_for_actor(post_id, _ACTOR)
+
+
+def _detail_for_actor(post_id: str, actor: str) -> str:
     target = _target(post_id)
     if post_id == "003":
         body = '<div dir="auto">A synthetic engineering post with details hidden below.<button>See more</button></div>'
     else:
         body = f'<div dir="auto">{_BODIES[post_id]}</div>'
     return _shell(
-        _ACTOR,
+        actor,
         "<main><article><header>"
         '<a href="/@synthetic.author">@synthetic.author</a>'
         f'<a href="{target}">time</a>'
@@ -181,7 +238,7 @@ def _fixture_document(
         post_ids = tuple(_BODIES) if topic_posts is None else topic_posts[topic]
         cards = "".join(_card(post_id) for post_id in post_ids)
         feed_html = _shell(
-            _ACTOR,
+            actor,
             '<main><form role="search"><input type="search" value="'
             f"{topic}"
             '"></form>'
@@ -216,7 +273,7 @@ def _fixture_document(
     elif scenario == "wrong-account":
         pages[0]["html"] = _shell("synthetic-other", "<main><p>synthetic home</p></main>")
     for post_id in _BODIES:
-        pages.append({"url": _target(post_id), "html": _detail(post_id)})
+        pages.append({"url": _target(post_id), "html": _detail_for_actor(post_id, actor)})
     return {
         "schema_version": 1,
         "fixture_kind": "SYNTHETIC_BROWSER_NURTURE",
@@ -322,8 +379,11 @@ def test_installed_cli_runs_two_offline_cycles_and_resumes_checkpoint(tmp_path: 
     assert first.stderr == ""
     assert "status=COMPLETE source=SYNTHETIC_FIXTURE" in first.stdout
     assert "cycles=2" in first.stdout
-    assert "scanned=4 relevant=2 irrelevant=1 unknown=1" in first.stdout
-    assert "duplicates=12 scrolls=12 sessions_opened=1 checkpoint_cycles=2" in first.stdout
+    assert "search_scanned=4 search_relevant=2 search_irrelevant=1 search_unknown=1" in first.stdout
+    assert (
+        "search_duplicates=12 search_scrolls=12 sessions_opened=1 checkpoint_cycles=2"
+        in first.stdout
+    )
     assert all(
         secret not in first.stdout + first.stderr
         for secret in (_ACCOUNT, _ACTOR, _BODIES["001"], _target("001"), _ORIGIN)
@@ -361,7 +421,7 @@ def test_installed_cli_runs_two_offline_cycles_and_resumes_checkpoint(tmp_path: 
     )
     assert replay.returncode == 0, replay.stdout + replay.stderr
     assert "cycles=1" in replay.stdout
-    assert "scanned=0" in replay.stdout
+    assert "search_scanned=0" in replay.stdout
     assert "checkpoint_cycles=3" in replay.stdout
 
 
@@ -397,7 +457,9 @@ def test_installed_cli_rotates_topic_selection_when_cycle_cap_is_one(tmp_path: P
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "cycles=2" in result.stdout
-    assert "scanned=2 relevant=1 irrelevant=1 unknown=0" in result.stdout
+    assert (
+        "search_scanned=2 search_relevant=1 search_irrelevant=1 search_unknown=0" in result.stdout
+    )
     checkpoint_path = root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json"
     checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
     assert checkpoint["next_topic_index"] == 0
@@ -427,7 +489,7 @@ def test_installed_cli_starts_new_policy_epoch_after_configuration_change(tmp_pa
 
     first = _run_cli(run_args, cwd=fixtures, root=root)
     assert first.returncode == 0, first.stdout + first.stderr
-    assert "scanned=1 relevant=1 irrelevant=0 unknown=0" in first.stdout
+    assert "search_scanned=1 search_relevant=1 search_irrelevant=0 search_unknown=0" in first.stdout
 
     reconfigured = _run_cli(
         (
@@ -452,8 +514,10 @@ def test_installed_cli_starts_new_policy_epoch_after_configuration_change(tmp_pa
 
     second = _run_cli(run_args, cwd=fixtures, root=root)
     assert second.returncode == 0, second.stdout + second.stderr
-    assert "scanned=1 relevant=0 irrelevant=1 unknown=0" in second.stdout
-    assert "duplicates=1" in second.stdout
+    assert (
+        "search_scanned=1 search_relevant=0 search_irrelevant=1 search_unknown=0" in second.stdout
+    )
+    assert "search_duplicates=1" in second.stdout
     assert "checkpoint_cycles=1" in second.stdout
 
     checkpoint_path = root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json"
@@ -508,9 +572,26 @@ def test_installed_cli_stops_before_committing_unsafe_ui_state(
     assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
 
 
-def test_browser_source_gate_and_installed_cli_help_are_explicit(tmp_path: Path) -> None:
+def test_browser_source_requires_explicit_read_only_selection_and_installed_cli_help(
+    tmp_path: Path,
+) -> None:
     missing_root = tmp_path / "must-not-be-created"
-    disabled = _run_cli(
+    no_confirmation = _run_cli(
+        (
+            "browser-nurture",
+            "run",
+            _ACCOUNT,
+            "--source",
+            "browser",
+        ),
+        cwd=tmp_path,
+        root=None,
+    )
+    assert no_confirmation.returncode == 1
+    assert "ERROR LIVE_CONFIRMATION_REQUIRED" in no_confirmation.stderr
+    assert not missing_root.exists()
+
+    redirected_root = _run_cli(
         (
             "browser-nurture",
             "run",
@@ -523,14 +604,268 @@ def test_browser_source_gate_and_installed_cli_help_are_explicit(tmp_path: Path)
         cwd=tmp_path,
         root=None,
     )
-    assert disabled.returncode == 1
-    assert "status=DISABLED_PERMISSION_PENDING" in disabled.stdout
+    assert redirected_root.returncode == 1
+    assert "ERROR LIVE_DATA_ROOT_NOT_ALLOWED" in redirected_root.stderr
+    assert not missing_root.exists()
+
+    unattended = _run_cli(
+        (
+            "browser-nurture",
+            "run",
+            _ACCOUNT,
+            "--source",
+            "browser",
+            "--confirm-live-read-only",
+        ),
+        cwd=tmp_path,
+        root=None,
+    )
+    assert unattended.returncode == 1
+    assert "ERROR INTERACTIVE_CONSOLE_REQUIRED" in unattended.stderr
     assert not missing_root.exists()
 
     help_result = _run_cli(("browser-nurture", "run", "--help"), cwd=tmp_path, root=None)
     assert help_result.returncode == 0
     assert "--continuous" in help_result.stdout
     assert "--source {browser,ui-fixture}" in help_result.stdout
+    assert "--confirm-live-read-only" in help_result.stdout
+    command_help = _run_cli(("browser-nurture", "--help"), cwd=tmp_path, root=None)
+    assert command_help.returncode == 0
+    assert "enable-continuous" in command_help.stdout
+    assert "disable-continuous" in command_help.stdout
+
+
+def _offline_live_pages(actor: str) -> dict[str, str]:
+    document = _fixture_document(actor=actor)
+    raw_pages = cast(list[dict[str, str]], document["pages"])
+    return {
+        page["url"].replace(_ORIGIN, BROWSER_FEED_ORIGIN): page["html"].replace(
+            _ORIGIN,
+            BROWSER_FEED_ORIGIN,
+        )
+        for page in raw_pages
+    }
+
+
+def _install_offline_live_browser_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    pages: dict[str, str],
+) -> list[str]:
+    original_open = playwright_engine_module.PlaywrightBrowserEngine.open
+    requested_urls: list[str] = []
+
+    async def headless_chromium_for_test(engine: Any, request: BrowserLaunchRequest) -> Any:
+        assert request.headless is False
+        return await original_open(engine, replace(request, headless=True))
+
+    async def fulfill_offline_pages(_session: Any, route: Any) -> None:
+        url = route.request.url
+        requested_urls.append(url)
+        html = pages.get(url)
+        if html is None:
+            await route.abort("blockedbyclient")
+            return
+        await route.fulfill(
+            status=200,
+            content_type="text/html; charset=utf-8",
+            body=html,
+        )
+
+    monkeypatch.setattr(
+        playwright_engine_module.PlaywrightBrowserEngine,
+        "open",
+        headless_chromium_for_test,
+    )
+    monkeypatch.setattr(
+        playwright_engine_module._PlaywrightBrowserSession,
+        "_guard_navigation",
+        fulfill_offline_pages,
+    )
+    return requested_urls
+
+
+def _create_browser_source_account(root: Path, expected_actor: str) -> LocalAccount:
+    accounts = LocalAccountStore(root)
+    account = accounts.add("offline-browser-nurture")
+    profile = root / "profiles" / str(account.id)
+    profile.mkdir(parents=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(profile, 0o700)
+    state = BrowserNurtureStateStore(root)
+    state.save_config(
+        validate_browser_nurture_config(
+            {
+                "schema_version": 1,
+                "account_uuid": str(account.id),
+                "expected_username": expected_actor,
+                "topics": list(_TOPICS),
+                "relevance_terms": ["engineer"],
+                "max_posts_per_cycle": 10,
+                "idle_seconds": 60,
+            }
+        )
+    )
+    return account
+
+
+def test_first_live_cli_cycle_rejects_multiple_cycles_before_browser_or_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "live-first-cycle-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    state = BrowserNurtureStateStore(root)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", os.fspath(root))
+
+    from threads_platform.standalone import __main__ as cli_module
+
+    monkeypatch.setattr(cli_module, "_browser_nurture_interactive_console", lambda: True)
+
+    def reject_if_runner_starts(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("multi-cycle one-shot reached the browser runner")
+
+    monkeypatch.setattr(cli_module, "_run_browser_nurture_with_stop", reject_if_runner_starts)
+    exit_code = cli_module.main(
+        (
+            "browser-nurture",
+            "run",
+            account.alias,
+            "--source",
+            "browser",
+            "--confirm-live-read-only",
+            "--max-cycles",
+            "2",
+        )
+    )
+
+    output = capsys.readouterr()
+    config = state.load_config(account.id)
+    assert config is not None
+    checkpoint = state.load_checkpoint(
+        account.id,
+        policy_fingerprint=browser_nurture_policy_fingerprint(config),
+    )
+    assert exit_code == 1
+    assert "ERROR RUN_POLICY_INVALID" in output.err
+    assert checkpoint.completed_cycles == 0
+
+
+def test_browser_source_runs_live_cli_path_through_offline_chromium(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "live-browser-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    requested_urls = _install_offline_live_browser_transport(monkeypatch, pages)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", os.fspath(root))
+
+    from threads_platform.standalone import __main__ as cli_module
+
+    monkeypatch.setattr(cli_module, "_browser_nurture_interactive_console", lambda: True)
+    exit_code = cli_module.main(
+        (
+            "browser-nurture",
+            "run",
+            account.alias,
+            "--source",
+            "browser",
+            "--confirm-live-read-only",
+        )
+    )
+
+    output = capsys.readouterr()
+    assert exit_code == 0, output.out + output.err
+    assert "status=COMPLETE source=BROWSER_UI" in output.out
+    assert "search_scanned=4 search_relevant=2 search_irrelevant=1 search_unknown=1" in output.out
+    assert any(url == f"{BROWSER_FEED_ORIGIN}/" for url in requested_urls)
+    assert set(requested_urls).issubset(pages)
+    assert requested_urls
+    checkpoint = BrowserNurtureStateStore(root).load_checkpoint(account.id)
+    assert checkpoint.completed_cycles == 1
+    assert checkpoint.scanned == 4
+    assert not BrowserNurtureStateStore(root).continuous_opt_in_enabled(
+        account.id,
+        policy_fingerprint=checkpoint.policy_fingerprint,
+    )
+
+    enable_code = cli_module.main(
+        (
+            "browser-nurture",
+            "enable-continuous",
+            account.alias,
+            "--confirm-supervised-read-only",
+        )
+    )
+    assert enable_code == 0
+    assert "BROWSER_NURTURE_CONTINUOUS status=ENABLED" in capsys.readouterr().out
+
+    continuous_code = cli_module.main(
+        (
+            "browser-nurture",
+            "run",
+            account.alias,
+            "--source",
+            "browser",
+            "--continuous",
+            "--max-cycles",
+            "1",
+        )
+    )
+    continuous_output = capsys.readouterr()
+    assert continuous_code == 0, continuous_output.out + continuous_output.err
+    assert "status=COMPLETE source=BROWSER_UI" in continuous_output.out
+    assert "search_scanned=0" in continuous_output.out
+    checkpoint = BrowserNurtureStateStore(root).load_checkpoint(account.id)
+    assert checkpoint.completed_cycles == 2
+
+    disable_code = cli_module.main(("browser-nurture", "disable-continuous", account.alias))
+    assert disable_code == 0
+    assert "BROWSER_NURTURE_CONTINUOUS status=DISABLED" in capsys.readouterr().out
+    assert not BrowserNurtureStateStore(root).continuous_opt_in_enabled(
+        account.id,
+        policy_fingerprint=checkpoint.policy_fingerprint,
+    )
+
+
+def test_browser_source_stops_on_visible_actor_mismatch_before_search(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "live-browser-mismatch-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    pages = _offline_live_pages("offline.other")
+    requested_urls = _install_offline_live_browser_transport(monkeypatch, pages)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", os.fspath(root))
+
+    from threads_platform.standalone import __main__ as cli_module
+
+    monkeypatch.setattr(cli_module, "_browser_nurture_interactive_console", lambda: True)
+    exit_code = cli_module.main(
+        (
+            "browser-nurture",
+            "run",
+            account.alias,
+            "--source",
+            "browser",
+            "--confirm-live-read-only",
+        )
+    )
+
+    output = capsys.readouterr()
+    assert exit_code == 1
+    assert "ERROR BROWSER_SESSION_MISMATCH" in output.err
+    assert requested_urls == [f"{BROWSER_FEED_ORIGIN}/"] * 2
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
 
 
 class _FakeNurtureSession:
@@ -670,6 +1005,70 @@ def _runner_case(
     fixture = SyntheticBrowserNurtureFixtureV1(pages=pages)
     runner = BrowserNurtureRunner(LocalRuntime(root, accounts, engine), state)
     return account, runner, state, fixture
+
+
+def test_runner_without_source_or_fixture_does_not_start_live_browser(tmp_path: Path) -> None:
+    engine = _FakeNurtureEngine(frozenset())
+    account, runner, _state, _fixture = _runner_case(tmp_path, engine)
+
+    with pytest.raises(BrowserNurtureError) as error:
+        asyncio.run(runner.run(account.alias))
+
+    assert error.value.code == "RUN_POLICY_INVALID"
+    assert engine.sessions == []
+
+
+def test_live_runner_one_shot_rejects_multiple_cycles_before_browser_start(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "live-runner-cycle-limit-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    accounts = LocalAccountStore(root)
+    state = BrowserNurtureStateStore(root)
+    engine = _FakeNurtureEngine(frozenset())
+    runner = BrowserNurtureRunner(LocalRuntime(root, accounts, engine), state)
+
+    with pytest.raises(BrowserNurtureError) as error:
+        asyncio.run(
+            runner.run(
+                account.alias,
+                source=BrowserNurtureSource.BROWSER_UI,
+                max_cycles=2,
+            )
+        )
+
+    assert error.value.code == "RUN_POLICY_INVALID"
+    assert engine.sessions == []
+
+
+@pytest.mark.parametrize("idle_seconds", [0, 59])
+def test_live_continuous_runner_enforces_configured_cooldown_with_cycle_cap(
+    tmp_path: Path,
+    idle_seconds: int,
+) -> None:
+    root = tmp_path / f"live-cooldown-{idle_seconds}-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    accounts = LocalAccountStore(root)
+    state = BrowserNurtureStateStore(root)
+    engine = _FakeNurtureEngine(frozenset())
+    runner = BrowserNurtureRunner(LocalRuntime(root, accounts, engine), state)
+
+    with pytest.raises(BrowserNurtureError) as error:
+        asyncio.run(
+            runner.run(
+                account.alias,
+                source=BrowserNurtureSource.BROWSER_UI,
+                max_cycles=2,
+                continuous=True,
+                idle_seconds=idle_seconds,
+            )
+        )
+
+    assert error.value.code == "RUN_POLICY_INVALID"
+    assert engine.sessions == []
+    assert state.load_checkpoint(account.id).completed_cycles == 0
 
 
 def test_runner_leaves_v1_checkpoint_untouched_when_starting_v2_state(tmp_path: Path) -> None:
