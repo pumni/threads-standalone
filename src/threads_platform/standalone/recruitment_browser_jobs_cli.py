@@ -194,16 +194,22 @@ class _ConsoleStopSignal:
             self._wait_posix(seconds)
 
     def _wait_posix(self, seconds: float) -> None:
-        try:
-            readable, _writable, _exceptional = select.select([self._input], [], [], seconds)
-            if not readable:
+        deadline = time.monotonic() + seconds
+        while not self._stopped:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return
-            line = self._input.readline()
-        except OSError, ValueError:
-            self._stopped = True
-            return
-        if line == "" or line.strip().casefold() == "stop":
-            self._stopped = True
+            try:
+                readable, _writable, _exceptional = select.select([self._input], [], [], remaining)
+                if not readable:
+                    return
+                line = self._input.readline()
+            except OSError, ValueError:
+                self._stopped = True
+                return
+            if line == "" or line.strip().casefold() == "stop":
+                self._stopped = True
+                return
 
     def _wait_windows(self, seconds: float) -> None:
         try:

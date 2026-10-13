@@ -711,19 +711,115 @@ def test_two_cycle_run_needs_a_foreground_terminal_before_touching_root(
 def test_console_stop_signal_recognizes_stop_and_eof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    calls = 0
+
     def ready(
         streams: list[object], *_args: object
     ) -> tuple[list[object], list[object], list[object]]:
+        nonlocal calls
+        calls += 1
         return streams, [], []
 
     monkeypatch.setattr(cli_module.select, "select", ready)
     stop_command = cli_module._ConsoleStopSignal(io.StringIO("STOP\n"))
     stop_command._wait_posix(1)
     assert stop_command.is_set()
+    assert calls == 1
 
+    calls = 0
     end_of_input = cli_module._ConsoleStopSignal(io.StringIO(""))
     end_of_input._wait_posix(1)
     assert end_of_input.is_set()
+    assert calls == 1
+
+
+@pytest.mark.parametrize("line", ["hello\n", "\n"])
+def test_console_stop_signal_ignores_other_lines_until_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    line: str,
+) -> None:
+    now = 100.0
+    timeouts: list[float] = []
+
+    def monotonic() -> float:
+        return now
+
+    def poll(
+        streams: list[object],
+        _write: list[object],
+        _exceptional: list[object],
+        timeout: float,
+    ) -> tuple[list[object], list[object], list[object]]:
+        nonlocal now
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            now += 1.0
+            return streams, [], []
+        now += timeout
+        return [], [], []
+
+    monkeypatch.setattr(cli_module.time, "monotonic", monotonic)
+    monkeypatch.setattr(cli_module.select, "select", poll)
+    signal = cli_module._ConsoleStopSignal(io.StringIO(line))
+
+    signal._wait_posix(5.0)
+
+    assert not signal.is_set()
+    assert now == 105.0
+    assert timeouts == pytest.approx([5.0, 4.0])
+
+
+def test_two_cycle_run_ignores_non_stop_posix_input_and_keeps_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_parent, fixture_dir = _private_paths(tmp_path)
+    root = _caller_created_root(private_parent)
+    fixture = _write_fixture(fixture_dir, _fixture_document(cycles=2))
+    args = _args(root, fixture, max_cycles=2)
+    clock = _Clock()
+    timeouts: list[float] = []
+
+    def force_tty(_stream: TextIO) -> bool:
+        return True
+
+    def posix_wait(signal: cli_module._ConsoleStopSignal, seconds: float) -> None:
+        signal._wait_posix(seconds)
+
+    def poll(
+        streams: list[object],
+        _write: list[object],
+        _exceptional: list[object],
+        timeout: float,
+    ) -> tuple[list[object], list[object], list[object]]:
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            clock.advance(1.0)
+            return streams, [], []
+        clock.advance(timeout)
+        return [], [], []
+
+    monkeypatch.setattr(cli_module, "_is_tty", force_tty)
+    monkeypatch.setattr(cli_module._ConsoleStopSignal, "wait", posix_wait)
+    monkeypatch.setattr(cli_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(cli_module.select, "select", poll)
+
+    code, output, errors = _invoke(
+        args,
+        clock=clock,
+        input_stream=io.StringIO("hello\n"),
+    )
+
+    assert code == 0
+    assert "status=COMPLETE" in output
+    assert "completed_cycles=2" in output
+    assert "INTERVAL_NOT_MET" not in output + errors
+    assert "hello" not in output + errors
+    assert errors == "FOREGROUND_WAIT type STOP + Enter, EOF, or Ctrl+C to stop.\n"
+    assert timeouts == pytest.approx([MIN_CYCLE_INTERVAL_SECONDS, MIN_CYCLE_INTERVAL_SECONDS - 1])
+    summary = _archive_summary(root, "test-a")
+    assert summary.observation_count == 2
+    assert summary.post_count == 2
 
 
 def test_ctrl_c_while_waiting_returns_fixed_interrupt_status(

@@ -76,12 +76,13 @@ accepts 1–20 and the whole fixture is checked before the engine starts. A
 multi-cycle run requires a terminal and `--interval-minutes` of at least 15;
 the interval is real foreground time. The watch is bounded and exits after the
 requested number of cycles. Type `STOP` and press Enter, send EOF, or press
-Ctrl+C while it waits. Ctrl+C returns status 130. There is no daemon, scheduler,
-missed-cycle catch-up, or hidden retry. Restart with the same account alias,
-root, run ID, options, and fixture plan to resume. A changed plan with the same
-run ID returns `CHECKPOINT_CONFLICT`; an identical completed replay does not
-create a new observation. Reusing a local fixture is not evidence of a fresh
-remote observation.
+Ctrl+C while it waits. Other input lines, including blank lines, are ignored;
+the wait continues until the remaining interval elapses. Ctrl+C returns status
+130. There is no daemon, scheduler, missed-cycle catch-up, or hidden retry.
+Restart with the same account alias, root, run ID, options, and fixture plan to
+resume. A changed plan with the same run ID returns `CHECKPOINT_CONFLICT`; an
+identical completed replay does not create a new observation. Reusing a local
+fixture is not evidence of a fresh remote observation.
 
 Terminal output contains only fixed statuses/reasons, counts, and the next due
 time. It does not print aliases, UUIDs, paths, source URLs, fixture bodies, or
