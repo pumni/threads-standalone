@@ -1,5 +1,7 @@
 # Browser Jobs acceptance contract (BJ-00)
 
+**Current Browser-development owner direction (2026-10-13):** [AGENTS.md](../AGENTS.md) and [PRODUCT_DIRECTION.md](PRODUCT_DIRECTION.md) supersede this historical proposal wherever it treats generic Meta/Threads Terms review, express written platform permission, or #64/#103 closure as a prerequisite to writing, integrating, testing, or reviewing the Browser automation workflow. Keep account isolation, data minimization, technical integrity, and remote-effect safeguards. The documented `NO_GO` / `DISABLED_PERMISSION_PENDING` entries still describe today's live runtime, not a ban on implementing it. This clarification neither enables the currently disabled source nor claims Meta authorization. For actual live operation, follow the explicit operator task and applicable external obligations.
+
 **Status: proposed contract; coordinator acceptance is pending.** This is a documentation-only design for [BJ-00 #97](https://github.com/pumni/threads-standalone/issues/97), under [Browser Jobs #96](https://github.com/pumni/threads-standalone/issues/96). It does not authorize a browser read, contact collection, UI effect, release, or a later BJ slice.
 
 Reviewed against the refreshed `origin/main@1db96e2ec2fcd7533f289ebfdc1693c3ce4291bb` on 2026-10-12. The current `AGENTS.md` requires a separate explicit handoff for each slice and keeps platform permission distinct from implementation permission.
