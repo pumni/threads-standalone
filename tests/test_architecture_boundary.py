@@ -107,7 +107,9 @@ def test_playwright_imports_are_confined_to_explicit_browser_adapters() -> None:
     assert set(imports) == {
         Path("browser/playwright_engine.py"),
         Path("browser/synthetic_dom_session.py"),
+        Path("browser/threads_job_ui_reader.py"),
         Path("browser/ui_card_snapshot.py"),
+        Path("standalone/recruitment_browser_jobs_browser_source.py"),
     }
 
 

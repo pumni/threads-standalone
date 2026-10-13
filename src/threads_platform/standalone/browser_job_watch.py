@@ -1159,7 +1159,33 @@ def _observation_reason(reasons: tuple[ObservationReasonCode, ...]) -> WatchReas
         ObservationReasonCode.TIMEOUT,
     ):
         return WatchReasonCode.STOP_REQUESTED
-    return reason.value
+    if reason in (
+        ObservationReasonCode.BATCH_LIMIT_REACHED,
+        ObservationReasonCode.TRANCHE_LIMIT_REACHED,
+        ObservationReasonCode.CANDIDATE_LIMIT_REACHED,
+        ObservationReasonCode.DETAIL_LIMIT_REACHED,
+        ObservationReasonCode.TEXT_LIMIT_REACHED,
+    ):
+        return WatchReasonCode.ARCHIVE_LIMIT_REACHED
+    if reason is ObservationReasonCode.ACCOUNT_MISMATCH:
+        return WatchReasonCode.ACCOUNT_MISMATCH
+    if reason in (
+        ObservationReasonCode.TARGET_MOVED,
+        ObservationReasonCode.WRONG_ORIGIN,
+        ObservationReasonCode.REDIRECT_DETECTED,
+    ):
+        return WatchReasonCode.TARGET_CHANGED
+    if reason in (
+        ObservationReasonCode.SESSION_FAILURE,
+        ObservationReasonCode.UNCLASSIFIED_STATE,
+        ObservationReasonCode.AUTHOR_MISMATCH,
+    ):
+        return WatchReasonCode.OBSERVATION_FAILED
+    try:
+        return WatchReasonCode(reason.value)
+    except ValueError:
+        pass
+    return WatchReasonCode.OBSERVATION_FAILED
 
 
 def _archive_reason(error: RecruitmentJobStoreError) -> WatchReasonCode:

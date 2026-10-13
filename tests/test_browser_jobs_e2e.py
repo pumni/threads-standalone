@@ -655,12 +655,13 @@ def test_account_roots_are_isolated_and_manual_or_live_sources_fail_closed(
     assert manual_output.out == ("BROWSER_WATCH status=UNKNOWN source=MANUAL_URL reason=NO_TEXT\n")
     assert manual_output.err == ""
 
-    with pytest.raises(SystemExit) as browser_error:
-        main(["recruitment", "browser-watch", "--source", "browser"])
+    browser_code = main(["recruitment", "browser-watch", "--source", "browser"])
     browser_output = capsys.readouterr()
-    assert browser_error.value.code == 2
-    assert browser_output.out == ""
-    assert browser_output.err == "ERROR CLI_ARGUMENT_INVALID\n"
+    assert browser_code == 1
+    assert browser_output.out.startswith(
+        "BROWSER_WATCH status=DISABLED_PERMISSION_PENDING source=BROWSER_UI reason=SOURCE_DISABLED"
+    )
+    assert browser_output.err == ""
 
 
 @pytest.mark.parametrize(
@@ -756,7 +757,7 @@ def test_explicit_export_hides_synthetic_contact_after_raw_expiry_and_escapes_fo
     assert requirement["spans"] == []
 
 
-def test_nested_browser_watch_help_exposes_only_synthetic_and_manual_sources(
+def test_nested_browser_watch_help_exposes_disabled_browser_and_synthetic_sources(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit) as help_exit:
@@ -764,6 +765,7 @@ def test_nested_browser_watch_help_exposes_only_synthetic_and_manual_sources(
 
     captured = capsys.readouterr()
     assert help_exit.value.code == 0
-    assert "--source {fixture,dom-fixture,manual}" in captured.out
+    assert "--source {fixture,dom-fixture,ui-fixture,browser,manual}" in captured.out
     assert "--fixture-file" in captured.out
-    assert "browser}" not in captured.out
+    assert "disabled pending" in captured.out
+    assert "operator" in captured.out

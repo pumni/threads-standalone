@@ -591,13 +591,16 @@ def test_manual_mode_returns_unknown_without_reading_any_target_file(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_browser_source_and_invalid_flags_are_rejected_with_fixed_codes(
+def test_browser_source_is_disabled_and_invalid_flags_are_rejected_with_fixed_codes(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    with pytest.raises(SystemExit) as browser_error:
-        main(["recruitment", "browser-watch", "--source", "browser"])
-    assert browser_error.value.code == 2
-    assert capsys.readouterr().err == "ERROR CLI_ARGUMENT_INVALID\n"
+    browser_code = main(["recruitment", "browser-watch", "--source", "browser"])
+    browser_result = capsys.readouterr()
+    assert browser_code == 1
+    assert (
+        "DISABLED_PERMISSION_PENDING source=BROWSER_UI reason=SOURCE_DISABLED" in browser_result.out
+    )
+    assert browser_result.err == ""
 
     with pytest.raises(SystemExit) as option_error:
         main(
