@@ -2,17 +2,20 @@
 
 ## Scope
 
-This slice binds operator-prepared text to one current API-AUTO-01 planner
-proposal and returns a review-required in-memory packet. It is a pure Python
-contract. It does not approve content, persist packets, invoke a draft provider,
-make HTTP/API calls, or dispatch posts or replies.
+This module provides a pure Python contract for binding operator-prepared text
+to an API-AUTO-01 planner result and returning a review-required in-memory
+packet. The legacy proposal-based path remains available. The ReviewIntent path
+revalidates its input with the planner and does not create an `ActionProposal`.
+Neither path approves content, persists packets, invokes a draft provider, makes
+HTTP/API calls, or dispatches posts or replies.
 
 The supported actions are an account's own text post and a reply bound to one
-exact planner target. The module stores the account UUID and hashes for the
-candidate fingerprint, target, context, content, policy revision, and packet
-revision. It does not store a raw remote target or parent ID. The hashes bind a
-proposal for comparison. This module never decodes a digest or retains a raw
-remote target or parent ID.
+exact planner target. Legacy proposal packets store the account UUID and hashes
+for candidate fingerprint, target, context, content, policy revision, and
+packet revision. ReviewIntent packets also store an actor digest and separate
+root, parent, reply, and context-evidence digests. They do not store raw remote
+target or actor IDs. The planner rechecks the exact target from ephemeral
+observation DTOs; no digest is decoded or treated as a remote identifier.
 
 ## Text and evidence
 
@@ -35,12 +38,15 @@ provenance for both content and planner observation. Missing declarations make
 content ineligible; conflicting provenance stops evaluation.
 
 Content preparation and expiry must be UTC aware, ordered, no more than 24
-hours apart, and within the planner proposal's expiry. Capability and quota
-snapshots must be verified and fresh. The planner proposal must match the
-account, policy, action, exact target and context hashes, candidate fingerprint,
-permissions, and normalized content digest. A changed binding, stale window,
-missing permission, exhausted quota, cooldown, ambiguous prior action, or known
-duplicate packet cannot produce a review packet.
+hours apart, and within the current planner proposal or ReviewIntent expiry.
+Capability and quota snapshots must be verified and fresh. The legacy
+proposal-based path checks the planner proposal's account, policy, action,
+exact target and context hashes, candidate fingerprint, permissions, and
+normalized content digest. The ReviewIntent path independently replans the
+candidate before computing content and packet-revision hashes from normalized
+operator text. A changed binding, stale window, missing permission, exhausted
+quota, cooldown, ambiguous prior action, or known duplicate packet cannot
+produce a review packet.
 
 The candidate fingerprint is for re-selection and deduplication only. These
 DTOs contain no raw root, parent, or API target IDs, and this module does not
@@ -51,43 +57,57 @@ context can be compared by the planner's context contract.
 ## Review boundary
 
 Every valid result is `NEEDS_REVIEW` with `NEEDS_OPERATOR_REVIEW` state. The
-result has no approval flag, dispatch flag, or approved packet type. The optional
-`approval_input_for_review()` projection is inert metadata for a separately
-reviewed consumer; it does not assert consent and cannot be treated as an
-approval. A caller-provided set of known packet revision hashes supports pure
-duplicate checks in memory. It is not durable replay protection.
+result has no approval flag or approved packet type; `ReviewContentPacket` also
+has `dispatchable=False`. The optional `approval_input_for_review()` and
+`approval_input_for_review_packet()` projections are inert metadata for a
+separately reviewed consumer; neither asserts consent or is an approval. A
+caller-provided set of known packet revision hashes supports pure duplicate
+checks in memory. It is not durable replay protection.
 
 The contract has no storage, queue, scheduler, browser, HTTP, API client, or
 mutation dependency. All identifiers used as target evidence are digests. Raw
 target IDs must not be added to this packet or its representation.
 
-## Known bootstrap limitation — tracked by #135
+## ReviewIntent bootstrap — #135
 
-The accepted planner and this content contract are not yet connected into an
-end-to-end bootstrap. Calling `plan_cycle(scope, candidates, None, now=...)`
-returns `OBSERVE_ONLY / DRAFT_UNAVAILABLE` without an `ActionProposal`, while
-`prepare_packet(...)` requires an `ActionProposal` to create the first review
-packet. The `_proposal(...)` helper in the unit tests constructs a synthetic
-proposal to test content validation; it does not demonstrate a wired product
-flow from observation to operator review.
+The pure content path now connects a planner-selected, unapproved
+`ReviewIntent` to operator-supplied text without constructing an `ActionProposal`.
+`prepare_review_packet(intent, prepared_content, scope, candidates, now=...)`
+re-runs `plan_cycle(scope, candidates, None, now=...)`, requires one current
+selectable intent with `OBSERVE_ONLY / DRAFT_UNAVAILABLE` and `proposal=None`,
+and requires the supplied intent to equal that planner result. Planner STOP,
+context, collision, ambiguity, permission, quota, and policy decisions remain
+fail-closed.
 
-Until [the design gate in issue #135](https://github.com/pumni/threads-standalone/issues/135)
-is reviewed and accepted, #74B must not manufacture an `ActionProposal`, treat a
-bare fingerprint or digest as an exact target, or treat `ApprovalInput` as
-operator consent or durable approval. The #135 design must specify a pure,
-fully evidenced, unapproved `ReviewIntent` for an eligible candidate, including
-account UUID, API actor, source/provenance, target/root/parent/context digests,
-verified permission and quota evidence, policy revision, and freshness. It must
-define the path from that intent to an operator-authored review packet, explicit
-TTY consent stored privately and bound to the exact packet revision, and fresh
-official-API target reacquisition compared with that immutable approval before
-any later guarded #76 dispatch proposal. The accepted planner must remain
-fail-closed during that design.
+`ReviewIntentBinding` is a distinct digest-only type. It carries account,
+actor, action, source/provenance, fingerprint, target/context/root/parent/reply
+and context-evidence digests, policy, required permissions, quota evidence,
+observation times, and the intent expiry. Actor and remote IDs are not stored as
+raw values. The planner's current exact-target comparison remains the authority
+for binding those digests to the ephemeral observation DTOs.
 
-Persistent #74B storage and approval implementation is blocked until the
-coordinator reviews and accepts this interface through #135. This section
-documents the current integration gap; it does not change planner behavior or
-authorize bootstrap, persistence, or dispatch implementation.
+`ReviewContentPacket` holds the normalized `PreparedContent` in memory with its
+content SHA-256, a versioned and domain-separated packet-revision SHA-256, and
+`NEEDS_OPERATOR_REVIEW` state. Content is hashed only after the existing
+`nfc-lf-v1` normalization and text bound. The packet has no approval, consent,
+store, journal, or dispatch authority. Existing scope, candidate-state,
+prepared-content, and rights/job-facts validators are reused.
+
+`revalidate_review_packet(packet, scope, candidates, now=...)` independently
+re-runs the planner and checks the current verified account, actor, exact
+target, context, root/parent/reply, policy, permissions, quota and candidate
+state. The same target and context may be observed at a later time; freshness
+timestamps alone do not change the packet binding. The packet's original
+expiry remains fixed and is not extended by fresh restart evidence. Missing or
+changed binding evidence, insufficient permissions, exhausted or changed
+quota, stale evidence, or an expired packet yields no review packet.
+
+`approval_input_for_review_packet(evaluation)` returns only the existing inert
+`ApprovalInput` field projection from an internally valid review evaluation.
+It does not assert TTY consent, create an `ApprovedPacketSummary`, persist an
+approval, or authorize dispatch. Explicit operator review and private
+single-use approval remain separate #74B work. The synthetic planner/content
+DTO seam does not itself claim an authenticated official API observation.
 
 ## Requirements for the separately reviewed #74B store
 
@@ -115,11 +135,11 @@ authority.
 
 ## Synthetic acceptance coverage
 
-`tests/test_api_auto_content.py` uses synthetic IDs and in-memory DTOs. It covers
-operator-authored posts and exact-target replies; missing provider, rights, job
-facts, and permissions; malformed or overlong Unicode; normalization and
-content-hash changes; wrong account, policy, target, or context; synthetic/live
-provenance mismatch; stale, expired, and not-yet-effective windows; quota,
-cooldown, ambiguous prior action, duplicate packet, and unknown review state.
-Every rejected or unavailable case returns without any HTTP call, store write,
-approval, or remote mutation.
+`tests/test_api_auto_content.py` preserves the proposal-based compatibility
+coverage. `tests/test_api_auto_review_packet.py` uses fresh synthetic IDs and
+in-memory DTOs to cover the complete `ReviewIntent` to review-packet path for an
+own-account post and exact inbound reply, normalization, rights and revision
+integrity, wrong or changed account/actor/target/root/parent/reply/context/
+policy, refreshed evidence, restart, missing permissions, quota and candidate
+states. Every rejected or unavailable case returns without any HTTP call,
+store write, approval, or remote mutation.
