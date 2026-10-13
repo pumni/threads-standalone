@@ -25,6 +25,7 @@ from threads_platform.standalone.api_auto_plan import (
     PlanDecision,
     PlanReason,
     QuotaSnapshot,
+    ReviewIntent,
     TargetKind,
     VerifiedTargetBinding,
     _context_digest,
@@ -306,6 +307,8 @@ def test_duplicate_fingerprint_is_dedupe_only() -> None:
     ]
     assert plan.items[1].reason_codes == (PlanReason.DUPLICATE_FINGERPRINT,)
     assert all(item.proposal is None for item in plan.items)
+    assert isinstance(plan.items[0].review_intent, ReviewIntent)
+    assert plan.items[1].review_intent is None
 
 
 def test_same_fingerprint_cannot_rebind_to_another_root() -> None:
@@ -317,6 +320,7 @@ def test_same_fingerprint_cannot_rebind_to_another_root() -> None:
 
     assert plan.decision is PlanDecision.STOP
     assert plan.reason_codes == (PlanReason.FINGERPRINT_BINDING_CONFLICT,)
+    assert plan.items == ()
 
 
 def test_same_reply_id_cannot_be_rebound_to_another_root_or_parent() -> None:
@@ -328,6 +332,7 @@ def test_same_reply_id_cannot_be_rebound_to_another_root_or_parent() -> None:
 
     assert plan.decision is PlanDecision.STOP
     assert plan.reason_codes == (PlanReason.REPLY_TARGET_COLLISION,)
+    assert plan.items == ()
 
 
 @pytest.mark.parametrize(
@@ -598,6 +603,296 @@ def test_missing_content_is_observe_only_and_no_generic_reply_is_created() -> No
     assert plan.decision is PlanDecision.OBSERVE_ONLY
     assert plan.items[0].reason_codes == (PlanReason.DRAFT_UNAVAILABLE,)
     assert plan.items[0].proposal is None
+    assert isinstance(plan.items[0].review_intent, ReviewIntent)
+
+
+def test_unapproved_post_emits_review_intent_without_remote_target_or_content() -> None:
+    candidate = _post_candidate("review-intent-post")
+    scope = _scope()
+    plan = plan_cycle(scope, (candidate,), now=NOW)
+
+    assert plan.decision is PlanDecision.OBSERVE_ONLY
+    assert plan.items[0].decision is PlanDecision.OBSERVE_ONLY
+    assert plan.items[0].reason_codes == (PlanReason.DRAFT_UNAVAILABLE,)
+    assert plan.items[0].proposal is None
+    intent = plan.items[0].review_intent
+    assert isinstance(intent, ReviewIntent)
+    assert intent.account_id == ACCOUNT_ID
+    assert intent.actor_id == ACTOR_ID
+    assert intent.action is ActionKind.POST_TEXT
+    assert intent.source is CandidateSource.OWN_ACCOUNT
+    assert intent.provenance is ObservationProvenance.SYNTHETIC_FIXTURE
+    assert intent.candidate_fingerprint == candidate.fingerprint
+    assert intent.target_sha256 == _target_digest(scope, candidate)
+    assert intent.context_sha256 == _context_digest(candidate)
+    assert intent.root_sha256 is None
+    assert intent.parent_sha256 is None
+    assert intent.reply_sha256 is None
+    assert intent.context_evidence_sha256 == candidate.binding.context_evidence_sha256
+    assert intent.policy_sha256 == scope.policy_sha256
+    assert intent.required_permissions == (
+        ApiPermission.THREADS_BASIC,
+        ApiPermission.THREADS_CONTENT_PUBLISH,
+    )
+    assert (intent.quota_used, intent.quota_total) == (1, 100)
+    assert intent.capabilities_observed_at == scope.capabilities.observed_at
+    assert intent.quota_observed_at == scope.quota.observed_at
+    assert intent.candidate_observed_at == candidate.observed_at
+    assert intent.binding_observed_at == candidate.binding.observed_at
+    assert intent.expires_at == NOW + timedelta(minutes=14)
+    assert intent.dispatchable is False
+    assert not isinstance(intent, api_auto_plan.ActionProposal)
+    assert not isinstance(intent, ApprovedPacketSummary)
+    assert not hasattr(intent, "content_sha256")
+    assert not hasattr(intent, "packet_revision_sha256")
+    assert not hasattr(intent, "text")
+    assert not hasattr(intent, "approval")
+    assert not hasattr(intent, "consent")
+    assert not hasattr(intent, "thread_id")
+    assert not hasattr(intent, "root_id")
+    assert not hasattr(intent, "parent_id")
+    assert not hasattr(intent, "reply_id")
+
+
+def test_reply_review_intent_hashes_exact_ids_and_ignores_observation_time() -> None:
+    candidate = _reply_candidate(
+        "review-intent-reply",
+        root_id="root-review-intent",
+        thread_id="root-review-intent",
+        parent_id="parent-review-intent",
+        reply_id="reply-review-intent",
+    )
+    scope = _scope()
+    plan = plan_cycle(scope, (candidate,), now=NOW)
+    intent = plan.items[0].review_intent
+
+    assert isinstance(intent, ReviewIntent)
+    assert intent.root_sha256 is not None
+    assert intent.parent_sha256 is not None
+    assert intent.reply_sha256 is not None
+    assert len({intent.root_sha256, intent.parent_sha256, intent.reply_sha256}) == 3
+    assert intent.action is ActionKind.REPLY
+    assert intent.source is CandidateSource.INBOUND_REPLY
+    assert intent.provenance is ObservationProvenance.SYNTHETIC_FIXTURE
+
+    later_observation = NOW - timedelta(seconds=30)
+    reobserved = replace(
+        candidate,
+        observed_at=later_observation,
+        binding=replace(candidate.binding, observed_at=later_observation),
+    )
+    reobserved_intent = plan_cycle(scope, (reobserved,), now=NOW).items[0].review_intent
+    assert isinstance(reobserved_intent, ReviewIntent)
+    assert reobserved_intent.context_sha256 == intent.context_sha256
+    assert reobserved_intent.root_sha256 == intent.root_sha256
+    assert reobserved_intent.parent_sha256 == intent.parent_sha256
+    assert reobserved_intent.reply_sha256 == intent.reply_sha256
+
+
+@pytest.mark.parametrize("changed_id", ["root", "parent", "reply"])
+def test_reply_review_intent_digests_rebind_when_verified_raw_id_changes(
+    changed_id: str,
+) -> None:
+    candidate = _reply_candidate(
+        f"review-intent-{changed_id}",
+        root_id="root-original",
+        thread_id="root-original",
+        parent_id="parent-original",
+        reply_id="reply-original",
+    )
+    binding = candidate.binding
+    observation = binding.reply_observation
+    if changed_id == "root":
+        changed_binding = replace(
+            binding,
+            root_id="root-changed",
+            thread_id="root-changed",
+            reply_observation=replace(observation, root_post_id="root-changed"),
+        )
+    elif changed_id == "parent":
+        changed_binding = replace(
+            binding,
+            parent_id="parent-changed",
+            reply_observation=replace(observation, replied_to_id="parent-changed"),
+        )
+    else:
+        changed_binding = replace(
+            binding,
+            reply_id="reply-changed",
+            reply_observation=replace(observation, reply_id="reply-changed"),
+        )
+
+    original_intent = plan_cycle(_scope(), (candidate,), now=NOW).items[0].review_intent
+    changed_intent = (
+        plan_cycle(_scope(), (replace(candidate, binding=changed_binding),), now=NOW)
+        .items[0]
+        .review_intent
+    )
+
+    assert isinstance(original_intent, ReviewIntent)
+    assert isinstance(changed_intent, ReviewIntent)
+    assert original_intent.target_sha256 != changed_intent.target_sha256
+    assert original_intent.context_sha256 != changed_intent.context_sha256
+    digest_field = {
+        "root": "root_sha256",
+        "parent": "parent_sha256",
+        "reply": "reply_sha256",
+    }[changed_id]
+    assert getattr(original_intent, digest_field) != getattr(changed_intent, digest_field)
+
+
+def test_review_intent_is_repr_redacted_and_never_approvable() -> None:
+    candidate = _reply_candidate("review-intent-private")
+    plan = plan_cycle(_scope(), (candidate,), now=NOW)
+    intent = plan.items[0].review_intent
+    assert isinstance(intent, ReviewIntent)
+    rendered = " ".join((repr(intent), repr(plan.items[0]), repr(plan)))
+
+    for private_value in (
+        str(ACCOUNT_ID),
+        ACTOR_ID,
+        candidate.binding.root_id,
+        candidate.binding.parent_id,
+        candidate.binding.reply_id,
+        candidate.fingerprint,
+        intent.target_sha256,
+        intent.context_sha256,
+        intent.root_sha256,
+        intent.parent_sha256,
+        intent.reply_sha256,
+        intent.context_evidence_sha256,
+        intent.policy_sha256,
+    ):
+        assert private_value not in rendered
+    assert intent.dispatchable is False
+
+
+def test_review_intent_is_limited_to_first_stable_eligible_candidate() -> None:
+    candidates = tuple(
+        _reply_candidate(f"review-intent-{index}", score=index, source_order=index)
+        for index in range(20)
+    )
+    plan = plan_cycle(_scope(), candidates, now=NOW)
+    selected = [item for item in plan.items if item.review_intent is not None]
+
+    assert plan.decision is PlanDecision.OBSERVE_ONLY
+    assert len(selected) == 1
+    assert selected[0].candidate_fingerprint == candidates[-1].fingerprint
+    assert selected[0].reason_codes == (PlanReason.DRAFT_UNAVAILABLE,)
+    assert selected[0].proposal is None
+
+
+def test_review_intent_respects_zero_action_cap_and_strict_expiry() -> None:
+    candidate = _reply_candidate("review-intent-expiry")
+    zero_cap_plan = plan_cycle(replace(_scope(), max_actions_per_cycle=0), (candidate,), now=NOW)
+    assert zero_cap_plan.decision is PlanDecision.OBSERVE_ONLY
+    assert zero_cap_plan.items[0].reason_codes == (PlanReason.DRAFT_UNAVAILABLE,)
+    assert zero_cap_plan.items[0].proposal is None
+    assert zero_cap_plan.items[0].review_intent is None
+
+    at_expiry = NOW - timedelta(minutes=15)
+    boundary_candidate = replace(
+        candidate,
+        observed_at=at_expiry,
+        binding=replace(candidate.binding, observed_at=at_expiry),
+    )
+    boundary_plan = plan_cycle(_scope(), (boundary_candidate,), now=NOW)
+    assert boundary_plan.decision is PlanDecision.OBSERVE_ONLY
+    assert boundary_plan.items[0].reason_codes == (PlanReason.DRAFT_UNAVAILABLE,)
+    assert boundary_plan.items[0].review_intent is None
+
+
+def test_review_intent_expiry_uses_oldest_evidence_timestamp() -> None:
+    candidate = _reply_candidate(candidate_observed_at=NOW - timedelta(minutes=4))
+    binding = replace(candidate.binding, observed_at=NOW - timedelta(minutes=5))
+    scope = _scope()
+    scope = replace(
+        scope,
+        capabilities=replace(scope.capabilities, observed_at=NOW - timedelta(minutes=3)),
+        quota=replace(scope.quota, observed_at=NOW - timedelta(minutes=1)),
+    )
+    intent = (
+        plan_cycle(scope, (replace(candidate, binding=binding),), now=NOW).items[0].review_intent
+    )
+
+    assert isinstance(intent, ReviewIntent)
+    assert intent.expires_at == NOW + timedelta(minutes=10)
+
+
+def test_invalid_or_ineligible_candidates_never_receive_review_intents() -> None:
+    candidate = _reply_candidate("review-intent-invalid")
+    bad_actor = replace(candidate, binding=replace(candidate.binding, actor_id="other-actor"))
+    stale = replace(
+        candidate,
+        observed_at=NOW - timedelta(minutes=16),
+        binding=replace(candidate.binding, observed_at=NOW - timedelta(minutes=16)),
+    )
+    cases = (
+        (
+            _reply_candidate(
+                "wrong-account",
+                account_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            ),
+            _scope(),
+        ),
+        (bad_actor, _scope()),
+        (_reply_candidate("wrong-source", source=CandidateSource.KEYWORD), _scope()),
+        (
+            _reply_candidate("unknown-provenance", provenance=ObservationProvenance.UNKNOWN),
+            _scope(),
+        ),
+        (_reply_candidate("partial", completeness=ContextCompleteness.PARTIAL), _scope()),
+        (stale, _scope()),
+        (
+            candidate,
+            _scope(permissions=ALL_PERMISSIONS - {ApiPermission.THREADS_CONTENT_PUBLISH}),
+        ),
+        (
+            candidate,
+            _scope(permissions=ALL_PERMISSIONS - {ApiPermission.THREADS_READ_REPLIES}),
+        ),
+        (
+            candidate,
+            _scope(permissions=ALL_PERMISSIONS - {ApiPermission.THREADS_BASIC}),
+        ),
+        (_reply_candidate(state=CandidateState.COOLDOWN), _scope()),
+        (_reply_candidate(state=CandidateState.PENDING), _scope()),
+        (_reply_candidate(state=CandidateState.CONFIRMED), _scope()),
+        (_reply_candidate(state=CandidateState.AMBIGUOUS), _scope()),
+        (
+            candidate,
+            _scope(quota=QuotaSnapshot(1, 100, 100, 100, True, NOW - timedelta(minutes=1))),
+        ),
+        (
+            candidate,
+            replace(_scope(), quota=replace(_scope().quota, verified=False)),
+        ),
+        (
+            candidate,
+            replace(
+                _scope(),
+                capabilities=replace(
+                    _scope().capabilities,
+                    observed_at=NOW - timedelta(minutes=16),
+                ),
+            ),
+        ),
+    )
+
+    for invalid_candidate, scope in cases:
+        plan = plan_cycle(scope, (invalid_candidate,), now=NOW)
+        assert all(item.review_intent is None for item in plan.items)
+
+
+def test_approved_packet_path_never_emits_review_intent() -> None:
+    candidate = _reply_candidate("review-intent-approved-path")
+    scope = _scope()
+    packet = _packet(candidate, scope)
+    plan = plan_cycle(scope, (candidate,), packet, now=NOW)
+
+    assert plan.decision is PlanDecision.NEEDS_REVIEW
+    assert plan.items[0].proposal is not None
+    assert plan.items[0].review_intent is None
 
 
 def test_all_rendered_representations_redact_ids_fingerprints_and_content_hashes() -> None:

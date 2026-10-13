@@ -278,6 +278,45 @@ class ActionProposal:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class ReviewIntent:
+    """Ephemeral, unapproved request for an operator to review a target."""
+
+    account_id: UUID = field(repr=False)
+    actor_id: str = field(repr=False)
+    action: ActionKind
+    source: CandidateSource
+    provenance: ObservationProvenance
+    candidate_fingerprint: str = field(repr=False)
+    target_sha256: str = field(repr=False)
+    context_sha256: str = field(repr=False)
+    root_sha256: str | None = field(repr=False)
+    parent_sha256: str | None = field(repr=False)
+    reply_sha256: str | None = field(repr=False)
+    context_evidence_sha256: str = field(repr=False)
+    policy_sha256: str = field(repr=False)
+    required_permissions: tuple[ApiPermission, ...]
+    quota_used: int
+    quota_total: int
+    capabilities_observed_at: datetime
+    quota_observed_at: datetime
+    candidate_observed_at: datetime
+    binding_observed_at: datetime
+    expires_at: datetime
+    dispatchable: bool = field(default=False, init=False)
+
+    def __repr__(self) -> str:
+        return (
+            "ReviewIntent("
+            f"action={self.action.value}, source={self.source.value}, "
+            f"provenance={self.provenance.value}, "
+            f"required_permissions={tuple(item.value for item in self.required_permissions)!r}, "
+            f"quota_used={self.quota_used}, quota_total={self.quota_total}, "
+            f"expires_at={self.expires_at.isoformat()}, dispatchable=False, "
+            "private_evidence=<redacted>)"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class PlanItem:
     source: CandidateSource
     decision: PlanDecision
@@ -285,6 +324,7 @@ class PlanItem:
     score: int
     candidate_fingerprint: str = field(repr=False)
     proposal: ActionProposal | None = field(repr=False)
+    review_intent: ReviewIntent | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         return (
@@ -506,6 +546,7 @@ def plan_cycle(
 
     items: list[PlanItem] = []
     proposal_count = 0
+    review_intent_count = 0
     for candidate, provisional, reasons, target_digest, context_digest in prepared:
         if provisional is not PlanDecision.NEEDS_REVIEW:
             items.append(
@@ -522,6 +563,13 @@ def plan_cycle(
 
         packet = approved_packet_summary
         if packet is None or candidate is not packet_index:
+            review_intent = None
+            if packet is None and review_intent_count == 0 and scope.max_actions_per_cycle > 0:
+                review_intent = _make_review_intent(
+                    scope, candidate, target_digest, context_digest, now
+                )
+                if review_intent is not None:
+                    review_intent_count += 1
             items.append(
                 PlanItem(
                     source=candidate.source,
@@ -530,6 +578,7 @@ def plan_cycle(
                     score=candidate.score,
                     candidate_fingerprint=candidate.fingerprint,
                     proposal=None,
+                    review_intent=review_intent,
                 )
             )
             continue
@@ -593,6 +642,92 @@ def plan_cycle(
 
     plan_items = tuple(items)
     return CyclePlan(_aggregate_decision(plan_items), plan_items)
+
+
+def _make_review_intent(
+    scope: CampaignScope,
+    candidate: ObservedCandidate,
+    target_digest: str,
+    context_digest: str,
+    now: datetime,
+) -> ReviewIntent | None:
+    """Build a review-only hint from a candidate already accepted by the planner."""
+
+    binding = candidate.binding
+    if binding is None or binding.context_evidence_sha256 is None:
+        return None
+    try:
+        expires_at = (
+            min(
+                candidate.observed_at,
+                binding.observed_at,
+                scope.capabilities.observed_at,
+                scope.quota.observed_at,
+            )
+            + scope.max_context_age
+        )
+    except OverflowError, TypeError, ValueError:
+        return None
+    if not _is_utc(expires_at) or expires_at <= now:
+        return None
+
+    quota_used, quota_total = _quota_pair(candidate.action, scope.quota)
+    if quota_used >= quota_total:
+        return None
+
+    root_sha256 = None
+    parent_sha256 = None
+    reply_sha256 = None
+    if candidate.action is ActionKind.REPLY:
+        # _candidate_check has already verified this exact inbound binding and
+        # its RemoteReply relationships before this helper is reached.
+        if binding.root_id is None or binding.parent_id is None or binding.reply_id is None:
+            return None
+        root_sha256 = _target_reference_digest(
+            scope.account_id, binding.actor_id, "root", binding.root_id
+        )
+        parent_sha256 = _target_reference_digest(
+            scope.account_id, binding.actor_id, "parent", binding.parent_id
+        )
+        reply_sha256 = _target_reference_digest(
+            scope.account_id, binding.actor_id, "reply", binding.reply_id
+        )
+
+    return ReviewIntent(
+        account_id=scope.account_id,
+        actor_id=binding.actor_id,
+        action=candidate.action,
+        source=candidate.source,
+        provenance=candidate.provenance,
+        candidate_fingerprint=candidate.fingerprint,
+        target_sha256=target_digest,
+        context_sha256=context_digest,
+        root_sha256=root_sha256,
+        parent_sha256=parent_sha256,
+        reply_sha256=reply_sha256,
+        context_evidence_sha256=binding.context_evidence_sha256,
+        policy_sha256=scope.policy_sha256,
+        required_permissions=_required_permissions(candidate),
+        quota_used=quota_used,
+        quota_total=quota_total,
+        capabilities_observed_at=scope.capabilities.observed_at,
+        quota_observed_at=scope.quota.observed_at,
+        candidate_observed_at=candidate.observed_at,
+        binding_observed_at=binding.observed_at,
+        expires_at=expires_at,
+    )
+
+
+def _target_reference_digest(account_id: UUID, actor_id: str, role: str, remote_id: str) -> str:
+    return _digest(
+        {
+            "domain": "threads-standalone.api-auto.review-intent-target-reference.v1",
+            "account_uuid": str(account_id),
+            "actor_id": actor_id,
+            "role": role,
+            "remote_id": remote_id,
+        }
+    )
 
 
 def _scope_failure(
