@@ -1,4 +1,4 @@
-"""Private v1 configuration and checkpoint state for Browser Nurture."""
+"""Private versioned configuration and checkpoint state for Browser Nurture."""
 
 # Browser Nurture shares the established private path and ACL primitives. It owns
 # separate versioned files and never opens or rewrites NurtureStore v1 records.
@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ MAX_SEEN_POST_FINGERPRINTS = 5_000
 MAX_CHECKPOINT_COUNTER = 1_000_000_000_000
 
 _NAMESPACE = "browser_nurture_v1"
+_CHECKPOINT_NAMESPACE = "browser_nurture_v2"
 _ACCOUNT_HANDLE = re.compile(r"[A-Za-z0-9._]{1,30}\Z")
 _SAFE_TOPIC_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -58,6 +60,7 @@ _CHECKPOINT_KEYS = frozenset(
         "crash_recovery_pending",
     }
 )
+_CHECKPOINT_V2_KEYS = _CHECKPOINT_KEYS | frozenset({"policy_fingerprint", "next_topic_index"})
 
 
 class BrowserNurtureStateError(Exception):
@@ -148,6 +151,74 @@ class BrowserNurtureCheckpointV1:
             "seen_fingerprints": list(self.seen_fingerprints),
             "crash_recovery_pending": self.crash_recovery_pending,
         }
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class BrowserNurtureCheckpointV2:
+    account_uuid: UUID
+    completed_cycles: int = 0
+    scanned: int = 0
+    relevant: int = 0
+    irrelevant: int = 0
+    unknown: int = 0
+    duplicates: int = 0
+    scrolls: int = 0
+    policy_fingerprint: str = field(default="", repr=False)
+    next_topic_index: int = 0
+    seen_fingerprints: tuple[str, ...] = field(default=(), repr=False)
+    crash_recovery_pending: bool = False
+    schema_version: int = 2
+
+    def __repr__(self) -> str:
+        return (
+            "BrowserNurtureCheckpointV2("
+            f"account=<redacted>, completed_cycles={self.completed_cycles}, "
+            f"scanned={self.scanned}, relevant={self.relevant}, "
+            f"duplicates={self.duplicates}, seen_count={len(self.seen_fingerprints)}, "
+            f"next_topic_index={self.next_topic_index}, "
+            f"crash_recovery_pending={self.crash_recovery_pending})"
+        )
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "account_uuid": str(self.account_uuid),
+            "completed_cycles": self.completed_cycles,
+            "scanned": self.scanned,
+            "relevant": self.relevant,
+            "irrelevant": self.irrelevant,
+            "unknown": self.unknown,
+            "duplicates": self.duplicates,
+            "scrolls": self.scrolls,
+            "policy_fingerprint": self.policy_fingerprint,
+            "next_topic_index": self.next_topic_index,
+            "seen_fingerprints": list(self.seen_fingerprints),
+            "crash_recovery_pending": self.crash_recovery_pending,
+        }
+
+
+def browser_nurture_policy_fingerprint(config: BrowserNurtureConfigV1) -> str:
+    """Bind dedupe and aggregate counters to the active observation policy."""
+
+    policy = {
+        "schema_version": 1,
+        "expected_username": config.expected_username.casefold(),
+        "topics": [topic.casefold() for topic in config.topics],
+        "relevance_terms": [term.casefold() for term in config.relevance_terms],
+        "max_posts_per_cycle": config.max_posts_per_cycle,
+    }
+    serialized = json.dumps(
+        policy,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(b"threads-local/browser-nurture-policy-v1\0" + serialized).hexdigest()
+
+
+def _empty_policy_fingerprint() -> str:
+    return hashlib.sha256(b"threads-local/browser-nurture-policy-none-v1").hexdigest()
 
 
 def validate_browser_nurture_config(value: object) -> BrowserNurtureConfigV1:
@@ -252,8 +323,76 @@ def validate_browser_nurture_checkpoint(value: object) -> BrowserNurtureCheckpoi
     )
 
 
+def validate_browser_nurture_checkpoint_v2(value: object) -> BrowserNurtureCheckpointV2:
+    if type(value) is not dict:
+        raise BrowserNurtureStateError("CHECKPOINT_INVALID")
+    document = cast(dict[str, object], value)
+    if frozenset(document) != _CHECKPOINT_V2_KEYS:
+        raise BrowserNurtureStateError("CHECKPOINT_INVALID")
+    try:
+        account_uuid = UUID(_required_string(document["account_uuid"]))
+    except TypeError, ValueError, AttributeError:
+        raise BrowserNurtureStateError("CHECKPOINT_INVALID") from None
+    version = document["schema_version"]
+    counters = tuple(
+        document[key]
+        for key in (
+            "completed_cycles",
+            "scanned",
+            "relevant",
+            "irrelevant",
+            "unknown",
+            "duplicates",
+            "scrolls",
+        )
+    )
+    raw_fingerprints = document["seen_fingerprints"]
+    recovery_pending = document["crash_recovery_pending"]
+    policy_fingerprint = document["policy_fingerprint"]
+    next_topic_index = document["next_topic_index"]
+    if (
+        type(version) is not int
+        or version != 2
+        or any(
+            type(counter) is not int or not 0 <= counter <= MAX_CHECKPOINT_COUNTER
+            for counter in counters
+        )
+        or type(raw_fingerprints) is not list
+        or type(recovery_pending) is not bool
+        or not isinstance(policy_fingerprint, str)
+        or _SHA256.fullmatch(policy_fingerprint) is None
+        or type(next_topic_index) is not int
+        or not 0 <= next_topic_index < MAX_NURTURE_TOPICS
+    ):
+        raise BrowserNurtureStateError("CHECKPOINT_INVALID")
+    fingerprints = cast(list[object], raw_fingerprints)
+    if (
+        len(fingerprints) > MAX_SEEN_POST_FINGERPRINTS
+        or any(
+            not isinstance(item, str) or _SHA256.fullmatch(item) is None for item in fingerprints
+        )
+        or len(set(cast(list[str], fingerprints))) != len(fingerprints)
+    ):
+        raise BrowserNurtureStateError("CHECKPOINT_INVALID")
+    return BrowserNurtureCheckpointV2(
+        account_uuid=account_uuid,
+        completed_cycles=cast(int, counters[0]),
+        scanned=cast(int, counters[1]),
+        relevant=cast(int, counters[2]),
+        irrelevant=cast(int, counters[3]),
+        unknown=cast(int, counters[4]),
+        duplicates=cast(int, counters[5]),
+        scrolls=cast(int, counters[6]),
+        policy_fingerprint=policy_fingerprint,
+        next_topic_index=next_topic_index,
+        seen_fingerprints=tuple(cast(list[str], fingerprints)),
+        crash_recovery_pending=recovery_pending,
+        schema_version=version,
+    )
+
+
 class BrowserNurtureStateStore:
-    """Store strict private Browser Nurture v1 files under the existing data root."""
+    """Store private versioned Browser Nurture configuration and checkpoint files."""
 
     def __init__(self, data_root: Path) -> None:
         self._root = Path(data_root).absolute()
@@ -273,27 +412,48 @@ class BrowserNurtureStateStore:
         path, directory = self._file_path(validated.account_uuid, "config")
         self._write(path, directory, validated.to_document(), CONFIG_MAX_BYTES)
 
-    def load_checkpoint(self, account_uuid: UUID) -> BrowserNurtureCheckpointV1:
+    def load_checkpoint(
+        self,
+        account_uuid: UUID,
+        *,
+        policy_fingerprint: str | None = None,
+    ) -> BrowserNurtureCheckpointV2:
+        if policy_fingerprint is not None and _SHA256.fullmatch(policy_fingerprint) is None:
+            raise BrowserNurtureStateError("CHECKPOINT_INVALID")
         path, directory = self._file_path(account_uuid, "checkpoints")
         document = self._read(path, directory, CHECKPOINT_MAX_BYTES)
         if document is None:
-            return BrowserNurtureCheckpointV1(account_uuid=account_uuid)
-        checkpoint = validate_browser_nurture_checkpoint(document)
+            checkpoint = BrowserNurtureCheckpointV2(
+                account_uuid=account_uuid,
+                policy_fingerprint=(
+                    policy_fingerprint
+                    if policy_fingerprint is not None
+                    else _empty_policy_fingerprint()
+                ),
+            )
+            return checkpoint
+        checkpoint = validate_browser_nurture_checkpoint_v2(document)
         if checkpoint.account_uuid != account_uuid:
             raise BrowserNurtureStateError("CHECKPOINT_INVALID")
+        if policy_fingerprint is not None and checkpoint.policy_fingerprint != policy_fingerprint:
+            checkpoint = BrowserNurtureCheckpointV2(
+                account_uuid=account_uuid,
+                policy_fingerprint=policy_fingerprint,
+            )
+            self.save_checkpoint(checkpoint)
         return checkpoint
 
-    def save_checkpoint(self, checkpoint: BrowserNurtureCheckpointV1) -> None:
-        validated = validate_browser_nurture_checkpoint(checkpoint.to_document())
+    def save_checkpoint(self, checkpoint: BrowserNurtureCheckpointV2) -> None:
+        validated = validate_browser_nurture_checkpoint_v2(checkpoint.to_document())
         path, directory = self._file_path(validated.account_uuid, "checkpoints")
         self._write(path, directory, validated.to_document(), CHECKPOINT_MAX_BYTES)
 
     def mark_crash_recovery(
-        self, checkpoint: BrowserNurtureCheckpointV1
-    ) -> BrowserNurtureCheckpointV1:
+        self, checkpoint: BrowserNurtureCheckpointV2
+    ) -> BrowserNurtureCheckpointV2:
         if checkpoint.crash_recovery_pending:
             raise BrowserNurtureStateError("CRASH_RECOVERY_EXHAUSTED")
-        updated = BrowserNurtureCheckpointV1(
+        updated = BrowserNurtureCheckpointV2(
             account_uuid=checkpoint.account_uuid,
             completed_cycles=checkpoint.completed_cycles,
             scanned=checkpoint.scanned,
@@ -302,6 +462,8 @@ class BrowserNurtureStateStore:
             unknown=checkpoint.unknown,
             duplicates=checkpoint.duplicates,
             scrolls=checkpoint.scrolls,
+            policy_fingerprint=checkpoint.policy_fingerprint,
+            next_topic_index=checkpoint.next_topic_index,
             seen_fingerprints=checkpoint.seen_fingerprints,
             crash_recovery_pending=True,
         )
@@ -309,13 +471,13 @@ class BrowserNurtureStateStore:
         return updated
 
     def _file_path(self, account_uuid: UUID, directory_name: str) -> tuple[Path, Path]:
-        _namespace, configs, checkpoints = self._directories()
+        configs, checkpoints = self._directories()
         directory = configs if directory_name == "config" else checkpoints
         path = directory / f"{account_uuid}.json"
         _store_fs._require_parented_child(path, directory)
         return path, directory
 
-    def _directories(self) -> tuple[Path, Path, Path]:
+    def _directories(self) -> tuple[Path, Path]:
         try:
             _store_fs._validate_path_components(self._root)
             info = self._root.lstat()
@@ -323,22 +485,33 @@ class BrowserNurtureStateStore:
                 raise BrowserNurtureStateError("STATE_UNSAFE")
             _store_fs._ensure_outside_checkout(self._root)
             _store_fs._verify_private_directory(self._root)
-            namespace, created = _store_fs._ensure_directory(self._root, _NAMESPACE)
-            if created:
-                _store_fs._secure_directory(namespace, configure_windows_acl=True)
+            config_namespace, config_namespace_created = _store_fs._ensure_directory(
+                self._root, _NAMESPACE
+            )
+            if config_namespace_created:
+                _store_fs._secure_directory(config_namespace, configure_windows_acl=True)
             else:
-                _store_fs._verify_private_directory(namespace)
-            config, config_created = _store_fs._ensure_directory(namespace, "config")
-            checkpoints, checkpoints_created = _store_fs._ensure_directory(namespace, "checkpoints")
+                _store_fs._verify_private_directory(config_namespace)
+            config, config_created = _store_fs._ensure_directory(config_namespace, "config")
             if config_created:
                 _store_fs._secure_directory(config, configure_windows_acl=True)
             else:
                 _store_fs._verify_private_directory(config)
+            checkpoint_namespace, checkpoint_namespace_created = _store_fs._ensure_directory(
+                self._root, _CHECKPOINT_NAMESPACE
+            )
+            if checkpoint_namespace_created:
+                _store_fs._secure_directory(checkpoint_namespace, configure_windows_acl=True)
+            else:
+                _store_fs._verify_private_directory(checkpoint_namespace)
+            checkpoints, checkpoints_created = _store_fs._ensure_directory(
+                checkpoint_namespace, "checkpoints"
+            )
             if checkpoints_created:
                 _store_fs._secure_directory(checkpoints, configure_windows_acl=True)
             else:
                 _store_fs._verify_private_directory(checkpoints)
-            return namespace, config, checkpoints
+            return config, checkpoints
         except BrowserNurtureStateError:
             raise
         except RecruitmentJobStoreError:

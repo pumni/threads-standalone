@@ -28,10 +28,11 @@ from threads_platform.standalone import recruitment_job_store as _store_fs
 from threads_platform.standalone.browser_nurture_state import (
     MAX_CHECKPOINT_COUNTER,
     MAX_SEEN_POST_FINGERPRINTS,
-    BrowserNurtureCheckpointV1,
+    BrowserNurtureCheckpointV2,
     BrowserNurtureConfigV1,
     BrowserNurtureStateError,
     BrowserNurtureStateStore,
+    browser_nurture_policy_fingerprint,
     validate_browser_nurture_config,
 )
 from threads_platform.standalone.nurture_policy import (
@@ -334,7 +335,10 @@ class BrowserNurtureRunner:
                     or (continuous and active_idle_seconds == 0 and max_cycles is None)
                 ):
                     raise BrowserNurtureError("RUN_POLICY_INVALID")
-                checkpoint = self._state.load_checkpoint(lease.account.id)
+                checkpoint = self._state.load_checkpoint(
+                    lease.account.id,
+                    policy_fingerprint=browser_nurture_policy_fingerprint(config),
+                )
                 run_counts = _RunCounts()
                 await lease.start()
                 session = _leased_nurture_session(lease)
@@ -387,7 +391,7 @@ class BrowserNurtureRunner:
                                 checkpoint,
                                 session_open_count,
                             )
-                    checkpoint = self._commit_cycle(checkpoint, cycle)
+                    checkpoint = self._commit_cycle(checkpoint, cycle, len(config.topics))
                     run_counts.add(cycle)
                     attempt_count += 1
                     if max_cycles is not None and attempt_count >= max_cycles:
@@ -427,7 +431,7 @@ class BrowserNurtureRunner:
         session: BrowserNurtureUiSession,
         config: BrowserNurtureConfigV1,
         fixture: SyntheticBrowserNurtureFixtureV1,
-        checkpoint: BrowserNurtureCheckpointV1,
+        checkpoint: BrowserNurtureCheckpointV2,
     ) -> BrowserNurtureCycleMetrics:
         try:
             async with asyncio.timeout(MAX_NURTURE_CYCLE_SECONDS):
@@ -443,7 +447,9 @@ class BrowserNurtureRunner:
                 feed_candidates = 0
                 scrolls = 0
                 topic_queries = 0
-                for topic in config.topics:
+                topic_start = checkpoint.next_topic_index % len(config.topics)
+                ordered_topics = config.topics[topic_start:] + config.topics[:topic_start]
+                for topic in ordered_topics:
                     batches = await session.search_ui_feed(
                         topic,
                         expected_actor=config.expected_username,
@@ -510,13 +516,14 @@ class BrowserNurtureRunner:
 
     def _commit_cycle(
         self,
-        checkpoint: BrowserNurtureCheckpointV1,
+        checkpoint: BrowserNurtureCheckpointV2,
         metrics: BrowserNurtureCycleMetrics,
-    ) -> BrowserNurtureCheckpointV1:
+        topic_count: int,
+    ) -> BrowserNurtureCheckpointV2:
         seen = tuple(dict.fromkeys((*checkpoint.seen_fingerprints, *metrics.fingerprints)))[
             -MAX_SEEN_POST_FINGERPRINTS:
         ]
-        updated = BrowserNurtureCheckpointV1(
+        updated = BrowserNurtureCheckpointV2(
             account_uuid=checkpoint.account_uuid,
             completed_cycles=_add_counter(checkpoint.completed_cycles, 1),
             scanned=_add_counter(checkpoint.scanned, metrics.scanned),
@@ -525,6 +532,8 @@ class BrowserNurtureRunner:
             unknown=_add_counter(checkpoint.unknown, metrics.unknown),
             duplicates=_add_counter(checkpoint.duplicates, metrics.duplicates),
             scrolls=_add_counter(checkpoint.scrolls, metrics.scrolls),
+            policy_fingerprint=checkpoint.policy_fingerprint,
+            next_topic_index=(checkpoint.next_topic_index + 1) % topic_count,
             seen_fingerprints=seen,
             crash_recovery_pending=False,
         )
@@ -619,7 +628,7 @@ def _run_result(
     status: BrowserNurtureStatus,
     reason_code: str | None,
     counts: _RunCounts,
-    checkpoint: BrowserNurtureCheckpointV1,
+    checkpoint: BrowserNurtureCheckpointV2,
     sessions_opened: int,
 ) -> BrowserNurtureRunResult:
     return BrowserNurtureRunResult(

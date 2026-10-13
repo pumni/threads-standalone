@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlencode
+from uuid import UUID
 
 import pytest
 from playwright.sync_api import Error as PlaywrightError
@@ -34,7 +35,9 @@ from threads_platform.standalone.browser_nurture import (
     SyntheticBrowserNurtureFixtureV1,
 )
 from threads_platform.standalone.browser_nurture_state import (
+    BrowserNurtureCheckpointV1,
     BrowserNurtureStateStore,
+    validate_browser_nurture_checkpoint,
     validate_browser_nurture_config,
 )
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
@@ -49,6 +52,34 @@ _BODIES = {
     "003": "A synthetic engineering post with details hidden below.",
     "004": "A synthetic senior engineer is mentoring new makers.",
 }
+
+
+def test_browser_nurture_checkpoint_v1_contract_is_preserved() -> None:
+    checkpoint = BrowserNurtureCheckpointV1(
+        account_uuid=UUID("00000000-0000-4000-8000-000000000001"),
+        completed_cycles=1,
+        scanned=1,
+        relevant=1,
+        seen_fingerprints=("0" * 64,),
+    )
+
+    document = checkpoint.to_document()
+
+    assert set(document) == {
+        "schema_version",
+        "account_uuid",
+        "completed_cycles",
+        "scanned",
+        "relevant",
+        "irrelevant",
+        "unknown",
+        "duplicates",
+        "scrolls",
+        "seen_fingerprints",
+        "crash_recovery_pending",
+    }
+    assert document["schema_version"] == 1
+    assert validate_browser_nurture_checkpoint(document).to_document() == document
 
 
 def _secure_directory(path: Path) -> None:
@@ -79,12 +110,20 @@ def _threads_local_executable() -> str:
 
 
 def _require_local_chromium() -> None:
+    hosted = (
+        os.environ.get("CI", "").casefold() == "true"
+        or os.environ.get("THREADS_STANDALONE_WHEEL_SMOKE") == "1"
+    )
     with sync_playwright() as playwright:
         if not Path(playwright.chromium.executable_path).is_file():
+            if hosted:
+                pytest.fail("Playwright Chromium is required for the offline Nurture E2E")
             pytest.skip("Playwright Chromium is not installed")
         try:
             browser = playwright.chromium.launch(headless=True)
         except PlaywrightError:
+            if hosted:
+                pytest.fail("Playwright Chromium must launch for the offline Nurture E2E")
             pytest.skip("Playwright Chromium cannot launch in this environment")
         browser.close()
 
@@ -128,13 +167,19 @@ def _detail(post_id: str) -> str:
     )
 
 
-def _fixture_document(*, actor: str = _ACTOR, scenario: str | None = None) -> dict[str, object]:
+def _fixture_document(
+    *,
+    actor: str = _ACTOR,
+    scenario: str | None = None,
+    topic_posts: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, object]:
     pages: list[dict[str, str]] = [
         {"url": f"{_ORIGIN}/", "html": _shell(actor, "<main><p>synthetic home</p></main>")}
     ]
     for topic in _TOPICS:
         query_url = f"{_ORIGIN}/search?{urlencode({'q': topic})}"
-        cards = "".join(_card(post_id) for post_id in _BODIES)
+        post_ids = tuple(_BODIES) if topic_posts is None else topic_posts[topic]
+        cards = "".join(_card(post_id) for post_id in post_ids)
         feed_html = _shell(
             _ACTOR,
             '<main><form role="search"><input type="search" value="'
@@ -209,7 +254,13 @@ def _run_cli(
     )
 
 
-def _create_account_and_config(fixtures: Path, root: Path) -> LocalAccount:
+def _create_account_and_config(
+    fixtures: Path,
+    root: Path,
+    *,
+    max_posts_per_cycle: int = 10,
+    relevance_terms: tuple[str, ...] = ("engineer",),
+) -> LocalAccount:
     added = _run_cli(("account", "add", _ACCOUNT), cwd=fixtures, root=root)
     assert added.returncode == 0, added.stdout + added.stderr
     accounts = LocalAccountStore(root)
@@ -218,22 +269,20 @@ def _create_account_and_config(fixtures: Path, root: Path) -> LocalAccount:
     profile_directory.mkdir(parents=True, mode=0o700)
     if os.name != "nt":
         os.chmod(profile_directory, 0o700)
+    config_args = [
+        "browser-nurture",
+        "configure",
+        _ACCOUNT,
+        "--expected-username",
+        _ACTOR,
+    ]
+    for topic in _TOPICS:
+        config_args.extend(("--topic", topic))
+    for term in relevance_terms:
+        config_args.extend(("--relevance-term", term))
+    config_args.extend(("--max-posts-per-cycle", str(max_posts_per_cycle)))
     configured = _run_cli(
-        (
-            "browser-nurture",
-            "configure",
-            _ACCOUNT,
-            "--expected-username",
-            _ACTOR,
-            "--topic",
-            _TOPICS[0],
-            "--topic",
-            _TOPICS[1],
-            "--relevance-term",
-            "engineer",
-            "--max-posts-per-cycle",
-            "10",
-        ),
+        tuple(config_args),
         cwd=fixtures,
         root=root,
     )
@@ -280,7 +329,7 @@ def test_installed_cli_runs_two_offline_cycles_and_resumes_checkpoint(tmp_path: 
         for secret in (_ACCOUNT, _ACTOR, _BODIES["001"], _target("001"), _ORIGIN)
     )
 
-    checkpoint_path = root / "browser_nurture_v1" / "checkpoints" / f"{account.id}.json"
+    checkpoint_path = root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json"
     checkpoint_bytes = checkpoint_path.read_bytes()
     checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
     assert checkpoint["completed_cycles"] == 2
@@ -314,6 +363,106 @@ def test_installed_cli_runs_two_offline_cycles_and_resumes_checkpoint(tmp_path: 
     assert "cycles=1" in replay.stdout
     assert "scanned=0" in replay.stdout
     assert "checkpoint_cycles=3" in replay.stdout
+
+
+def test_installed_cli_rotates_topic_selection_when_cycle_cap_is_one(tmp_path: Path) -> None:
+    _require_local_chromium()
+    fixtures, root = _case_dirs(tmp_path, "topic-rotation")
+    account = _create_account_and_config(fixtures, root, max_posts_per_cycle=1)
+    fixture_path = _write_fixture(
+        fixtures,
+        _fixture_document(topic_posts={"design": ("001",), "engineering": ("002",)}),
+    )
+
+    result = _run_cli(
+        (
+            "browser-nurture",
+            "run",
+            _ACCOUNT,
+            "--source",
+            "ui-fixture",
+            "--fixture-file",
+            os.fspath(fixture_path),
+            "--data-root",
+            os.fspath(root),
+            "--continuous",
+            "--max-cycles",
+            "2",
+            "--idle-seconds",
+            "0",
+        ),
+        cwd=fixtures,
+        root=root,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "cycles=2" in result.stdout
+    assert "scanned=2 relevant=1 irrelevant=1 unknown=0" in result.stdout
+    checkpoint_path = root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json"
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["next_topic_index"] == 0
+    assert len(checkpoint["seen_fingerprints"]) == 2
+
+
+def test_installed_cli_starts_new_policy_epoch_after_configuration_change(tmp_path: Path) -> None:
+    _require_local_chromium()
+    fixtures, root = _case_dirs(tmp_path, "policy-change")
+    account = _create_account_and_config(fixtures, root, max_posts_per_cycle=1)
+    fixture_path = _write_fixture(fixtures, _fixture_document())
+    run_args = (
+        "browser-nurture",
+        "run",
+        _ACCOUNT,
+        "--source",
+        "ui-fixture",
+        "--fixture-file",
+        os.fspath(fixture_path),
+        "--data-root",
+        os.fspath(root),
+        "--max-cycles",
+        "1",
+        "--idle-seconds",
+        "0",
+    )
+
+    first = _run_cli(run_args, cwd=fixtures, root=root)
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "scanned=1 relevant=1 irrelevant=0 unknown=0" in first.stdout
+
+    reconfigured = _run_cli(
+        (
+            "browser-nurture",
+            "configure",
+            _ACCOUNT,
+            "--expected-username",
+            _ACTOR,
+            "--topic",
+            _TOPICS[1],
+            "--topic",
+            _TOPICS[0],
+            "--relevance-term",
+            "garden",
+            "--max-posts-per-cycle",
+            "1",
+        ),
+        cwd=fixtures,
+        root=root,
+    )
+    assert reconfigured.returncode == 0, reconfigured.stdout + reconfigured.stderr
+
+    second = _run_cli(run_args, cwd=fixtures, root=root)
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "scanned=1 relevant=0 irrelevant=1 unknown=0" in second.stdout
+    assert "duplicates=1" in second.stdout
+    assert "checkpoint_cycles=1" in second.stdout
+
+    checkpoint_path = root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json"
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["completed_cycles"] == 1
+    assert checkpoint["scanned"] == 1
+    assert checkpoint["relevant"] == 0
+    assert checkpoint["irrelevant"] == 1
+    assert len(checkpoint["seen_fingerprints"]) == 1
 
 
 @pytest.mark.parametrize(
@@ -356,7 +505,7 @@ def test_installed_cli_stops_before_committing_unsafe_ui_state(
     assert result.returncode == 1
     assert f"ERROR {error_code}" in result.stderr
     assert "threads.example.invalid" not in result.stdout + result.stderr
-    assert not (root / "browser_nurture_v1" / "checkpoints" / f"{account.id}.json").exists()
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
 
 
 def test_browser_source_gate_and_installed_cli_help_are_explicit(tmp_path: Path) -> None:
@@ -521,6 +670,42 @@ def _runner_case(
     fixture = SyntheticBrowserNurtureFixtureV1(pages=pages)
     runner = BrowserNurtureRunner(LocalRuntime(root, accounts, engine), state)
     return account, runner, state, fixture
+
+
+def test_runner_leaves_v1_checkpoint_untouched_when_starting_v2_state(tmp_path: Path) -> None:
+    engine = _FakeNurtureEngine(frozenset())
+    account, runner, state, fixture = _runner_case(tmp_path, engine)
+    legacy_directory = tmp_path / "runner-root" / "browser_nurture_v1" / "checkpoints"
+    legacy_directory.mkdir(mode=0o700)
+    legacy_path = legacy_directory / f"{account.id}.json"
+    legacy = BrowserNurtureCheckpointV1(
+        account_uuid=account.id,
+        completed_cycles=7,
+        scanned=11,
+        relevant=5,
+        seen_fingerprints=("f" * 64,),
+    )
+    legacy_bytes = (
+        json.dumps(
+            legacy.to_document(),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("ascii")
+    legacy_path.write_bytes(legacy_bytes)
+
+    result = asyncio.run(runner.run(account.alias, fixture, max_cycles=1))
+
+    assert result.scanned == 1
+    assert result.checkpoint_cycles == 1
+    assert legacy_path.read_bytes() == legacy_bytes
+    v2_checkpoint = state.load_checkpoint(account.id)
+    assert v2_checkpoint.schema_version == 2
+    assert v2_checkpoint.scanned == 1
+    assert v2_checkpoint.completed_cycles == 1
 
 
 def test_runner_restarts_once_after_browser_crash_without_committing_partial_cycle(
