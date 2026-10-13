@@ -22,6 +22,7 @@ from threads_platform.standalone.recruitment_job_store import RecruitmentJobStor
 
 CONFIG_MAX_BYTES = 16 * 1024
 CHECKPOINT_MAX_BYTES = 512 * 1024
+CONTINUOUS_OPT_IN_MAX_BYTES = 4 * 1024
 MAX_NURTURE_TOPICS = 5
 MAX_NURTURE_RELEVANCE_TERMS = 32
 MAX_NURTURE_POSTS_PER_CYCLE = 20
@@ -31,6 +32,7 @@ MAX_CHECKPOINT_COUNTER = 1_000_000_000_000
 
 _NAMESPACE = "browser_nurture_v1"
 _CHECKPOINT_NAMESPACE = "browser_nurture_v2"
+_CONTINUOUS_OPT_IN_DIRECTORY = "continuous_opt_in"
 _ACCOUNT_HANDLE = re.compile(r"[A-Za-z0-9._]{1,30}\Z")
 _SAFE_TOPIC_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -61,6 +63,9 @@ _CHECKPOINT_KEYS = frozenset(
     }
 )
 _CHECKPOINT_V2_KEYS = _CHECKPOINT_KEYS | frozenset({"policy_fingerprint", "next_topic_index"})
+_CONTINUOUS_OPT_IN_KEYS = frozenset(
+    {"schema_version", "account_uuid", "policy_fingerprint", "continuous_enabled"}
+)
 
 
 class BrowserNurtureStateError(Exception):
@@ -74,6 +79,7 @@ class BrowserNurtureStateError(Exception):
             "STATE_UNSAFE",
             "STATE_WRITE_FAILED",
             "CRASH_RECOVERY_EXHAUSTED",
+            "CONTINUOUS_OPT_IN_INVALID",
         }:
             raise ValueError("unsupported Browser Nurture state error")
         self.code = code
@@ -194,6 +200,28 @@ class BrowserNurtureCheckpointV2:
             "next_topic_index": self.next_topic_index,
             "seen_fingerprints": list(self.seen_fingerprints),
             "crash_recovery_pending": self.crash_recovery_pending,
+        }
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class BrowserNurtureContinuousOptInV1:
+    account_uuid: UUID
+    policy_fingerprint: str = field(repr=False)
+    continuous_enabled: bool = True
+    schema_version: int = 1
+
+    def __repr__(self) -> str:
+        return (
+            "BrowserNurtureContinuousOptInV1("
+            f"account=<redacted>, continuous_enabled={self.continuous_enabled})"
+        )
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "account_uuid": str(self.account_uuid),
+            "policy_fingerprint": self.policy_fingerprint,
+            "continuous_enabled": self.continuous_enabled,
         }
 
 
@@ -391,6 +419,37 @@ def validate_browser_nurture_checkpoint_v2(value: object) -> BrowserNurtureCheck
     )
 
 
+def validate_browser_nurture_continuous_opt_in_v1(
+    value: object,
+) -> BrowserNurtureContinuousOptInV1:
+    if type(value) is not dict:
+        raise BrowserNurtureStateError("CONTINUOUS_OPT_IN_INVALID")
+    document = cast(dict[str, object], value)
+    if frozenset(document) != _CONTINUOUS_OPT_IN_KEYS:
+        raise BrowserNurtureStateError("CONTINUOUS_OPT_IN_INVALID")
+    try:
+        account_uuid = UUID(_required_string(document["account_uuid"]))
+    except TypeError, ValueError, AttributeError:
+        raise BrowserNurtureStateError("CONTINUOUS_OPT_IN_INVALID") from None
+    version = document["schema_version"]
+    policy_fingerprint = document["policy_fingerprint"]
+    enabled = document["continuous_enabled"]
+    if (
+        type(version) is not int
+        or version != 1
+        or not isinstance(policy_fingerprint, str)
+        or _SHA256.fullmatch(policy_fingerprint) is None
+        or type(enabled) is not bool
+    ):
+        raise BrowserNurtureStateError("CONTINUOUS_OPT_IN_INVALID")
+    return BrowserNurtureContinuousOptInV1(
+        account_uuid=account_uuid,
+        policy_fingerprint=policy_fingerprint,
+        continuous_enabled=enabled,
+        schema_version=version,
+    )
+
+
 class BrowserNurtureStateStore:
     """Store private versioned Browser Nurture configuration and checkpoint files."""
 
@@ -448,6 +507,55 @@ class BrowserNurtureStateStore:
         path, directory = self._file_path(validated.account_uuid, "checkpoints")
         self._write(path, directory, validated.to_document(), CHECKPOINT_MAX_BYTES)
 
+    def continuous_opt_in_enabled(
+        self,
+        account_uuid: UUID,
+        *,
+        policy_fingerprint: str,
+    ) -> bool:
+        if _SHA256.fullmatch(policy_fingerprint) is None:
+            raise BrowserNurtureStateError("CONTINUOUS_OPT_IN_INVALID")
+        path, directory = self._file_path(account_uuid, "continuous_opt_in")
+        document = self._read(path, directory, CONTINUOUS_OPT_IN_MAX_BYTES)
+        if document is None:
+            return False
+        opt_in = validate_browser_nurture_continuous_opt_in_v1(document)
+        if opt_in.account_uuid != account_uuid:
+            raise BrowserNurtureStateError("CONTINUOUS_OPT_IN_INVALID")
+        return opt_in.continuous_enabled and opt_in.policy_fingerprint == policy_fingerprint
+
+    def set_continuous_opt_in(
+        self,
+        account_uuid: UUID,
+        *,
+        policy_fingerprint: str,
+        enabled: bool,
+    ) -> None:
+        if _SHA256.fullmatch(policy_fingerprint) is None or type(enabled) is not bool:
+            raise BrowserNurtureStateError("CONTINUOUS_OPT_IN_INVALID")
+        opt_in = BrowserNurtureContinuousOptInV1(
+            account_uuid=account_uuid,
+            policy_fingerprint=policy_fingerprint,
+            continuous_enabled=enabled,
+        )
+        validated = validate_browser_nurture_continuous_opt_in_v1(opt_in.to_document())
+        path, directory = self._file_path(account_uuid, "continuous_opt_in")
+        self._write(path, directory, validated.to_document(), CONTINUOUS_OPT_IN_MAX_BYTES)
+
+    def disable_continuous_opt_in(self, account_uuid: UUID) -> None:
+        path, directory = self._file_path(account_uuid, "continuous_opt_in")
+        document = self._read(path, directory, CONTINUOUS_OPT_IN_MAX_BYTES)
+        if document is None:
+            return
+        opt_in = validate_browser_nurture_continuous_opt_in_v1(document)
+        if opt_in.account_uuid != account_uuid:
+            raise BrowserNurtureStateError("CONTINUOUS_OPT_IN_INVALID")
+        self.set_continuous_opt_in(
+            account_uuid,
+            policy_fingerprint=opt_in.policy_fingerprint,
+            enabled=False,
+        )
+
     def mark_crash_recovery(
         self, checkpoint: BrowserNurtureCheckpointV2
     ) -> BrowserNurtureCheckpointV2:
@@ -471,13 +579,19 @@ class BrowserNurtureStateStore:
         return updated
 
     def _file_path(self, account_uuid: UUID, directory_name: str) -> tuple[Path, Path]:
-        configs, checkpoints = self._directories()
-        directory = configs if directory_name == "config" else checkpoints
+        configs, checkpoints, continuous_opt_ins = self._directories()
+        directory = {
+            "config": configs,
+            "checkpoints": checkpoints,
+            "continuous_opt_in": continuous_opt_ins,
+        }.get(directory_name)
+        if directory is None:
+            raise BrowserNurtureStateError("STATE_UNSAFE")
         path = directory / f"{account_uuid}.json"
         _store_fs._require_parented_child(path, directory)
         return path, directory
 
-    def _directories(self) -> tuple[Path, Path]:
+    def _directories(self) -> tuple[Path, Path, Path]:
         try:
             _store_fs._validate_path_components(self._root)
             info = self._root.lstat()
@@ -511,7 +625,14 @@ class BrowserNurtureStateStore:
                 _store_fs._secure_directory(checkpoints, configure_windows_acl=True)
             else:
                 _store_fs._verify_private_directory(checkpoints)
-            return config, checkpoints
+            continuous_opt_ins, continuous_created = _store_fs._ensure_directory(
+                checkpoint_namespace, _CONTINUOUS_OPT_IN_DIRECTORY
+            )
+            if continuous_created:
+                _store_fs._secure_directory(continuous_opt_ins, configure_windows_acl=True)
+            else:
+                _store_fs._verify_private_directory(continuous_opt_ins)
+            return config, checkpoints, continuous_opt_ins
         except BrowserNurtureStateError:
             raise
         except RecruitmentJobStoreError:

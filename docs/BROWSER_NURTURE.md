@@ -1,26 +1,26 @@
 # Browser Nurture operator notes
 
-Browser Nurture is a read-only, account-scoped browser workflow. It uses the registered account UUID, its existing Chromium profile, and the same account lock as one-shot browser commands. It does not use the official Threads API or the API Nurture runner.
+Browser Nurture is a read-only, account-scoped workflow. It uses the registered account UUID, its existing Chromium profile, the shared account lock, and the visible UI reader. It does not use the official Threads API or the API Nurture runner.
 
-## Current source gate
+## Status and boundaries
 
-The live `browser` source remains `DISABLED_PERMISSION_PENDING`. Running it exits before reading the data root, opening a profile, or navigating. Synthetic Chromium tests do not enable live account access. Keep this gate in place until the repository's separate platform-permission and operator-UAT prerequisites are met.
+The live `browser` source is implemented and has offline Chromium routing coverage. Private Windows live UAT has **not** been performed or verified. Synthetic CI results do not establish current Threads UI compatibility.
 
-The `ui-fixture` source is for offline development and CI. It accepts only a private fixture with the reserved `threads.example.invalid` origin, a synthetic account, and a synthetic expected username. The browser fulfills exact fixture pages locally and blocks unmapped requests. Do not place real account data, cookies, post text, contact details, or real URLs in a fixture.
+The `browser` source requires an explicit source selection and a headed interactive one-shot confirmation. It reads only visible UI and stops on an account mismatch, login wall, challenge, rate limit, redirect, selector drift, timeout, or browser crash. The CLI does not expose likes, follows, replies, posts, or other engagement actions.
 
-## Capability and measurement boundary
+The `ui-fixture` source is for offline development and CI. It accepts only a private fixture with the reserved `threads.example.invalid` origin, a synthetic account, and a synthetic expected username. It fulfills exact fixture pages locally and blocks unmapped requests. Do not put real account data, cookies, post text, contact details, or real URLs in fixtures.
 
-This feature is **SOURCE_READY**. Its required hosted acceptance is **OFFLINE_SYNTHETIC_E2E_VERIFIED** only when the Chromium-backed CLI tests pass in CI. Those tests do not access real Threads accounts or establish current Threads UI compatibility. The live source remains disabled, so this is not an available real-account or 24/7 nurture workflow.
+Topic-search metrics describe only visible posts returned by configured searches. They are labeled `search_*` in CLI output. They do not measure the home or For You recommendation feed and cannot establish that a recommendation changed.
 
-Relevance counts describe only visible posts returned by the configured topic searches. Browser Nurture does not sample the home or For You recommendation feed, so these counts are not a recommendation-feed baseline.
+For a manual before/after feed sample, use the same account and device and sample the first 20 visible posts from the same Home or For You tab at the same local time on three days before and three days after the observation period. Do not click, like, follow, reply, or open posts during the sample. Privately tally relevant, irrelevant, and unknown counts using the configured topics; retain aggregate counts and dates only, without post text, URLs, or actor details. Compare the six samples descriptively and do not attribute a difference to Nurture alone.
 
-## Configure and run
+## Configure and run one supervised cycle
 
-Configure a registered account with an expected UI username, one or more search topics, relevance terms, and a per-cycle post limit:
+Configure the registered account alias, the expected username visible in the account banner, one or more search topics, relevance terms, a post bound, and an idle interval:
 
 ```powershell
 threads-local browser-nurture configure <alias> `
-  --expected-username <username> `
+  --expected-username <expected-username> `
   --topic <topic> `
   --topic <another-topic> `
   --relevance-term <term> `
@@ -28,60 +28,78 @@ threads-local browser-nurture configure <alias> `
   --idle-seconds 900
 ```
 
-The expected username is checked against the visible signed-in account banner. The local alias is only used to find the account UUID and profile; it is not identity evidence.
+Use the existing manually logged-in UUID profile for that alias. Do not copy the profile or paste cookies or tokens. The alias selects the local profile; only the visible UI actor check proves the signed-in account matches `--expected-username`.
 
-The default one-shot command is:
+Run one headed cycle from an interactive PowerShell console:
 
 ```powershell
-threads-local browser-nurture run <alias>
+threads-local browser-nurture run <alias> `
+  --source browser `
+  --confirm-live-read-only `
+  --max-cycles 1
 ```
 
-It currently returns the live-source disabled status without starting a browser. For a private synthetic fixture, use the explicit source and a fresh temporary data root:
+The live source uses the configured data root and does not accept `--data-root` or `--fixture-file`. It requires both interactive input and output, so it cannot be started accidentally from a scheduled or redirected one-shot command. The browser window remains visible. The runner verifies the account banner before searching, reads a bounded number of visible search cards, opens only exact same-origin post pages, classifies full visible post text, and commits the checkpoint after the complete cycle.
+
+Output contains safe status codes and aggregate counts such as `search_scanned` and `search_relevant`; it does not print post text, URLs, or account identifiers.
+
+## Private Windows UAT checklist
+
+Run this locally with the operator-selected account and the limits in its private configuration. Do not paste output that contains private paths or account evidence into GitHub.
+
+1. Run the one-shot command above. Confirm the visible banner shows the configured username. Let the bounded cycle complete and privately record its status, aggregate search counts, and `checkpoint_cycles=1`.
+2. Repeat the same one-shot command. Confirm the checkpoint resumes and previously read posts are deduplicated (`search_scanned` should be zero when the same results remain visible).
+3. To verify account mismatch handling, temporarily configure a deliberately different expected username, then run one supervised cycle. Confirm it stops with `BROWSER_SESSION_MISMATCH` before issuing a topic search. Restore the correct username afterward; changing configuration resets the policy-bound checkpoint epoch.
+4. Press Ctrl+C during a continuous foreground run. The current bounded cycle may finish and commit; the runner then reports `STOPPED`. Restart one-shot and confirm committed posts are not replayed.
+5. Redact the alias, expected username, local paths, screenshots, URLs, post text, and all profile evidence before sharing. Share only the status code and aggregate counts.
+
+This checklist is an operator action. Source code and offline E2E tests do not mark private UAT complete.
+
+## Continuous mode and rollback
+
+After a successful supervised live cycle, review the visible account and aggregate result. From the same interactive user session, explicitly enable continuous operation for that account and current observation policy:
 
 ```powershell
-threads-local browser-nurture run <synthetic-alias> `
-  --source ui-fixture `
-  --fixture-file <synthetic-fixture.json> `
-  --data-root <fresh-private-root> `
-  --max-cycles 2
+threads-local browser-nurture enable-continuous <alias> `
+  --confirm-supervised-read-only
 ```
 
-Foreground continuous mode uses the configured idle interval. `--max-cycles` can cap an invocation for a bounded run:
+This command requires an interactive console and a completed live checkpoint. The private, versioned opt-in is bound to the account UUID and current policy fingerprint. Changing topics, relevance terms, expected username, or the per-cycle post limit invalidates that opt-in. Stop an active foreground run with Ctrl+C first, then disable permission for later starts with:
 
 ```powershell
-threads-local browser-nurture run <synthetic-alias> `
-  --source ui-fixture `
-  --fixture-file <synthetic-fixture.json> `
-  --data-root <fresh-private-root> `
+threads-local browser-nurture disable-continuous <alias>
+```
+
+Run continuous mode in the foreground with an explicit source and bounded work cycles between idle periods:
+
+```powershell
+threads-local browser-nurture run <alias> `
+  --source browser `
   --continuous `
-  --max-cycles 5 `
   --idle-seconds 900
 ```
 
-Use Ctrl+C to stop a foreground run. The current cycle is committed only after its bounded reads finish; earlier committed cycles remain resumable. Browser process recovery is limited to one restart per invocation. A second crash stops the run and leaves the pending recovery marker for the next invocation. The runner never likes, follows, replies, posts, or catches up by replaying a completed cycle.
+`--max-cycles` can cap an invocation to at most five cycles. Each cycle is bounded to 180 seconds and at most 100 visible search candidates. Ctrl+C requests a safe stop after the active cycle reaches its commit boundary. A committed cycle is checkpointed once; an incomplete cycle is not committed. The runner attempts at most one browser restart per invocation. A later invocation reuses the same UUID profile and checkpoint. The account lock excludes another Nurture process and existing one-shot browser commands.
 
-## Private state and output
-
-Configuration and checkpoint files are stored under the selected `THREADS_LOCAL_DATA_ROOT` (or the existing default root):
+Configuration and private state are stored under the selected `THREADS_LOCAL_DATA_ROOT` (or the existing default root):
 
 - `browser_nurture_v1/config/<account-uuid>.json`
 - `browser_nurture_v2/checkpoints/<account-uuid>.json`
+- `browser_nurture_v2/continuous_opt_in/<account-uuid>.json`
 
-The versioned config contains the expected username, topics, relevance terms, work bound, and idle interval. The v2 checkpoint binds its counters and SHA-256 dedupe fingerprints to a fingerprint of the expected username, ordered topics, relevance terms, and per-cycle post limit. Changing that observation policy starts a new checkpoint epoch, so prior URLs are re-assessed and prior counters are not mixed with new results. The first topic rotates after every committed cycle. Idle-interval changes retain the current epoch. The checkpoint does not store post text or raw post URLs. Configuration remains under `browser_nurture_v1/config`; new checkpoints are stored under `browser_nurture_v2/checkpoints`. Any existing v1 checkpoint file is left untouched and is not reused because it has no policy fingerprint. Existing account metadata, Nurture v1, browser profile, and recruitment state files are not migrated or rewritten.
-
-CLI output contains fixed status codes and aggregate counts only. Keep private configuration and local state out of repository fixtures, logs, screenshots, and public CI output.
+The configuration remains v1. The v2 checkpoint binds counters, topic rotation, and SHA-256 dedupe fingerprints to the observation policy. The separate v1 continuous opt-in stores only the account UUID, policy fingerprint, and enabled state. Existing v1 Nurture checkpoints remain untouched. Existing account metadata, browser profiles, operation journals, and recruitment state are not migrated or rewritten.
 
 ## Windows Task Scheduler
 
-Use Task Scheduler only under the same interactive Windows user that owns the local account registry and Chromium profile. The live source remains disabled until its separate gate is cleared.
+Use Task Scheduler only after the private supervised UAT and continuous opt-in above. Use the same interactive Windows user that owns the account registry and profile.
 
 1. Create a task with an **At log on** trigger for that user.
-2. Select **Run only when user is logged on**. Do not run it as `SYSTEM` or as a Windows service.
+2. Select **Run only when user is logged on**. Do not run as `SYSTEM` or as a Windows service.
 3. Add an action for the installed `threads-local.exe`. Set arguments to `browser-nurture run <alias> --source browser --continuous` and set **Start in** to the executable's installation directory.
 4. In Settings, select **If the task is already running, do not start a new instance**. The account UUID lock also excludes one-shot browser commands and other runner instances.
-5. Clear any duration limit that would forcibly terminate the process. Stop a foreground session with Ctrl+C so its active cycle can finish or cancel cleanly.
+5. Clear any duration limit that would forcibly terminate the process. Stop a foreground session with Ctrl+C so its active cycle can reach the checkpoint boundary.
 6. Under failure recovery, set **Restart every 30 minutes** and **Attempt to restart up to 1 time**. This gives a failed process one delayed retry.
 
-The idle interval is held in process memory. A process restart begins a new invocation and does not inherit time spent idle before the failure. Keep the delayed, single-retry limit as a cooldown; repeated manual or scheduled restarts are not a reason to run extra browsing cycles.
+Idle periods are held in process memory and restart from the configured interval after a process restart. Keep the delayed single-retry limit; repeated manual or scheduled restarts are not a reason to run extra browsing cycles.
 
-With the current source gate, this scheduled live command exits with `DISABLED_PERMISSION_PENDING`; it does not inspect the account or open Chromium. Do not replace it with `ui-fixture` for unattended operation. After a future gate change, verify the exact CLI help, private UAT prerequisites, and stop behavior before scheduling a live read.
+Automated Chromium tests use temporary synthetic accounts and local request interception. They do not open a real Threads profile or make a remote Threads request. Report live UI compatibility only after the private Windows UAT above.

@@ -16,7 +16,11 @@ from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import parse_qs, urlsplit
 
-from threads_platform.browser.contracts import BrowserAdapterError, BrowserProcessCrashed
+from threads_platform.browser.contracts import (
+    BROWSER_FEED_ORIGIN,
+    BrowserAdapterError,
+    BrowserProcessCrashed,
+)
 from threads_platform.browser.threads_job_ui_reader import (
     UiBodyVisibility,
     UiFeedBatch,
@@ -78,6 +82,11 @@ class BrowserNurtureStatus(StrEnum):
     COMPLETE = "COMPLETE"
     STOPPED = "STOPPED"
     FAILED = "FAILED"
+
+
+class BrowserNurtureSource(StrEnum):
+    BROWSER_UI = "browser"
+    UI_FIXTURE = "ui-fixture"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -301,33 +310,58 @@ class BrowserNurtureRunner:
     async def run(
         self,
         alias: str,
-        fixture: SyntheticBrowserNurtureFixtureV1,
+        fixture: SyntheticBrowserNurtureFixtureV1 | None = None,
         *,
+        source: BrowserNurtureSource | str | None = None,
         max_cycles: int | None = 1,
         continuous: bool = False,
         idle_seconds: int | None = None,
         stop_event: asyncio.Event | None = None,
     ) -> BrowserNurtureRunResult:
-        if type(continuous) is not bool or (not continuous and max_cycles is None):
+        try:
+            selected_source = (
+                BrowserNurtureSource(source)
+                if source is not None
+                else BrowserNurtureSource.UI_FIXTURE
+                if fixture is not None
+                else BrowserNurtureSource.BROWSER_UI
+            )
+        except TypeError, ValueError:
+            raise BrowserNurtureError("RUN_POLICY_INVALID") from None
+        if (
+            type(continuous) is not bool
+            or (not continuous and max_cycles is None)
+            or (selected_source is BrowserNurtureSource.UI_FIXTURE) != (fixture is not None)
+        ):
             raise BrowserNurtureError("RUN_POLICY_INVALID")
         if max_cycles is not None and (
             type(max_cycles) is not int or not 1 <= max_cycles <= MAX_NURTURE_CYCLES_PER_INVOCATION
         ):
             raise BrowserNurtureError("RUN_POLICY_INVALID")
         try:
-            async with self._runtime.own_browser_profile(alias, headless=True) as lease:
+            async with self._runtime.own_browser_profile(
+                alias,
+                headless=selected_source is BrowserNurtureSource.UI_FIXTURE,
+            ) as lease:
                 config = self._state.load_config(lease.account.id)
                 if config is None:
                     raise BrowserNurtureError("CONFIG_NOT_FOUND")
                 config = validate_browser_nurture_config(config.to_document())
-                if not _ACCOUNT_ALIAS.fullmatch(lease.account.alias):
-                    raise BrowserNurtureError("SYNTHETIC_ACCOUNT_REQUIRED")
-                if (
-                    fixture.schema_version != 1
-                    or fixture.origin != SYNTHETIC_NURTURE_ORIGIN
-                    or not set(config.topics).issubset(_fixture_search_queries(fixture.pages))
-                ):
-                    raise BrowserNurtureError("FIXTURE_TOPIC_PAGE_MISSING")
+                if selected_source is BrowserNurtureSource.UI_FIXTURE:
+                    if not _ACCOUNT_ALIAS.fullmatch(lease.account.alias):
+                        raise BrowserNurtureError("SYNTHETIC_ACCOUNT_REQUIRED")
+                    assert fixture is not None
+                    if (
+                        fixture.schema_version != 1
+                        or fixture.origin != SYNTHETIC_NURTURE_ORIGIN
+                        or not set(config.topics).issubset(_fixture_search_queries(fixture.pages))
+                    ):
+                        raise BrowserNurtureError("FIXTURE_TOPIC_PAGE_MISSING")
+                    origin = fixture.origin
+                else:
+                    if _ACCOUNT_ALIAS.fullmatch(lease.account.alias):
+                        raise BrowserNurtureError("LIVE_ACCOUNT_REQUIRED")
+                    origin = BROWSER_FEED_ORIGIN
                 active_idle_seconds = config.idle_seconds if idle_seconds is None else idle_seconds
                 if (
                     type(active_idle_seconds) is not int
@@ -339,10 +373,22 @@ class BrowserNurtureRunner:
                     lease.account.id,
                     policy_fingerprint=browser_nurture_policy_fingerprint(config),
                 )
+                if (
+                    continuous
+                    and selected_source is BrowserNurtureSource.BROWSER_UI
+                    and (
+                        checkpoint.completed_cycles < 1
+                        or not self._state.continuous_opt_in_enabled(
+                            lease.account.id,
+                            policy_fingerprint=checkpoint.policy_fingerprint,
+                        )
+                    )
+                ):
+                    raise BrowserNurtureError("CONTINUOUS_OPT_IN_REQUIRED")
                 run_counts = _RunCounts()
                 await lease.start()
                 session = _leased_nurture_session(lease)
-                await _prepare_session(session, fixture)
+                await _prepare_session(session, fixture, origin=origin)
                 session_open_count = lease.open_count
                 attempt_count = 0
                 crash_recoveries = 0
@@ -356,7 +402,7 @@ class BrowserNurtureRunner:
                             session_open_count,
                         )
                     try:
-                        cycle = await self._run_cycle(session, config, fixture, checkpoint)
+                        cycle = await self._run_cycle(session, config, origin, checkpoint)
                     except BrowserProcessCrashed:
                         if checkpoint.crash_recovery_pending:
                             return _run_result(
@@ -380,9 +426,9 @@ class BrowserNurtureRunner:
                         await lease.restart()
                         session_open_count = lease.open_count
                         session = _leased_nurture_session(lease)
-                        await _prepare_session(session, fixture)
+                        await _prepare_session(session, fixture, origin=origin)
                         try:
-                            cycle = await self._run_cycle(session, config, fixture, checkpoint)
+                            cycle = await self._run_cycle(session, config, origin, checkpoint)
                         except BrowserProcessCrashed:
                             return _run_result(
                                 BrowserNurtureStatus.FAILED,
@@ -394,6 +440,14 @@ class BrowserNurtureRunner:
                     checkpoint = self._commit_cycle(checkpoint, cycle, len(config.topics))
                     run_counts.add(cycle)
                     attempt_count += 1
+                    if stop_event is not None and stop_event.is_set():
+                        return _run_result(
+                            BrowserNurtureStatus.STOPPED,
+                            "STOP_REQUESTED",
+                            run_counts,
+                            checkpoint,
+                            session_open_count,
+                        )
                     if max_cycles is not None and attempt_count >= max_cycles:
                         break
                     if stop_event is not None:
@@ -430,14 +484,14 @@ class BrowserNurtureRunner:
         self,
         session: BrowserNurtureUiSession,
         config: BrowserNurtureConfigV1,
-        fixture: SyntheticBrowserNurtureFixtureV1,
+        origin: str,
         checkpoint: BrowserNurtureCheckpointV2,
     ) -> BrowserNurtureCycleMetrics:
         try:
             async with asyncio.timeout(MAX_NURTURE_CYCLE_SECONDS):
                 state = await session.verify_ui_account(
                     config.expected_username,
-                    origin=fixture.origin,
+                    origin=origin,
                 )
                 _require_ready_state(state)
                 already_seen = set(checkpoint.seen_fingerprints)
@@ -453,7 +507,7 @@ class BrowserNurtureRunner:
                     batches = await session.search_ui_feed(
                         topic,
                         expected_actor=config.expected_username,
-                        origin=fixture.origin,
+                        origin=origin,
                     )
                     topic_queries += 1
                     scrolls += _ui_reader_scroll_count(session)
@@ -482,7 +536,7 @@ class BrowserNurtureRunner:
                     detail = await session.read_exact_ui_post(
                         target.canonical_post_url,
                         expected_actor=config.expected_username,
-                        origin=fixture.origin,
+                        origin=origin,
                     )
                     _require_ready_state(detail.state)
                     if (
@@ -580,12 +634,15 @@ def _leased_nurture_session(lease: BrowserProfileLease) -> BrowserNurtureUiSessi
 
 async def _prepare_session(
     session: BrowserNurtureUiSession,
-    fixture: SyntheticBrowserNurtureFixtureV1,
+    fixture: SyntheticBrowserNurtureFixtureV1 | None,
+    *,
+    origin: str,
 ) -> None:
-    await session.install_synthetic_fixture_pages(fixture.pages, origin=fixture.origin)
+    if fixture is not None:
+        await session.install_synthetic_fixture_pages(fixture.pages, origin=fixture.origin)
     await session.navigate(
-        f"{fixture.origin}/",
-        allowed_origins=frozenset({fixture.origin}),
+        f"{origin}/",
+        allowed_origins=frozenset({origin}),
     )
 
 
