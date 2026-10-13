@@ -4,7 +4,7 @@ Local account management, official Threads API commands, bounded headed-browser 
 
 The repository contains source and synthetic examples only. Never commit tokens, cookies, browser profiles, local account files, operation or manual-outcome journals, real account identifiers, customer data, raw API data, or private review evidence.
 
-**Product and roadmap:** [Two independent operating lanes — Browser and official Threads API](docs/PRODUCT_DIRECTION.md). Browser is a durable standalone path, **not** a temporary bridge or something to retire when API permissions arrive. This is a product decision, not authorization for automated live browsing. For current implementation, read the applicable code and exact-head PRs; historical milestone sections below remain historical.
+**Product and roadmap:** [Two independent operating lanes — Browser and official Threads API](docs/PRODUCT_DIRECTION.md). The Browser lane is an independent automation tool (search/scroll/read/watch and review workflows), **not** an API fallback. Building and testing Browser functionality does not depend on Meta App Review, API token scopes, or recurring Threads Terms adjudication. Current live-browser restrictions are runtime facts, not prohibitions on writing Browser code; they can change only through a separate reviewed implementation and operator-selected UAT. No external-platform authorization is asserted. Historical milestone sections below remain historical.
 
 ## Browser-first manual workflow
 
