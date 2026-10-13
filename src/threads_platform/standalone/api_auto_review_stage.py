@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from threads_platform.locks.filesystem import FilesystemProcessLock
@@ -1317,8 +1317,8 @@ def _windows_acl_entries(path: Path) -> list[tuple[str, int, int, int]]:
         from ctypes import wintypes
     except ImportError:
         raise _StoreFault(ReviewStageReason.UNSUPPORTED_PLATFORM) from None
-    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi = _load_windows_dll("advapi32")
+    kernel = _load_windows_dll("kernel32")
     owner = ctypes.c_void_p()
     group = ctypes.c_void_p()
     dacl = ctypes.c_void_p()
@@ -1396,8 +1396,8 @@ def _windows_current_user_sid() -> str:
         from ctypes import wintypes
     except ImportError:
         raise _StoreFault(ReviewStageReason.UNSUPPORTED_PLATFORM) from None
-    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi = _load_windows_dll("advapi32")
+    kernel = _load_windows_dll("kernel32")
     token = wintypes.HANDLE()
     get_current_process = kernel.GetCurrentProcess
     get_current_process.argtypes = []
@@ -1439,6 +1439,13 @@ def _windows_current_user_sid() -> str:
         return value
     finally:
         close_handle(token)
+
+
+def _load_windows_dll(name: str) -> Any:
+    loader = cast(Callable[..., Any] | None, getattr(ctypes, "WinDLL", None))
+    if loader is None:
+        raise _StoreFault(ReviewStageReason.UNSUPPORTED_PLATFORM)
+    return loader(name, use_last_error=True)
 
 
 def _acquire_account_lock(account_dir: Path) -> FilesystemProcessLock:
