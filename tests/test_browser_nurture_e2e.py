@@ -33,7 +33,9 @@ from threads_platform.browser.threads_job_ui_reader import (
 )
 from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
 from threads_platform.standalone.browser_nurture import (
+    BrowserNurtureError,
     BrowserNurtureRunner,
+    BrowserNurtureSource,
     BrowserNurtureStatus,
     SyntheticBrowserNurtureFixtureV1,
 )
@@ -706,6 +708,50 @@ def _create_browser_source_account(root: Path, expected_actor: str) -> LocalAcco
     return account
 
 
+def test_first_live_cli_cycle_rejects_multiple_cycles_before_browser_or_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "live-first-cycle-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    state = BrowserNurtureStateStore(root)
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", os.fspath(root))
+
+    from threads_platform.standalone import __main__ as cli_module
+
+    monkeypatch.setattr(cli_module, "_browser_nurture_interactive_console", lambda: True)
+
+    def reject_if_runner_starts(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("multi-cycle one-shot reached the browser runner")
+
+    monkeypatch.setattr(cli_module, "_run_browser_nurture_with_stop", reject_if_runner_starts)
+    exit_code = cli_module.main(
+        (
+            "browser-nurture",
+            "run",
+            account.alias,
+            "--source",
+            "browser",
+            "--confirm-live-read-only",
+            "--max-cycles",
+            "2",
+        )
+    )
+
+    output = capsys.readouterr()
+    config = state.load_config(account.id)
+    assert config is not None
+    checkpoint = state.load_checkpoint(
+        account.id,
+        policy_fingerprint=browser_nurture_policy_fingerprint(config),
+    )
+    assert exit_code == 1
+    assert "ERROR RUN_POLICY_INVALID" in output.err
+    assert checkpoint.completed_cycles == 0
+
+
 def test_browser_source_runs_live_cli_path_through_offline_chromium(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -770,8 +816,6 @@ def test_browser_source_runs_live_cli_path_through_offline_chromium(
             "--continuous",
             "--max-cycles",
             "1",
-            "--idle-seconds",
-            "0",
         )
     )
     continuous_output = capsys.readouterr()
@@ -961,6 +1005,70 @@ def _runner_case(
     fixture = SyntheticBrowserNurtureFixtureV1(pages=pages)
     runner = BrowserNurtureRunner(LocalRuntime(root, accounts, engine), state)
     return account, runner, state, fixture
+
+
+def test_runner_without_source_or_fixture_does_not_start_live_browser(tmp_path: Path) -> None:
+    engine = _FakeNurtureEngine(frozenset())
+    account, runner, _state, _fixture = _runner_case(tmp_path, engine)
+
+    with pytest.raises(BrowserNurtureError) as error:
+        asyncio.run(runner.run(account.alias))
+
+    assert error.value.code == "RUN_POLICY_INVALID"
+    assert engine.sessions == []
+
+
+def test_live_runner_one_shot_rejects_multiple_cycles_before_browser_start(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "live-runner-cycle-limit-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    accounts = LocalAccountStore(root)
+    state = BrowserNurtureStateStore(root)
+    engine = _FakeNurtureEngine(frozenset())
+    runner = BrowserNurtureRunner(LocalRuntime(root, accounts, engine), state)
+
+    with pytest.raises(BrowserNurtureError) as error:
+        asyncio.run(
+            runner.run(
+                account.alias,
+                source=BrowserNurtureSource.BROWSER_UI,
+                max_cycles=2,
+            )
+        )
+
+    assert error.value.code == "RUN_POLICY_INVALID"
+    assert engine.sessions == []
+
+
+@pytest.mark.parametrize("idle_seconds", [0, 59])
+def test_live_continuous_runner_enforces_configured_cooldown_with_cycle_cap(
+    tmp_path: Path,
+    idle_seconds: int,
+) -> None:
+    root = tmp_path / f"live-cooldown-{idle_seconds}-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    accounts = LocalAccountStore(root)
+    state = BrowserNurtureStateStore(root)
+    engine = _FakeNurtureEngine(frozenset())
+    runner = BrowserNurtureRunner(LocalRuntime(root, accounts, engine), state)
+
+    with pytest.raises(BrowserNurtureError) as error:
+        asyncio.run(
+            runner.run(
+                account.alias,
+                source=BrowserNurtureSource.BROWSER_UI,
+                max_cycles=2,
+                continuous=True,
+                idle_seconds=idle_seconds,
+            )
+        )
+
+    assert error.value.code == "RUN_POLICY_INVALID"
+    assert engine.sessions == []
+    assert state.load_checkpoint(account.id).completed_cycles == 0
 
 
 def test_runner_leaves_v1_checkpoint_untouched_when_starting_v2_state(tmp_path: Path) -> None:

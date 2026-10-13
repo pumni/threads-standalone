@@ -318,19 +318,24 @@ class BrowserNurtureRunner:
         idle_seconds: int | None = None,
         stop_event: asyncio.Event | None = None,
     ) -> BrowserNurtureRunResult:
+        if source is None and fixture is None:
+            raise BrowserNurtureError("RUN_POLICY_INVALID")
         try:
             selected_source = (
                 BrowserNurtureSource(source)
                 if source is not None
                 else BrowserNurtureSource.UI_FIXTURE
-                if fixture is not None
-                else BrowserNurtureSource.BROWSER_UI
             )
         except TypeError, ValueError:
             raise BrowserNurtureError("RUN_POLICY_INVALID") from None
         if (
             type(continuous) is not bool
             or (not continuous and max_cycles is None)
+            or (
+                selected_source is BrowserNurtureSource.BROWSER_UI
+                and not continuous
+                and max_cycles != 1
+            )
             or (selected_source is BrowserNurtureSource.UI_FIXTURE) != (fixture is not None)
         ):
             raise BrowserNurtureError("RUN_POLICY_INVALID")
@@ -367,6 +372,11 @@ class BrowserNurtureRunner:
                     type(active_idle_seconds) is not int
                     or not 0 <= active_idle_seconds <= 86_400
                     or (continuous and active_idle_seconds == 0 and max_cycles is None)
+                    or (
+                        selected_source is BrowserNurtureSource.BROWSER_UI
+                        and continuous
+                        and active_idle_seconds < config.idle_seconds
+                    )
                 ):
                     raise BrowserNurtureError("RUN_POLICY_INVALID")
                 checkpoint = self._state.load_checkpoint(

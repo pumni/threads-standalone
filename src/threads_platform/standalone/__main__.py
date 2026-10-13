@@ -829,6 +829,8 @@ def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
 
     try:
         if args.source == "browser":
+            if not args.continuous and args.max_cycles not in (None, 1):
+                raise BrowserNurtureError("RUN_POLICY_INVALID")
             if args.fixture_file is not None or args.data_root is not None:
                 raise BrowserNurtureError("LIVE_DATA_ROOT_NOT_ALLOWED")
             if args.continuous:
