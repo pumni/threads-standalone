@@ -11,7 +11,7 @@ The installed command is:
 threads-local recruitment browser-watch
 ```
 
-It supports three explicit source values:
+It supports five explicit source values:
 
 - `fixture` validates a bounded UTF-8 fixture, maps it to BJ-02 fake session
   objects in memory, then calls the unchanged BJ-04A engine.
@@ -20,15 +20,25 @@ It supports three explicit source values:
   it to the same BJ-02 fake session contract, then calls the unchanged BJ-04A
   engine. It loads documents with `set_content`, disables JavaScript, blocks
   every browser request, and never navigates to the reserved post URLs.
+- `ui-fixture` launches ephemeral Chromium and exercises the B1 semantic UI
+  reader against a private local HTML manifest. It searches by the manifest's
+  query, reads visible feed cards before each bounded scroll, opens exact
+  reserved post URLs through an allowlisted local route, and maps verified
+  root-card snapshots to BJ-02's existing synthetic contract. It blocks every
+  request outside the exact fixture routes and keeps provenance
+  `SYNTHETIC_FIXTURE`.
+- `browser` is accepted so the production source has an explicit fixed
+  `DISABLED_PERMISSION_PENDING / SOURCE_DISABLED` result. The CLI returns this
+  before reading any account, path, fixture, browser profile, or operator root.
 - `manual` returns `UNKNOWN / NO_TEXT`. This initial CLI does not accept or
   open a target URL/file, parse a post, or write an archive for manual input.
 
-There is no `browser` source in this command. Actual browser reads remain
-`DISABLED_PERMISSION_PENDING` under #64 and #103. The `dom-fixture` source is
-offline test infrastructure only: it has no persistent browser profile,
-cookies, account-store, API, CRM, post, reply, like, follow, DM, or
-background-service path. Its HTML selectors describe the synthetic fixture
-contract; they do not claim compatibility with the live Threads UI.
+Actual browser reads remain disabled pending separately verified platform
+permissions and operator UAT. Both synthetic sources are offline test
+infrastructure only: they have no persistent browser profile, cookies,
+account-store, API, CRM, post, reply, like, follow, DM, or background-service
+path. Synthetic HTML selectors do not claim compatibility with the live Threads
+UI.
 
 ## Fixture schema
 
@@ -143,6 +153,78 @@ adds a private marker only to that empty directory; later resumes may reuse the
 marked root. An unmarked nonempty root or unexpected top-level file is rejected.
 Its only top-level store directories are `browser_job_watch_v1` and
 `job_vacancies_v1`.
+
+## B1 semantic Chromium fixture
+
+`ui-fixture` runs `threads_job_ui_reader.py` itself. It does not call the
+`dom-fixture` reader or reuse its `data-*` markers. The bounded manifest has
+`fixture_kind: SYNTHETIC_BROWSER_UI`, one query, exactly one watch cycle, one
+feed HTML document, and one exact detail HTML document per declared target.
+The query is limited to 120 codepoints; the whole JSON file is limited to
+1,100,000 bytes. Existing BJ-02 limits remain in force: at most five viewport
+batches, 20 visible cards per batch, 100 candidate appearances, 20 unique
+exact details, 10,000 body codepoints, and 30 seconds. Navigation and actions
+have a two-second timeout; collapsed text is never expanded.
+
+The synthetic page shell needs one visible `header[role="banner"]` profile
+link matching the suffix of the synthetic `--account` alias, one `main`, and
+for search one `form[role="search"] input[type="search"]` whose value matches
+the manifest query. A candidate is a visible top-level `article` or
+`[role="article"]`; its own header must bind one permalink and one author whose
+username matches that permalink. The exact detail must contain that same
+permalink, one matching author link, and at most one visible root body in a
+`div[dir="auto"]`. Nested cards, blockquotes, sidebars, hidden content, and
+collapsed body text are not treated as the root body. A mismatch stops the
+run. Missing text is `UNKNOWN`; visible but clipped or explicitly expandable
+text is `PARTIAL`; the reader never fills in absent text.
+
+The exact canonical manifest content is hashed into the existing checkpoint
+query identity. Reusing a run ID with a changed query, feed, or detail returns
+`CHECKPOINT_CONFLICT`; an identical completed replay does not add observations
+or vacancies. This source currently accepts one cycle per CLI invocation. Use
+the same run ID to verify restart/replay behavior.
+
+The reader's semantic selectors are an offline implementation candidate. They
+have not been verified against the live Threads UI. `BROWSER_UI` is never
+assigned to synthetic observations, and this command does not test live search,
+actor identity, session handling, platform permission, or third-party
+visibility.
+
+### PowerShell example
+
+Run this from a private fixture directory outside the checkout. It builds one
+synthetic recruiter post; only local HTML is served to Chromium.
+
+```powershell
+$private = Join-Path $env:TEMP ('threads-b1-ui-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $private | Out-Null
+$who = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$grant = '{0}:(OI)(CI)F' -f $who
+icacls $private /inheritance:r /grant:r $grant '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+$dataRoot = Join-Path $private 'synthetic-root'
+New-Item -ItemType Directory -Path $dataRoot | Out-Null
+$account = 'test-b1-demo'
+$actor = 'b1-demo'
+$query = 'synthetic recruitment roles'
+$post = 'https://threads.example.invalid/@synthetic-shop/post-001'
+$feed = "<html><body><header role='banner'><a href='/@$actor'>Account</a></header><main><form role='search'><input type='search' value='$query'></form><article style='height:900px'><header><a href='/@synthetic-shop'>@synthetic-shop</a><a href='$post'>time</a></header><div dir='auto'>Visible synthetic post</div></article></main></body></html>"
+$detail = "<html><body><header role='banner'><a href='/@$actor'>Account</a></header><main><article><header><a href='/@synthetic-shop'>@synthetic-shop</a><a href='$post'>time</a></header><div dir='auto'>Cần tuyển 02 nhân viên bán hàng tại Q.7, TP.HCM; lương 8–12 triệu/tháng.</div></article></main></body></html>"
+$manifest = @{
+  schema_version = 1
+  fixture_kind = 'SYNTHETIC_BROWSER_UI'
+  query = $query
+  cycles = @(@{ feed_html = $feed; detail_pages = @(@{ target = $post; html = $detail }) })
+}
+$fixtureFile = Join-Path $private 'ui-fixture.json'
+[IO.File]::WriteAllText($fixtureFile, ($manifest | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+threads-local recruitment browser-watch --source ui-fixture --account $account `
+  --fixture-file $fixtureFile --data-root $dataRoot --run-id b1-demo-001
+```
+
+The output contains only fixed status/reason codes and counts for batches,
+candidate appearances, unique targets, duplicates, details, scrolls, blocked
+requests, and watch/archive results. It does not print query, actor, permalink,
+body, alias, or paths. Archive provenance stays `SYNTHETIC_FIXTURE`.
 
 ## Foreground and resume behavior
 

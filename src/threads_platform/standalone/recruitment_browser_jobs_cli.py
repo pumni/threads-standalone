@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Protocol, TextIO, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from threads_platform.browser.contracts import BrowserAdapterError
 from threads_platform.browser.job_observation import (
     SYNTHETIC_ORIGIN,
     SYNTHETIC_SEARCH_URL,
@@ -55,6 +56,9 @@ from threads_platform.standalone.recruitment_job_store import (
 
 if TYPE_CHECKING:
     from threads_platform.browser.synthetic_dom_session import DomFixtureCapture
+    from threads_platform.standalone.recruitment_browser_jobs_browser_source import (
+        BrowserUiFixtureSession,
+    )
 
 DEFAULT_MAX_CYCLES = 1
 MAX_CYCLES = 5
@@ -283,6 +287,13 @@ def run_recruitment_browser_jobs_cli(
     output = stdout or sys.stdout
     errors = stderr or sys.stderr
     source = getattr(args, "source", None)
+    if source == "browser":
+        output.write(
+            "BROWSER_WATCH status=DISABLED_PERMISSION_PENDING source=BROWSER_UI "
+            "reason=SOURCE_DISABLED scanned=0 vacancy=0 duplicate=0 partial=0 "
+            "errors=0 completed_cycles=0 next_due_utc=-\n"
+        )
+        return 1
     if source == "manual":
         if any(
             getattr(args, name, None) is not None
@@ -299,10 +310,12 @@ def run_recruitment_browser_jobs_cli(
             return 1
         output.write("BROWSER_WATCH status=UNKNOWN source=MANUAL_URL reason=NO_TEXT\n")
         return 0
-    if source not in ("fixture", "dom-fixture"):
+    if source not in ("fixture", "dom-fixture", "ui-fixture"):
         errors.write("ERROR SOURCE_INVALID\n")
         return 1
     is_dom_fixture = source == "dom-fixture"
+    is_ui_fixture = source == "ui-fixture"
+    ui_session: BrowserUiFixtureSession | None = None
 
     try:
         account_alias = _required_string(args, "account", "ACCOUNT_REQUIRED")
@@ -325,6 +338,8 @@ def run_recruitment_browser_jobs_cli(
             raise BrowserJobsCliError("WATCH_POLICY_INVALID")
 
         dom_capture: DomFixtureCapture | None = None
+        ui_capture_metrics: tuple[int, int, int, int, int, int] | None = None
+        engine_cycles: tuple[SyntheticCycleInput, ...] = ()
         query = _FIXTURE_QUERY
         if is_dom_fixture:
             from threads_platform.browser.synthetic_dom_session import (
@@ -345,6 +360,37 @@ def run_recruitment_browser_jobs_cli(
                 raise BrowserJobsCliError("FIXTURE_BODY_INVALID")
             engine_cycles = dom_capture.cycles
             query = dom_capture.protocol_query
+        elif is_ui_fixture:
+            from threads_platform.standalone.recruitment_browser_jobs_browser_source import (
+                decode_ui_fixture_manifest,
+                make_ui_fixture_cycle,
+            )
+
+            ui_manifest = decode_ui_fixture_manifest(
+                _load_fixture_document(fixture_path),
+                max_cycles=max_cycles,
+                max_posts_per_cycle=max_posts,
+            )
+            query = ui_manifest.checkpoint_query
+            if len(ui_manifest.cycles[0].detail_pages) > max_posts:
+                raise BrowserJobsCliError("FIXTURE_POST_LIMIT_EXCEEDED")
+            _prepare_synthetic_root(data_root)
+            ui_session, ui_cycle = make_ui_fixture_cycle(
+                ui_manifest,
+                account_uuid=account_uuid,
+                account_alias=account_alias,
+            )
+            if ui_session.target_count > max_posts:
+                raise BrowserJobsCliError("BROWSER_POST_LIMIT_EXCEEDED")
+            engine_cycles = (ui_cycle,)
+            ui_capture_metrics = (
+                ui_session.batch_count,
+                ui_session.candidate_count,
+                ui_session.target_count,
+                ui_session.duplicate_count,
+                ui_session.scroll_count,
+                ui_session.blocked_request_count,
+            )
         else:
             fixture_cycles = _load_fixture(fixture_path)
             if len(fixture_cycles) < max_cycles:
@@ -392,12 +438,18 @@ def run_recruitment_browser_jobs_cli(
     except BrowserJobsCliError as error:
         errors.write(f"ERROR {error.code}\n")
         return 1
+    except BrowserAdapterError as error:
+        errors.write(f"ERROR {error.code}\n")
+        return 1
     except RecruitmentJobStoreError:
         errors.write("ERROR PRIVATE_PATH_UNSAFE\n")
         return 1
     except Exception:  # noqa: BLE001 - CLI boundary is deliberately redacted.
         errors.write("ERROR BROWSER_WATCH_FAILED\n")
         return 1
+    finally:
+        if ui_session is not None:
+            ui_session.close()
 
     if dom_capture is not None:
         output.write(
@@ -408,6 +460,18 @@ def run_recruitment_browser_jobs_cli(
             f"duplicates={_safe_count(dom_capture.duplicate_count)} "
             f"details={_safe_count(dom_capture.detail_count)} "
             f"blocked_requests={_safe_count(dom_capture.blocked_request_count)}\n"
+        )
+    if ui_capture_metrics is not None:
+        batches, candidates, targets, duplicates, scrolls, blocked_requests = ui_capture_metrics
+        output.write(
+            "BROWSER_UI_FIXTURE "
+            f"batches={_safe_count(batches)} "
+            f"candidates={_safe_count(candidates)} "
+            f"targets={_safe_count(targets)} "
+            f"duplicates={_safe_count(duplicates)} "
+            f"details={_safe_count(ui_session.detail_count if ui_session is not None else 0)} "
+            f"scrolls={_safe_count(scrolls)} "
+            f"blocked_requests={_safe_count(blocked_requests)}\n"
         )
     output.write(_format_result(result))
     if result.status is WatchStatus.COMPLETE:

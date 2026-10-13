@@ -799,10 +799,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     browser_watch_parser.add_argument(
         "--source",
-        choices=("fixture", "dom-fixture", "manual"),
+        choices=("fixture", "dom-fixture", "ui-fixture", "browser", "manual"),
         required=True,
         help=(
             "fixture maps synthetic JSON to BJ-02; dom-fixture renders local synthetic HTML; "
+            "ui-fixture runs the B1 semantic Chromium reader on local synthetic HTML; "
+            "browser is disabled pending verified operator permission; "
             "manual returns UNKNOWN / NO_TEXT"
         ),
     )
