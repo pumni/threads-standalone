@@ -4,6 +4,8 @@ Local account management, official Threads API commands, bounded headed-browser 
 
 The repository contains source and synthetic examples only. Never commit tokens, cookies, browser profiles, local account files, operation or manual-outcome journals, real account identifiers, customer data, raw API data, or private review evidence.
 
+**Product and roadmap:** [Two independent operating lanes — Browser and official Threads API](docs/PRODUCT_DIRECTION.md). Browser is a durable standalone path, **not** a temporary bridge or something to retire when API permissions arrive. This is a product decision, not authorization for automated live browsing. For current implementation, read the applicable code and exact-head PRs; historical milestone sections below remain historical.
+
 ## Browser-first manual workflow
 
 Micro-slices S1–S5 provide a local workflow that keeps target selection and reply decisions with an operator:
