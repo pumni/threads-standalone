@@ -9,6 +9,7 @@ import pytest
 import threads_platform.standalone.runtime as runtime_module
 from threads_platform.browser.capabilities import BrowserFeedResultV1, BrowserTargetOpenResultV1
 from threads_platform.browser.contracts import (
+    BROWSER_FEED_ORIGIN,
     BrowserAdapterError,
     BrowserEngineSession,
     BrowserLaunchRequest,
@@ -130,8 +131,13 @@ def test_login_creates_an_isolated_headed_profile_and_waits_for_operator(tmp_pat
     assert request.headless is False
     assert request.proxy_credentials is None
     assert request.profile_directory.is_dir()
+    assert engine.sessions[0].navigations == [
+        (f"{BROWSER_FEED_ORIGIN}/", frozenset({BROWSER_FEED_ORIGIN}))
+    ]
     assert len(prompts) == 1
-    assert "Log in to Threads manually" in prompts[0]
+    assert "Sign in manually if needed" in prompts[0]
+    assert "does not verify authentication" in prompts[0]
+    assert "synthetic_account" not in prompts[0]
     assert engine.sessions[0].closed
 
 
@@ -752,13 +758,14 @@ def test_browser_cli_runs_only_requested_synthetic_operations(
     assert cli.main(["feed", "synthetic_account", "--limit", "2"]) == 0
 
     output = capsys.readouterr().out
-    assert "login browser closed synthetic_account" in output
+    assert "login browser closed authentication=NOT_VERIFIED" in output
     assert "profile recognized target=/@synthetic\n" in output
     assert "thread recognized target=/@synthetic/post/fake_1\n" in output
     assert "feed count=2 truncated=true" in output
     assert "text=-" in output
     assert len(prompts) == 1
-    assert "Log in to Threads manually" in prompts[0]
+    assert "Sign in manually if needed" in prompts[0]
+    assert "does not verify authentication" in prompts[0]
     assert len(engine.requests) == 4
 
 

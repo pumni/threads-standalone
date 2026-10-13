@@ -4,9 +4,13 @@ Browser Nurture is a read-only, account-scoped workflow. It uses the registered 
 
 ## Status and boundaries
 
-The live `browser` source is implemented and has offline Chromium routing coverage. Private Windows live UAT has **not** been performed or verified. Synthetic CI results do not establish current Threads UI compatibility.
+The owner reported a private Windows UAT on the verified `main@bb415886` baseline. The existing profile, authenticated Home session, and data-root ACL were confirmed, but the one-shot run stopped with `BROWSER_SELECTOR_DRIFT` before Home had visibly finished loading. A privacy-safe aggregate inspection of that rendered Home reported `ready=complete`, `mains=0`, and `bannerLinks=0`. This confirms the previous readiness and Home selectors did not cover that observed structure.
 
-The `browser` source requires an explicit source selection and a headed interactive one-shot confirmation. It reads only visible UI and stops on an account mismatch, login wall, challenge, rate limit, redirect, selector drift, timeout, or browser crash. The CLI does not expose likes, follows, replies, posts, or other engagement actions.
+This update polls visible UI state for up to eight seconds per page operation. Home accepts one visible `main` root or one visible semantic `header` outside post cards. Its header fallback requires exactly one visible same-origin profile link with an accessible label beginning `Your profile`, `My profile`, `Your account`, or `My account`; the link must match the configured expected username. This generic semantic structure has only synthetic Chromium coverage. It is not a claim that the live Threads page uses that structure. Search and detail fallbacks remain bound to the exact visible query and exact post permalink, with unique author evidence. Stage-specific fixed errors include `HOME_UI_NOT_READY`, `HOME_ROOT_UNRECOGNIZED`, `HOME_ACTOR_UNVERIFIED`, `SEARCH_UI_NOT_READY`, `SEARCH_ROOT_UNRECOGNIZED`, `SEARCH_CARD_UNRECOGNIZED`, and `DETAIL_ROOT_UNRECOGNIZED`.
+
+The corrected reader's compatibility with the owner's live session remains **unverified** until the supervised rerun below succeeds. Synthetic CI results do not establish current Threads UI compatibility.
+
+The `browser` source requires an explicit source selection and a headed interactive one-shot confirmation. It reads only visible UI and stops on an account mismatch, login wall, challenge, rate limit, redirect, unsupported structure, timeout, or browser crash. The CLI does not expose likes, follows, replies, posts, or other engagement actions.
 
 The `ui-fixture` source is for offline development and CI. It accepts only a private fixture with the reserved `threads.example.invalid` origin, a synthetic account, and a synthetic expected username. It fulfills exact fixture pages locally and blocks unmapped requests. Do not put real account data, cookies, post text, contact details, or real URLs in fixtures.
 
@@ -30,6 +34,8 @@ threads-local browser-nurture configure <alias> `
 
 Use the existing manually logged-in UUID profile for that alias. Do not copy the profile or paste cookies or tokens. The alias selects the local profile; only the visible UI actor check proves the signed-in account matches `--expected-username`.
 
+For new profile onboarding, `threads-local account login <alias>` opens a headed browser at Threads Home and waits for manual sign-in. It never enters a password. The command ends with `authentication=NOT_VERIFIED`; use the supervised Browser Nurture run below to verify the configured actor.
+
 Run one headed cycle from an interactive PowerShell console:
 
 ```powershell
@@ -39,15 +45,66 @@ threads-local browser-nurture run <alias> `
   --max-cycles 1
 ```
 
-The live source uses the configured data root and does not accept `--data-root` or `--fixture-file`. It requires both interactive input and output, so it cannot be started accidentally from a scheduled or redirected one-shot command. The browser window remains visible. The runner verifies the account banner before searching, reads a bounded number of visible search cards, opens only exact same-origin post pages, classifies full visible post text, and commits the checkpoint after the complete cycle.
+The live source uses the configured data root and does not accept `--data-root` or `--fixture-file`. It requires both interactive input and output, so it cannot be started accidentally from a scheduled or redirected one-shot command. The browser window remains visible. The runner verifies one visible actor marker before searching, reads a bounded number of visible search cards, opens only exact same-origin post pages, classifies full visible post text, and commits the checkpoint after the complete cycle.
 
-Output contains safe status codes and aggregate counts such as `search_scanned` and `search_relevant`; it does not print post text, URLs, or account identifiers.
+Output contains safe stage codes and aggregate counts such as `search_scanned` and `search_relevant`; it does not print post text, URLs, or account identifiers. For the next private Windows UAT, run this one-shot command once. A successful output has `status=COMPLETE source=BROWSER_UI`, `cycles=1`, and `checkpoint_cycles=1`; privately confirm the visible actor and that at least one visible search post opened at its exact detail page. Do not enable continuous mode or Task Scheduler as part of this rerun.
+
+If the command stops with `HOME_ROOT_UNRECOGNIZED` or `HOME_ACTOR_UNVERIFIED`, inspect only aggregate structure in the authenticated Home tab. Open DevTools Console and run this snippet; enter the configured username only in the local prompt. The returned object contains counts only and no username, URL, text, DOM, storage, cookie, or network data:
+
+```javascript
+(() => {
+  const expected = prompt("Configured username for local matching only")?.trim();
+  const visible = (element) => {
+    if (!element || element.hidden || element.getAttribute("aria-hidden") === "true") return false;
+    let node = element;
+    while (node) {
+      const style = getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0 ||
+          node.getAttribute("aria-hidden") === "true") return false;
+      node = node.parentElement;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const inPost = (element) => element.closest('article, [role="article"]') !== null;
+  const shellHeaders = [...document.querySelectorAll("header")].filter((header) =>
+    visible(header) && !inPost(header) && !header.closest('main, [role="main"]')
+  );
+  const shellProfiles = shellHeaders.flatMap((header) =>
+    [...header.querySelectorAll("a[href]")].filter(visible).filter((anchor) => {
+      try {
+        const url = new URL(anchor.getAttribute("href"), location.href);
+        return url.origin === location.origin && !url.search && !url.hash &&
+          /^\/@[A-Za-z0-9._:-]{1,96}$/.test(url.pathname);
+      } catch { return false; }
+    })
+  );
+  const selfShellProfiles = shellProfiles.filter((anchor) =>
+    /^(your|my)\s+(profile|account)\b/i.test(anchor.getAttribute("aria-label") || "")
+  );
+  const expectedPath = expected ? `/@${expected}` : "";
+  return {
+    readyState: document.readyState,
+    visibleMainRoots: [...document.querySelectorAll("main, [role=main]")].filter(visible).length,
+    visibleBannerLinks: [...document.querySelectorAll('[role="banner"] a[href]')].filter(visible).length,
+    visibleShellHeaders: shellHeaders.length,
+    visibleShellProfileLinks: shellProfiles.length,
+    selfLabelledShellProfileLinks: selfShellProfiles.length,
+    expectedActorShellLinks: selfShellProfiles.filter((anchor) => {
+      try { return new URL(anchor.getAttribute("href"), location.href).pathname === expectedPath; }
+      catch { return false; }
+    }).length
+  };
+})();
+```
+
+Share only the stage code and these aggregate counts privately. Do not paste a screenshot, URL, profile path, actor value, post content, or raw page markup into an issue or PR. If the expected actor count is not exactly one in a recognized visible structure, the reader must continue to fail closed until a safe visible marker can be established.
 
 ## Private Windows UAT checklist
 
 Run this locally with the operator-selected account and the limits in its private configuration. Do not paste output that contains private paths or account evidence into GitHub.
 
-1. Run the one-shot command above. Confirm the visible banner shows the configured username. Let the bounded cycle complete and privately record its status, aggregate search counts, and `checkpoint_cycles=1`.
+1. Run the one-shot command above. Confirm the visible account control shows the configured username. Let the bounded cycle complete and privately record its status, aggregate search counts, and `checkpoint_cycles=1`.
 2. Repeat the same one-shot command. Confirm the checkpoint resumes and previously read posts are deduplicated (`search_scanned` should be zero when the same results remain visible).
 3. To verify account mismatch handling, temporarily configure a deliberately different expected username, then run one supervised cycle. Confirm it stops with `BROWSER_SESSION_MISMATCH` before issuing a topic search. Restore the correct username afterward; changing configuration resets the policy-bound checkpoint epoch.
 4. Press Ctrl+C during a continuous foreground run. The current bounded cycle may finish and commit; the runner then reports `STOPPED`. Restart one-shot and confirm committed posts are not replayed.
@@ -55,7 +112,9 @@ Run this locally with the operator-selected account and the limits in its privat
 
 This checklist is an operator action. Source code and offline E2E tests do not mark private UAT complete.
 
-## Continuous mode and rollback
+## Continuous mode and rollback — separate authorization required
+
+Do not enable continuous mode or Task Scheduler during the selector-drift UAT. The owner or Lead must authorize that step separately after reviewing the corrected one-shot result.
 
 After a successful supervised live cycle, review the visible account and aggregate result. From the same interactive user session, explicitly enable continuous operation for that account and current observation policy:
 

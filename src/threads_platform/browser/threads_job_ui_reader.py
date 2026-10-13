@@ -7,6 +7,7 @@ Threads compatibility has not been verified.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -34,6 +35,8 @@ _MAX_BATCHES = 5
 _MAX_CARDS_PER_BATCH = 20
 _MAX_TARGET_CODEPOINTS = 2_048
 _MAX_BODY_CODEPOINTS = 10_000
+_READINESS_TIMEOUT_MS = 8_000
+_READINESS_POLL_MS = 100
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._:-]{1,96}$")
 _POST_PATH_RE = re.compile(
     r"^/@(?P<username>[A-Za-z0-9._:-]{1,96})/"
@@ -130,34 +133,107 @@ _PAGE_STATE_SCRIPT = r"""
   const pathname = window.location.pathname;
   let state = 'READY';
   if (origin !== expectedOrigin) state = 'REDIRECTED';
-  else if (document.querySelector('iframe[title*="challenge" i], [aria-label*="captcha" i], [role="dialog"][aria-label*="challenge" i]')) {
+  else if (Array.from(document.querySelectorAll('iframe[title*="challenge" i], [aria-label*="captcha" i], [role="dialog"][aria-label*="challenge" i]')).some(visible)) {
     state = 'CHALLENGE';
-  } else if (document.querySelector('form[action*="login" i], input[type="password"]')) {
+  } else if (Array.from(document.querySelectorAll('form[action*="login" i], input[type="password"]')).some(visible)) {
     state = 'LOGIN_WALL';
-  } else if (document.querySelector('[role="alert"][aria-label*="rate" i]')) {
+  } else if (Array.from(document.querySelectorAll('[role="alert"][aria-label*="rate" i]')).some(visible)) {
     state = 'RATE_LIMITED';
   } else if (pathname !== expectedPath) state = 'REDIRECTED';
 
-  const mains = Array.from(document.querySelectorAll('main, [role="main"]'));
-  const bannerLinks = Array.from(document.querySelectorAll('header[role="banner"] a[href]'))
-    .filter(visible)
-    .map((anchor) => anchor.getAttribute('href'));
-  const searchValues = requireSearch
-    ? Array.from(document.querySelectorAll('form[role="search"] input[type="search"]'))
-        .filter(visible)
-        .map((input) => input.value)
+  const mains = Array.from(document.querySelectorAll('main, [role="main"]')).filter(visible);
+  const contentCardSelector = 'article, [role="article"]';
+  const shellHeaders = Array.from(document.querySelectorAll('header')).filter((header) =>
+    visible(header) && !header.closest(contentCardSelector) && !header.closest('main, [role="main"]')
+  );
+  const banners = Array.from(document.querySelectorAll('[role="banner"]')).filter(visible);
+  const profilePath = (anchor) => {
+    const href = anchor.getAttribute('href');
+    if (typeof href !== 'string') return null;
+    try {
+      const url = new URL(href, window.location.href);
+      return url.origin === expectedOrigin && !url.search && !url.hash &&
+        /^\/@[A-Za-z0-9._:-]{1,96}$/.test(url.pathname) ? url.pathname : null;
+    } catch (_) { return null; }
+  };
+  const linksIn = (roots) => roots.flatMap((root) =>
+    Array.from(root.querySelectorAll('a[href]')).filter(visible).map(profilePath)
+      .filter((path) => typeof path === 'string')
+  );
+  const bannerActorLinks = linksIn(banners);
+  const selfProfileLabel = (anchor) =>
+    /^(?:your|my)\s+(?:profile|account)\b/i.test(anchor.getAttribute('aria-label') || '');
+  const shellActorLinks = shellHeaders.flatMap((root) =>
+    Array.from(root.querySelectorAll('a[href]'))
+      .filter((anchor) => visible(anchor) && selfProfileLabel(anchor))
+      .map(profilePath)
+      .filter((path) => typeof path === 'string')
+  );
+  const actorLinks = bannerActorLinks.length ? bannerActorLinks : shellActorLinks;
+  const bannerLinks = bannerActorLinks;
+  const searchInputs = requireSearch
+    ? Array.from(document.querySelectorAll('form[role="search"] input[type="search"]')).filter(visible)
     : [];
-  return {state, origin, pathname, mains: mains.length, bannerLinks, searchValues};
+  const searchValues = searchInputs.map((input) => input.value);
+  const cardSelector = 'article, [role="article"]';
+  const rootCards = Array.from(document.querySelectorAll(cardSelector)).filter((card) => {
+    const parent = card.parentElement;
+    return visible(card) && (!parent || !parent.closest(cardSelector));
+  });
+  const detailRootCount = expectedPath.startsWith('/@')
+    ? rootCards.filter((card) => Array.from(card.querySelectorAll('a[href]')).some((anchor) => {
+        if (!visible(anchor)) return false;
+        try {
+          const url = new URL(anchor.getAttribute('href'), window.location.href);
+          return url.origin === expectedOrigin && !url.search && !url.hash &&
+            url.pathname === expectedPath && /\/post(?:\/|-)/.test(url.pathname);
+        } catch (_) { return false; }
+      })).length
+    : 0;
+  const visibleBodyChildCount = document.body
+    ? Array.from(document.body.children).filter(visible).length
+    : 0;
+  return {
+    state,
+    origin,
+    pathname,
+    mains: mains.length,
+    shellHeaders: shellHeaders.length,
+    banners: banners.length,
+    bannerLinks,
+    actorLinks,
+    searchValues,
+    detailRootCount,
+    visibleBodyChildCount
+  };
 }
 """
 
 _FEED_BATCH_SCRIPT = r"""
-({batchIndex, maxCards}) => {
+({batchIndex, maxCards, expectedQuery}) => {
   const mainSelector = 'main, [role="main"]';
   const cardSelector = 'article, [role="article"]';
-  const mains = Array.from(document.querySelectorAll(mainSelector));
-  if (mains.length !== 1) return {ok: false, reason: 'main'};
-  const main = mains[0];
+  const renderedInPage = (element) => {
+    if (!element || element.hidden || element.getAttribute('aria-hidden') === 'true') return false;
+    let current = element;
+    while (current) {
+      const style = window.getComputedStyle(current);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 ||
+          current.getAttribute('aria-hidden') === 'true') return false;
+      current = current.parentElement;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const mains = Array.from(document.querySelectorAll(mainSelector)).filter(renderedInPage);
+  const searchInputs = Array.from(document.querySelectorAll('form[role="search"] input[type="search"]'))
+    .filter(renderedInPage);
+  const searchRoot = mains.length === 0 && searchInputs.length === 1 &&
+    searchInputs[0].value === expectedQuery;
+  if (mains.length !== 1 && !searchRoot) return {ok: false, reason: 'root'};
+  // A body-scoped fallback is allowed only when the visible search control uniquely
+  // matches the exact query already validated against the same-origin search URL.
+  const main = mains.length === 1 ? mains[0] : document.body;
   const rendered = (element) => {
     if (!element || element.hidden || element.getAttribute('aria-hidden') === 'true') return false;
     let current = element;
@@ -240,13 +316,10 @@ _DETAIL_SCRIPT = r"""
 ({target, maxBodyCodepoints}) => {
   const mainSelector = 'main, [role="main"]';
   const cardSelector = 'article, [role="article"]';
-  const mains = Array.from(document.querySelectorAll(mainSelector));
-  if (mains.length !== 1) return {ok: false, reason: 'main'};
-  const main = mains[0];
   const visible = (element) => {
     if (!element || element.hidden || element.getAttribute('aria-hidden') === 'true') return false;
     let current = element;
-    while (current && current !== main) {
+    while (current) {
       const style = window.getComputedStyle(current);
       if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 ||
           current.getAttribute('aria-hidden') === 'true') return false;
@@ -255,6 +328,11 @@ _DETAIL_SCRIPT = r"""
     const rect = element.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
   };
+  const mains = Array.from(document.querySelectorAll(mainSelector)).filter(visible);
+  if (mains.length > 1) return {ok: false, reason: 'root'};
+  // Exact post permalink evidence below scopes this fallback; the body alone never
+  // qualifies a detail page or author.
+  const main = mains.length === 1 ? mains[0] : document.body;
   const allCards = Array.from(main.querySelectorAll(cardSelector));
   if (allCards.length > 1000) return {ok: false, reason: 'dom_bound'};
   const isAuxiliary = (card) => {
@@ -267,7 +345,7 @@ _DETAIL_SCRIPT = r"""
   };
   const roots = allCards.filter((card) => {
     const parent = card.parentElement;
-    return (!parent || !parent.closest(cardSelector)) && !isAuxiliary(card);
+    return (!parent || !parent.closest(cardSelector)) && !isAuxiliary(card) && visible(card);
   });
   const owns = (element, card) => element.closest(cardSelector) === card;
   const canonicalPath = (href) => {
@@ -282,26 +360,26 @@ _DETAIL_SCRIPT = r"""
     const ownAnchors = Array.from(card.querySelectorAll('a[href]')).filter(
       (anchor) => owns(anchor, card) && !anchor.closest('blockquote')
     );
-    const postPaths = new Set(ownAnchors.map((anchor) => canonicalPath(anchor.getAttribute('href')))
-      .filter((path) => typeof path === 'string' && /\/post(?:\/|-)/.test(path)));
-    if (postPaths.has(new URL(target).pathname)) matches.push({card, ownAnchors, postPaths});
+    const postPaths = ownAnchors.map((anchor) => canonicalPath(anchor.getAttribute('href')))
+      .filter((path) => typeof path === 'string' && /\/post(?:\/|-)/.test(path));
+    if (postPaths.includes(new URL(target).pathname)) matches.push({card, ownAnchors, postPaths});
   }
   if (matches.length !== 1) return {ok: false, reason: 'root'};
   const candidate = matches[0];
-  if (candidate.postPaths.size !== 1) return {ok: false, reason: 'permalink'};
+  if (candidate.postPaths.length !== 1) return {ok: false, reason: 'permalink'};
 
-  const authorPaths = new Set();
+  const authorPaths = [];
   for (const header of Array.from(candidate.card.querySelectorAll('header'))) {
     if (!owns(header, candidate.card) || header.closest('blockquote')) continue;
     for (const anchor of Array.from(header.querySelectorAll('a[href]'))) {
       if (!owns(anchor, candidate.card) || !visible(anchor)) continue;
       const path = canonicalPath(anchor.getAttribute('href'));
       if (typeof path === 'string' && /^\/@[A-Za-z0-9._:-]{1,96}$/.test(path)) {
-        authorPaths.add(path);
+        authorPaths.push(path);
       }
     }
   }
-  if (authorPaths.size !== 1) return {ok: false, reason: 'author'};
+  if (authorPaths.length !== 1) return {ok: false, reason: 'author'};
 
   const bodies = Array.from(candidate.card.querySelectorAll('div[dir="auto"]')).filter((body) => {
     if (!owns(body, candidate.card) || !visible(body) || body.closest('header, blockquote, aside, nav, footer')) {
@@ -338,7 +416,7 @@ _DETAIL_SCRIPT = r"""
   return {
     ok: true,
     canonicalPath: new URL(target).pathname,
-    authorPath: Array.from(authorPaths)[0],
+    authorPath: authorPaths[0],
     body: bodyText || null,
     bodyCount: bodies.length,
     partial,
@@ -684,7 +762,7 @@ class AsyncThreadsJobUiReader:
         page: AsyncPage,
         *,
         origin: str = _DEFAULT_ORIGIN,
-        action_timeout_ms: int = 5_000,
+        action_timeout_ms: int = 8_000,
         max_batches: int = _MAX_BATCHES,
         max_cards_per_batch: int = _MAX_CARDS_PER_BATCH,
     ) -> None:
@@ -717,7 +795,9 @@ class AsyncThreadsJobUiReader:
 
         if not _USERNAME_RE.fullmatch(expected_actor):
             raise BrowserAdapterError("BROWSER_ACTOR_INVALID")
-        await self._goto(f"{self._origin}/")
+        home_url = f"{self._origin}/"
+        if self._page.url != home_url:
+            await self._goto(home_url)
         state, _ = await self._page_state(
             expected_path="/",
             expected_query=None,
@@ -747,29 +827,24 @@ class AsyncThreadsJobUiReader:
             if page_state is not UiPageState.READY:
                 batches.append(UiFeedBatch(batch_index, page_url, page_state, (), False))
                 return tuple(batches)
-            snapshot = _object(
-                await self._evaluate(
-                    _FEED_BATCH_SCRIPT,
-                    {"batchIndex": batch_index, "maxCards": self._max_cards_per_batch},
-                )
+            snapshot = await self._feed_batch_snapshot(
+                batch_index,
+                query,
+                wait_for_cards=batch_index == 0,
             )
-            if snapshot.get("ok") is not True:
-                code = (
-                    "BROWSER_CARD_LIMIT_EXCEEDED"
-                    if snapshot.get("reason") == "card_bound"
-                    else "BROWSER_SELECTOR_DRIFT"
-                )
-                raise BrowserAdapterError(code)
             raw_cards = snapshot.get("cards")
             if not isinstance(raw_cards, list):
-                raise BrowserAdapterError("BROWSER_CARD_LIMIT_EXCEEDED")
+                raise BrowserAdapterError("SEARCH_CARD_UNRECOGNIZED")
             card_values = cast(list[object], raw_cards)
             if len(card_values) > self._max_cards_per_batch:
                 raise BrowserAdapterError("BROWSER_CARD_LIMIT_EXCEEDED")
-            cards = tuple(self._decode_card(item) for item in card_values)
+            try:
+                cards = tuple(self._decode_card(item) for item in card_values)
+            except BrowserAdapterError:
+                raise BrowserAdapterError("SEARCH_CARD_UNRECOGNIZED") from None
             has_more = snapshot.get("hasMore")
             if not isinstance(has_more, bool):
-                raise BrowserAdapterError("BROWSER_SELECTOR_DRIFT")
+                raise BrowserAdapterError("SEARCH_CARD_UNRECOGNIZED")
             batches.append(UiFeedBatch(batch_index, page_url, page_state, cards, has_more))
             if not has_more or batch_index + 1 == self._max_batches:
                 break
@@ -780,7 +855,7 @@ class AsyncThreadsJobUiReader:
             self._scroll_count += 1
             await self._wait_for_render()
         if not batches or not any(batch.cards for batch in batches):
-            raise BrowserAdapterError("BROWSER_EMPTY_FEED")
+            raise BrowserAdapterError("SEARCH_UI_NOT_READY")
         return tuple(batches)
 
     async def read_exact_post(
@@ -803,27 +878,42 @@ class AsyncThreadsJobUiReader:
         )
         if state is not UiPageState.READY:
             return UiPostDetail(target, page_url, canonical_target, state)
-        snapshot = _object(
-            await self._evaluate(
-                _DETAIL_SCRIPT,
-                {"target": canonical_target, "maxBodyCodepoints": _MAX_BODY_CODEPOINTS},
-            )
-        )
-        if snapshot.get("ok") is not True:
-            code = (
-                "BROWSER_ROOT_NOT_FOUND"
-                if snapshot.get("reason") == "root"
-                else "BROWSER_SELECTOR_DRIFT"
-            )
-            raise BrowserAdapterError(code)
+        deadline = self._readiness_deadline()
+        while True:
+            try:
+                detail_payload = await self._evaluate(
+                    _DETAIL_SCRIPT,
+                    {"target": canonical_target, "maxBodyCodepoints": _MAX_BODY_CODEPOINTS},
+                )
+            except BrowserReadTimeout:
+                raise BrowserAdapterError("DETAIL_ROOT_UNRECOGNIZED") from None
+            try:
+                snapshot = _object(detail_payload)
+            except BrowserAdapterError:
+                raise BrowserAdapterError("DETAIL_ROOT_UNRECOGNIZED") from None
+            if snapshot.get("ok") is True:
+                break
+            reason = snapshot.get("reason")
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                code = (
+                    "DETAIL_ROOT_UNRECOGNIZED"
+                    if reason == "root"
+                    else "DETAIL_PROVENANCE_UNVERIFIED"
+                )
+                raise BrowserAdapterError(code)
+            await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
         if snapshot.get("canonicalPath") != target_path:
-            raise BrowserAdapterError("BROWSER_TARGET_MISMATCH")
+            raise BrowserAdapterError("DETAIL_PROVENANCE_UNVERIFIED")
         author_path = snapshot.get("authorPath")
         if not isinstance(author_path, str):
-            raise BrowserAdapterError("BROWSER_AUTHOR_MISMATCH")
+            raise BrowserAdapterError("DETAIL_PROVENANCE_UNVERIFIED")
         profile = _PROFILE_PATH_RE.fullmatch(author_path)
-        if profile is None:
-            raise BrowserAdapterError("BROWSER_AUTHOR_MISMATCH")
+        if (
+            profile is None
+            or profile.group("username") != _parse_post_target(canonical_target, self._origin)[2]
+        ):
+            raise BrowserAdapterError("DETAIL_PROVENANCE_UNVERIFIED")
         body_value = snapshot.get("body")
         body = body_value if isinstance(body_value, str) else None
         partial = snapshot.get("partial") is True or len(body or "") > _MAX_BODY_CODEPOINTS
@@ -859,26 +949,26 @@ class AsyncThreadsJobUiReader:
         raw_authors = card.get("headerLinks")
         if not isinstance(raw_posts, list) or not isinstance(raw_authors, list):
             raise BrowserAdapterError("BROWSER_SELECTOR_DRIFT")
-        targets = {
+        target_values = [
             _parse_post_target(item, self._origin)[0]
             for item in cast(list[object], raw_posts)
             if isinstance(item, str)
-        }
-        if len(targets) != 1:
+        ]
+        if len(target_values) != 1:
             raise BrowserAdapterError(
-                "BROWSER_PERMALINK_MISSING" if not targets else "BROWSER_PERMALINK_MISMATCH"
+                "BROWSER_PERMALINK_MISSING" if not target_values else "BROWSER_PERMALINK_MISMATCH"
             )
-        authors = {
+        author_values = [
             author
             for item in cast(list[object], raw_authors)
             if isinstance(item, str)
             and (author := _parse_profile_link(item, self._origin)) is not None
-        }
-        if len(authors) != 1:
+        ]
+        if len(author_values) != 1:
             raise BrowserAdapterError("BROWSER_AUTHOR_MISMATCH")
-        target = next(iter(targets))
+        target = target_values[0]
         _, _, permalink_author = _parse_post_target(target, self._origin)
-        author = next(iter(authors))
+        author = author_values[0]
         if author != permalink_author:
             raise BrowserAdapterError("BROWSER_AUTHOR_MISMATCH")
         return UiPostTarget(target, author)
@@ -891,59 +981,185 @@ class AsyncThreadsJobUiReader:
         expected_actor: str,
         require_search: bool,
     ) -> tuple[UiPageState, str]:
-        page_url = self._page.url
-        try:
-            parsed = urlsplit(page_url)
-        except ValueError:
-            return UiPageState.REDIRECTED, page_url
-        origin = urlsplit(self._origin)
-        if parsed.scheme != "https" or parsed.netloc != origin.netloc:
-            return UiPageState.REDIRECTED, page_url
-        result = _object(
-            await self._evaluate(
-                _PAGE_STATE_SCRIPT,
-                {
-                    "expectedOrigin": self._origin,
-                    "expectedPath": expected_path,
-                    "expectedQuery": expected_query,
-                    "expectedActor": expected_actor,
-                    "requireSearch": require_search,
-                },
-            )
-        )
-        try:
-            state = UiPageState(result.get("state"))
-        except TypeError, ValueError:
-            return UiPageState.UNKNOWN, page_url
-        if state is not UiPageState.READY:
-            return state, page_url
-        if result.get("mains") != 1:
-            raise BrowserAdapterError("BROWSER_SELECTOR_DRIFT")
-        banner_links = result.get("bannerLinks")
-        if not isinstance(banner_links, list):
-            raise BrowserAdapterError("BROWSER_SELECTOR_DRIFT")
-        actors = {
-            actor
-            for item in cast(list[object], banner_links)
-            if (actor := _parse_profile_link(item, self._origin)) is not None
-        }
-        if actors != {expected_actor}:
-            raise BrowserAdapterError("BROWSER_SESSION_MISMATCH")
-        if require_search:
+        stage = "HOME" if expected_path == "/" else "SEARCH" if require_search else "DETAIL"
+        deadline = self._readiness_deadline()
+        last_result: dict[str, object] = {}
+        while True:
+            page_url = self._page.url
             try:
-                parsed_query = parse_qs(parsed.query, strict_parsing=True)
+                parsed = urlsplit(page_url)
             except ValueError:
                 return UiPageState.REDIRECTED, page_url
-            if (
-                expected_query is None
-                or parsed.path != "/search"
-                or parsed_query != {"q": [expected_query]}
-                or result.get("searchValues") != [expected_query]
-            ):
-                raise BrowserAdapterError("BROWSER_QUERY_MISMATCH")
-        elif parsed.path != expected_path or parsed.query or parsed.fragment:
-            return UiPageState.REDIRECTED, page_url
-        return UiPageState.READY, page_url
+            origin = urlsplit(self._origin)
+            if parsed.scheme != "https" or parsed.netloc != origin.netloc:
+                return UiPageState.REDIRECTED, page_url
+            try:
+                page_payload = await self._evaluate(
+                    _PAGE_STATE_SCRIPT,
+                    {
+                        "expectedOrigin": self._origin,
+                        "expectedPath": expected_path,
+                        "expectedQuery": expected_query,
+                        "expectedActor": expected_actor,
+                        "requireSearch": require_search,
+                    },
+                )
+            except BrowserReadTimeout:
+                raise BrowserAdapterError(f"{stage}_UI_NOT_READY") from None
+            try:
+                result = _object(page_payload)
+            except BrowserAdapterError:
+                raise BrowserAdapterError(f"{stage}_ROOT_UNRECOGNIZED") from None
+            last_result = result
+            try:
+                state = UiPageState(result.get("state"))
+            except TypeError, ValueError:
+                state = UiPageState.UNKNOWN
+            if state is not UiPageState.READY:
+                if state is not UiPageState.UNKNOWN:
+                    return state, page_url
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise BrowserAdapterError(
+                        self._readiness_error_code(stage, last_result, expected_query)
+                    )
+                await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
+                continue
+
+            if require_search:
+                try:
+                    parsed_query = parse_qs(parsed.query, strict_parsing=True)
+                except ValueError:
+                    return UiPageState.REDIRECTED, page_url
+                if (
+                    expected_query is None
+                    or parsed.path != "/search"
+                    or parsed_query != {"q": [expected_query]}
+                ):
+                    raise BrowserAdapterError("BROWSER_QUERY_MISMATCH")
+            elif parsed.path != expected_path or parsed.query or parsed.fragment:
+                return UiPageState.REDIRECTED, page_url
+
+            actor_links_value = result.get("actorLinks")
+            actor_links = (
+                cast(list[object], actor_links_value) if isinstance(actor_links_value, list) else []
+            )
+            actors = [
+                actor
+                for item in actor_links
+                if (actor := _parse_profile_link(item, self._origin)) is not None
+            ]
+            if len(actors) == 1 and actors[0] != expected_actor:
+                raise BrowserAdapterError("BROWSER_SESSION_MISMATCH")
+
+            mains = result.get("mains")
+            search_values_value = result.get("searchValues")
+            search_values = (
+                cast(list[object], search_values_value)
+                if isinstance(search_values_value, list)
+                else []
+            )
+            root_ready: bool = mains == 1
+            if stage == "HOME" and mains == 0:
+                root_ready = result.get("shellHeaders") == 1
+            elif stage == "SEARCH" and mains == 0:
+                root_ready = len(search_values) == 1 and search_values[0] == expected_query
+            elif stage == "DETAIL" and mains == 0:
+                root_ready = result.get("detailRootCount") == 1
+
+            query_ready = True
+            if require_search:
+                query_ready = len(search_values) == 1 and search_values[0] == expected_query
+
+            if root_ready and query_ready and len(actors) == 1 and actors[0] == expected_actor:
+                return UiPageState.READY, page_url
+
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise BrowserAdapterError(
+                    self._readiness_error_code(stage, last_result, expected_query)
+                )
+            await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
+
+    async def _feed_batch_snapshot(
+        self,
+        batch_index: int,
+        query: str,
+        *,
+        wait_for_cards: bool,
+    ) -> dict[str, object]:
+        deadline = self._readiness_deadline()
+        while True:
+            try:
+                payload = await self._evaluate(
+                    _FEED_BATCH_SCRIPT,
+                    {
+                        "batchIndex": batch_index,
+                        "maxCards": self._max_cards_per_batch,
+                        "expectedQuery": query,
+                    },
+                )
+            except BrowserReadTimeout:
+                raise BrowserAdapterError("SEARCH_UI_NOT_READY") from None
+            try:
+                snapshot = _object(payload)
+            except BrowserAdapterError:
+                raise BrowserAdapterError("SEARCH_CARD_UNRECOGNIZED") from None
+            if snapshot.get("ok") is not True:
+                if snapshot.get("reason") == "root":
+                    raise BrowserAdapterError("SEARCH_ROOT_UNRECOGNIZED")
+                if snapshot.get("reason") == "card_bound":
+                    raise BrowserAdapterError("BROWSER_CARD_LIMIT_EXCEEDED")
+                raise BrowserAdapterError("SEARCH_CARD_UNRECOGNIZED")
+            cards = snapshot.get("cards")
+            if not isinstance(cards, list):
+                raise BrowserAdapterError("SEARCH_CARD_UNRECOGNIZED")
+            if cards or not wait_for_cards:
+                return snapshot
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise BrowserAdapterError("SEARCH_UI_NOT_READY")
+            await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
+
+    def _readiness_deadline(self) -> float:
+        timeout_seconds = min(_READINESS_TIMEOUT_MS, self._timeout_ms) / 1000
+        return asyncio.get_running_loop().time() + timeout_seconds
+
+    @staticmethod
+    def _readiness_error_code(
+        stage: str,
+        result: dict[str, object],
+        expected_query: str | None,
+    ) -> str:
+        mains = result.get("mains")
+        if stage == "HOME":
+            root_ready = mains == 1 or (mains == 0 and result.get("shellHeaders") == 1)
+            if not root_ready:
+                return (
+                    "HOME_UI_NOT_READY"
+                    if result.get("visibleBodyChildCount") == 0
+                    else "HOME_ROOT_UNRECOGNIZED"
+                )
+            return "HOME_ACTOR_UNVERIFIED"
+        if stage == "SEARCH":
+            search_values = result.get("searchValues")
+            values = cast(list[object], search_values) if isinstance(search_values, list) else []
+            root_ready = mains == 1 or (
+                mains == 0 and len(values) == 1 and values[0] == expected_query
+            )
+            if not root_ready:
+                return (
+                    "SEARCH_UI_NOT_READY"
+                    if result.get("visibleBodyChildCount") == 0
+                    else "SEARCH_ROOT_UNRECOGNIZED"
+                )
+            if len(values) == 1 and values[0] != expected_query:
+                return "BROWSER_QUERY_MISMATCH"
+            return "SEARCH_UI_NOT_READY" if not values else "SEARCH_ACTOR_UNVERIFIED"
+        root_ready = mains == 1 or (mains == 0 and result.get("detailRootCount") == 1)
+        if not root_ready:
+            return "DETAIL_ROOT_UNRECOGNIZED"
+        return "DETAIL_ACTOR_UNVERIFIED"
 
     async def _goto(self, url: str) -> None:
         try:
@@ -952,7 +1168,6 @@ class AsyncThreadsJobUiReader:
                 wait_until="domcontentloaded",
                 timeout=self._timeout_ms,
             )
-            await self._page.wait_for_timeout(min(50, self._timeout_ms))
         except AsyncPlaywrightTimeoutError:
             if self._page.is_closed():
                 raise BrowserProcessCrashed() from None
@@ -983,9 +1198,14 @@ class AsyncThreadsJobUiReader:
                 raise BrowserProcessCrashed() from None
             raise BrowserAdapterError("BROWSER_READ_FAILED") from None
 
-    async def _wait_for_render(self) -> None:
+    async def _wait_for_render(self, *, remaining_ms: int | None = None) -> None:
         try:
-            await self._page.wait_for_timeout(min(100, self._timeout_ms))
+            timeout_ms = (
+                _READINESS_POLL_MS
+                if remaining_ms is None
+                else min(_READINESS_POLL_MS, remaining_ms)
+            )
+            await self._page.wait_for_timeout(min(timeout_ms, self._timeout_ms))
         except AsyncPlaywrightError:
             if self._page.is_closed():
                 raise BrowserProcessCrashed() from None
