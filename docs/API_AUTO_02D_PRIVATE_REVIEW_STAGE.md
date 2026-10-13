@@ -108,8 +108,10 @@ time. Expired records remain on disk and count toward the 64-record cap. This
 slice intentionally has no discard or cleanup API and makes no secure-erasure
 or backup-removal claim. The 64-record and 32 KiB bounds limit storage size,
 but a separate owner decision must set a physical retention/deletion period
-before real content may be staged. Tests use new `tmp_path` roots and leave no
-operator data behind.
+before real content may be staged. Tests use fresh temporary roots and leave no
+operator data behind. On Windows, synthetic roots live under a unique
+owner-only directory in `LOCALAPPDATA` so the tested ACL policy matches a
+private per-user data root; the fixture removes them after the test session.
 
 ## Synthetic acceptance
 

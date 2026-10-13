@@ -5,8 +5,11 @@ import hashlib
 import inspect
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -264,15 +267,29 @@ def _scenario(
     return selected_scope, selected_candidate, selected_display, packet, preview
 
 
+_WINDOWS_TEST_ROOTS: list[Path] = []
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _cleanup_windows_test_roots() -> Iterator[None]:
+    yield
+    for test_root in _WINDOWS_TEST_ROOTS:
+        shutil.rmtree(test_root, ignore_errors=True)
+
+
 def _store_root(tmp_path: Path) -> Path:
-    root = tmp_path / "private-data"
     if os.name == "nt":
         from threads_platform.standalone.api_auto_review_stage import _set_windows_private_acl
 
-        # These are fresh pytest fixture directories. Narrow them so the
-        # private-root fixture has no inherited broad writer above it.
-        _set_windows_private_acl(tmp_path.parent, directory=True)
-        _set_windows_private_acl(tmp_path, directory=True)
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if not local_app_data:
+            raise RuntimeError("Windows synthetic test root is unavailable")
+        test_root = Path(tempfile.mkdtemp(prefix="api-auto-review-stage-test-", dir=local_app_data))
+        _WINDOWS_TEST_ROOTS.append(test_root)
+        _set_windows_private_acl(test_root, directory=True)
+        root = test_root / "private-data"
+    else:
+        root = tmp_path / "private-data"
     root.mkdir()
     if os.name == "nt":
         from threads_platform.standalone.api_auto_review_stage import _set_windows_private_acl
