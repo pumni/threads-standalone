@@ -1026,7 +1026,11 @@ def _select_review_intent(
     plan = plan_cycle(scope, typed_candidates, None, now=now)
     if type(plan) is not CyclePlan:
         return None, None, _review_result(ContentDecision.STOP, ContentReason.INVALID_INPUT)
-    if plan.decision is not PlanDecision.OBSERVE_ONLY or plan.reason_codes:
+    if plan.decision is PlanDecision.NEEDS_CONTEXT:
+        return None, None, _review_result(ContentDecision.STOP, ContentReason.CONTEXT_MISMATCH)
+    if plan.decision is PlanDecision.STOP or plan.reason_codes:
+        return None, None, _review_plan_failure(plan)
+    if plan.decision not in {PlanDecision.OBSERVE_ONLY, PlanDecision.NOT_ELIGIBLE}:
         return None, None, _review_plan_failure(plan)
 
     if type(plan.items) is not tuple or any(type(item) is not PlanItem for item in plan.items):
@@ -1043,12 +1047,29 @@ def _select_review_intent(
         or item.review_intent.dispatchable is not False
     ):
         return None, None, _review_result(ContentDecision.STOP, ContentReason.INVALID_INPUT)
-    if any(
-        type(other) is not PlanItem
-        or other.decision is not PlanDecision.OBSERVE_ONLY
-        or other.proposal is not None
-        for other in plan.items
-    ):
+    allowed_ineligible_reasons = {
+        (PlanReason.COOLDOWN,),
+        (PlanReason.NOT_ELIGIBLE,),
+        (PlanReason.QUOTA_EXHAUSTED,),
+    }
+    for other in plan.items:
+        if other is item:
+            continue
+        if other.proposal is not None or other.review_intent is not None:
+            return (
+                None,
+                None,
+                _review_result(ContentDecision.STOP, ContentReason.REVIEW_INTENT_MISMATCH),
+            )
+        if other.decision is PlanDecision.OBSERVE_ONLY and other.reason_codes == (
+            PlanReason.DRAFT_UNAVAILABLE,
+        ):
+            continue
+        if (
+            other.decision is PlanDecision.NOT_ELIGIBLE
+            and other.reason_codes in allowed_ineligible_reasons
+        ):
+            continue
         return (
             None,
             None,

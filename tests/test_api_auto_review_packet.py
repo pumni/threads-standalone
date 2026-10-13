@@ -267,6 +267,18 @@ def _prepare(
     return intent, prepared, result
 
 
+def _intent_from_plan(
+    scope: CampaignScope,
+    candidates: tuple[ObservedCandidate, ...],
+) -> ReviewIntent:
+    plan = plan_cycle(scope, candidates, None, now=NOW)
+    intents = tuple(item.review_intent for item in plan.items if item.review_intent is not None)
+    assert len(intents) == 1
+    intent = intents[0]
+    assert type(intent) is ReviewIntent
+    return intent
+
+
 @pytest.mark.parametrize("action", ["post", "reply"])
 def test_planner_intent_connects_to_review_only_content_packet(action: str) -> None:
     scope = _scope()
@@ -293,6 +305,135 @@ def test_planner_intent_connects_to_review_only_content_packet(action: str) -> N
     assert projection.action is intent.action
     assert projection.packet_revision_sha256 == packet.packet_revision_sha256
     assert projection.expires_at == prepared.expires_at
+
+
+@pytest.mark.parametrize(
+    "state",
+    [CandidateState.COOLDOWN, CandidateState.PENDING, CandidateState.CONFIRMED],
+)
+def test_prepare_review_packet_accepts_eligible_intent_with_normal_ineligible_neighbor(
+    state: CandidateState,
+) -> None:
+    scope = _scope()
+    selected = _post_candidate(label=f"selected-{state.value}")
+    neighbor = _reply_candidate(label=f"neighbor-{state.value}", state=state)
+    candidates = (selected, neighbor)
+    plan = plan_cycle(scope, candidates, None, now=NOW)
+    intent = _intent_from_plan(scope, candidates)
+
+    assert plan.decision is PlanDecision.NOT_ELIGIBLE
+    result = prepare_review_packet(intent, _prepared(intent), scope, candidates, now=NOW)
+
+    assert result.decision is ContentDecision.NEEDS_REVIEW
+    assert result.packet is not None
+    assert result.packet.binding.candidate_fingerprint == intent.candidate_fingerprint
+
+
+@pytest.mark.parametrize(
+    "state",
+    [CandidateState.COOLDOWN, CandidateState.PENDING, CandidateState.CONFIRMED],
+)
+def test_revalidate_review_packet_accepts_eligible_intent_with_normal_ineligible_neighbor(
+    state: CandidateState,
+) -> None:
+    scope = _scope()
+    selected = _post_candidate(label=f"selected-{state.value}")
+    original_candidates = (selected,)
+    intent = _intent(scope, original_candidates)
+    prepared_result = prepare_review_packet(
+        intent,
+        _prepared(intent),
+        scope,
+        original_candidates,
+        now=NOW,
+    )
+    assert prepared_result.packet is not None
+    neighbor = _reply_candidate(label=f"neighbor-{state.value}", state=state)
+    candidates = (selected, neighbor)
+    plan = plan_cycle(scope, candidates, None, now=NOW)
+
+    assert plan.decision is PlanDecision.NOT_ELIGIBLE
+    result = revalidate_review_packet(prepared_result.packet, scope, candidates, now=NOW)
+
+    assert result.decision is ContentDecision.NEEDS_REVIEW
+    assert result.packet == prepared_result.packet
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "duplicate_fingerprint",
+        "root_collision",
+        "parent_collision",
+        "ambiguous",
+        "needs_context",
+        "stop",
+    ],
+)
+def test_mixed_batch_blockers_prevent_prepare_and_revalidation(
+    blocker: str,
+) -> None:
+    scope = _scope()
+    selected = _post_candidate(label=f"selected-{blocker}")
+    if blocker == "duplicate_fingerprint":
+        candidates = (selected, replace(selected))
+    elif blocker in {"root_collision", "parent_collision"}:
+        shared = _reply_candidate(
+            label=f"collision-first-{blocker}",
+            root_id="synthetic-collision-root",
+            parent_id="synthetic-collision-parent",
+            reply_id=f"synthetic-collision-reply-{blocker}",
+        )
+        collision = _reply_candidate(
+            label=f"collision-second-{blocker}",
+            root_id=(
+                "synthetic-other-root"
+                if blocker == "root_collision"
+                else "synthetic-collision-root"
+            ),
+            parent_id=(
+                "synthetic-collision-parent"
+                if blocker == "root_collision"
+                else "synthetic-other-parent"
+            ),
+            reply_id=f"synthetic-collision-reply-{blocker}",
+        )
+        candidates = (selected, shared, collision)
+    elif blocker == "ambiguous":
+        candidates = (
+            selected,
+            _reply_candidate(label="ambiguous-neighbor", state=CandidateState.AMBIGUOUS),
+        )
+    elif blocker == "needs_context":
+        candidates = (
+            selected,
+            _reply_candidate(
+                label="incomplete-neighbor",
+                completeness=ContextCompleteness.PARTIAL,
+            ),
+        )
+    else:
+        candidates = (
+            selected,
+            replace(_reply_candidate(label="unavailable-neighbor"), binding=None),
+        )
+
+    intent = _intent(scope, (selected,))
+    prepared = _prepared(intent)
+    initial = prepare_review_packet(intent, prepared, scope, (selected,), now=NOW)
+    assert initial.packet is not None
+
+    prepared_with_blocker = prepare_review_packet(intent, prepared, scope, candidates, now=NOW)
+    revalidated_with_blocker = revalidate_review_packet(
+        initial.packet,
+        scope,
+        candidates,
+        now=NOW,
+    )
+
+    for result in (prepared_with_blocker, revalidated_with_blocker):
+        assert result.decision is ContentDecision.STOP
+        assert result.packet is None
 
 
 def test_own_post_has_no_remote_target_ids_and_reply_binds_all_three_references() -> None:
