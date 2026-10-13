@@ -22,7 +22,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, TextIO, cast
+from typing import TYPE_CHECKING, Protocol, TextIO, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -52,6 +52,9 @@ from threads_platform.standalone.recruitment_job_store import (
     RecruitmentJobStoreError,
     RetentionPolicy,
 )
+
+if TYPE_CHECKING:
+    from threads_platform.browser.synthetic_dom_session import DomFixtureCapture
 
 DEFAULT_MAX_CYCLES = 1
 MAX_CYCLES = 5
@@ -296,9 +299,10 @@ def run_recruitment_browser_jobs_cli(
             return 1
         output.write("BROWSER_WATCH status=UNKNOWN source=MANUAL_URL reason=NO_TEXT\n")
         return 0
-    if source != "fixture":
+    if source not in ("fixture", "dom-fixture"):
         errors.write("ERROR SOURCE_INVALID\n")
         return 1
+    is_dom_fixture = source == "dom-fixture"
 
     try:
         account_alias = _required_string(args, "account", "ACCOUNT_REQUIRED")
@@ -320,13 +324,35 @@ def run_recruitment_browser_jobs_cli(
         ):
             raise BrowserJobsCliError("WATCH_POLICY_INVALID")
 
-        fixture_cycles = _load_fixture(fixture_path)
-        if len(fixture_cycles) < max_cycles:
-            raise BrowserJobsCliError("FIXTURE_CYCLE_COUNT_INVALID")
-        if any(len(cycle.targets) > max_posts for cycle in fixture_cycles):
-            raise BrowserJobsCliError("FIXTURE_POST_LIMIT_EXCEEDED")
-        selected_cycles = fixture_cycles[:max_cycles]
-        engine_cycles = _to_engine_cycles(selected_cycles, account_uuid)
+        dom_capture: DomFixtureCapture | None = None
+        query = _FIXTURE_QUERY
+        if is_dom_fixture:
+            from threads_platform.browser.synthetic_dom_session import (
+                SyntheticDomFixtureError,
+                capture_synthetic_dom_fixture,
+            )
+
+            try:
+                dom_capture = capture_synthetic_dom_fixture(
+                    _load_fixture_document(fixture_path),
+                    account_uuid=account_uuid,
+                    max_cycles=max_cycles,
+                    max_posts_per_cycle=max_posts,
+                )
+            except SyntheticDomFixtureError as error:
+                raise BrowserJobsCliError(error.code) from None
+            if any(_contains_contact_or_remote_url(text) for text in dom_capture.visible_texts):
+                raise BrowserJobsCliError("FIXTURE_BODY_INVALID")
+            engine_cycles = dom_capture.cycles
+            query = dom_capture.protocol_query
+        else:
+            fixture_cycles = _load_fixture(fixture_path)
+            if len(fixture_cycles) < max_cycles:
+                raise BrowserJobsCliError("FIXTURE_CYCLE_COUNT_INVALID")
+            if any(len(cycle.targets) > max_posts for cycle in fixture_cycles):
+                raise BrowserJobsCliError("FIXTURE_POST_LIMIT_EXCEEDED")
+            selected_cycles = fixture_cycles[:max_cycles]
+            engine_cycles = _to_engine_cycles(selected_cycles, account_uuid)
 
         input_handle = input_stream or sys.stdin
         active_stop = stop_signal
@@ -351,7 +377,7 @@ def run_recruitment_browser_jobs_cli(
         result = engine.run(
             source=WatchSource.SYNTHETIC_FIXTURE,
             account_uuid=account_uuid,
-            query=_FIXTURE_QUERY,
+            query=query,
             run_id=run_id,
             cycles=engine_cycles,
             max_cycles=max_cycles,
@@ -373,6 +399,16 @@ def run_recruitment_browser_jobs_cli(
         errors.write("ERROR BROWSER_WATCH_FAILED\n")
         return 1
 
+    if dom_capture is not None:
+        output.write(
+            "DOM_FIXTURE "
+            f"batches={_safe_count(dom_capture.batch_count)} "
+            f"candidates={_safe_count(dom_capture.candidate_count)} "
+            f"targets={_safe_count(dom_capture.target_count)} "
+            f"duplicates={_safe_count(dom_capture.duplicate_count)} "
+            f"details={_safe_count(dom_capture.detail_count)} "
+            f"blocked_requests={_safe_count(dom_capture.blocked_request_count)}\n"
+        )
     output.write(_format_result(result))
     if result.status is WatchStatus.COMPLETE:
         return 0
@@ -411,6 +447,10 @@ def _is_tty(stream: TextIO) -> bool:
 
 
 def _load_fixture(path: Path) -> tuple[_FixtureCycle, ...]:
+    return _decode_fixture_document(_load_fixture_document(path))
+
+
+def _load_fixture_document(path: Path) -> object:
     parent = path.parent
     try:
         _store_fs._validate_path_components(parent)
@@ -457,7 +497,7 @@ def _load_fixture(path: Path) -> tuple[_FixtureCycle, ...]:
         )
     except UnicodeError, json.JSONDecodeError, RecursionError, ValueError:
         raise BrowserJobsCliError("FIXTURE_INVALID") from None
-    return _decode_fixture_document(document)
+    return document
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

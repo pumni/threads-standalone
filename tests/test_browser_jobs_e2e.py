@@ -7,12 +7,17 @@ import csv
 import io
 import json
 import os
+import shutil
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 from uuid import UUID
 
 import pytest
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import sync_playwright
 
 from threads_platform.standalone import recruitment_browser_jobs_cli as cli_module
 from threads_platform.standalone.__main__ import main
@@ -211,6 +216,231 @@ def _entrypoint_args(account: str, root: Path, fixture: Path, run_id: str) -> li
         "--run-id",
         run_id,
     ]
+
+
+def _dom_card(index: int, handle: str) -> str:
+    url = _url(index).replace("synthetic-shop", handle)
+    return (
+        "<article data-post-card>"
+        f'<a data-post-permalink href="{url}">open</a>'
+        f"<header data-post-header><span data-post-author>@{handle}</span></header>"
+        "</article>"
+    )
+
+
+def _dom_detail(
+    index: int, handle: str, body_html: str, *, kind: str = "ORIGINAL"
+) -> dict[str, str]:
+    url = _url(index).replace("synthetic-shop", handle)
+    html = (
+        "<main data-post-detail>"
+        f'<article data-root-post data-post-kind="{kind}">'
+        f'<a data-post-permalink href="{url}">root</a>'
+        f"<header data-post-header><span data-post-author>@{handle}</span></header>"
+        f"{body_html}"
+        "</article></main>"
+    )
+    return {"target": url, "html": html}
+
+
+def _dom_manifest(recruiter_body: str) -> dict[str, object]:
+    query = "synthetic recruitment roles"
+    feed_html = (
+        f'<main data-search-query="{query}">'
+        '<img src="https://assets.example.invalid/blocked.png" alt="synthetic blocked image">'
+        '<section data-feed-tranche="0" style="height: 900px">'
+        f"{_dom_card(1, 'synthetic-shop')}{_dom_card(2, 'synthetic-seeker')}"
+        "</section>"
+        '<section data-feed-tranche="1" style="height: 900px">'
+        f"{_dom_card(1, 'synthetic-shop')}{_dom_card(3, 'synthetic-sharer')}"
+        "</section>"
+        "<aside><p>Cần tuyển hidden sidebar content</p></aside>"
+        "</main>"
+    )
+    details = [
+        _dom_detail(
+            1,
+            "synthetic-shop",
+            f'<div data-own-post-body data-body-visibility="FULL_VISIBLE">{recruiter_body}</div>',
+        ),
+        _dom_detail(
+            2,
+            "synthetic-seeker",
+            '<div data-own-post-body data-body-visibility="FULL_VISIBLE">'
+            "<span hidden>Cần tuyển 99 nhân viên lương 99 triệu.</span>"
+            "Em đang tìm việc kế toán.</div>",
+        ),
+        _dom_detail(
+            3,
+            "synthetic-sharer",
+            '<div data-own-post-body data-body-visibility="FULL_VISIBLE" data-collapsed="true">'
+            "Mình chia sẻ bài này.</div>"
+            "<aside data-quoted-post><blockquote>"
+            "Cần tuyển nhân viên bán hàng tại Hà Nội; lương 99 triệu/tháng."
+            "</blockquote></aside>",
+            kind="QUOTE",
+        ),
+    ]
+    return {
+        "schema_version": 1,
+        "fixture_kind": "SYNTHETIC_DOM_ONLY",
+        "query": query,
+        "cycles": [{"feed_html": feed_html, "detail_pages": details}],
+    }
+
+
+def _write_dom_manifest(
+    fixture_dir: Path, document: object, name: str = "dom-fixture.json"
+) -> Path:
+    path = fixture_dir / name
+    path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+    return path
+
+
+def _threads_local_executable() -> str:
+    executable = shutil.which("threads-local")
+    if executable is None:
+        suffix = ".exe" if os.name == "nt" else ""
+        candidate = Path(sys.executable).with_name(f"threads-local{suffix}")
+        if candidate.is_file():
+            executable = os.fspath(candidate)
+    assert executable is not None, "run installed CLI acceptance under `uv run`"
+    return executable
+
+
+def _run_installed_dom_cli(
+    account: str,
+    root: Path,
+    fixture: Path,
+    run_id: str,
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.pop("THREADS_LOCAL_DATA_ROOT", None)
+    return subprocess.run(
+        [
+            _threads_local_executable(),
+            "recruitment",
+            "browser-watch",
+            "--source",
+            "dom-fixture",
+            "--account",
+            account,
+            "--fixture-file",
+            os.fspath(fixture),
+            "--data-root",
+            os.fspath(root),
+            "--run-id",
+            run_id,
+        ],
+        cwd=fixture.parent,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=90,
+        check=False,
+    )
+
+
+def _require_local_chromium() -> None:
+    with sync_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        try:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--disable-background-networking", "--disable-sync", "--no-first-run"],
+            )
+        except PlaywrightError:
+            pytest.skip("Playwright Chromium cannot launch in this environment")
+        browser.close()
+
+
+def test_installed_cli_renders_dom_and_archives_only_recruiter_vacancy(
+    tmp_path: Path,
+) -> None:
+    _require_local_chromium()
+    _private_parent, fixture_dir, root = _case_dirs(tmp_path, "dom-cli-e2e")
+    alias = "test-dom-e2e"
+    run_id = "dom-e2e-001"
+    recruiter_body = "Cần tuyển 02 nhân viên bán hàng tại Q.7, TP.HCM; lương 8–12 triệu/tháng."
+    fixture = _write_dom_manifest(fixture_dir, _dom_manifest(recruiter_body))
+
+    first = _run_installed_dom_cli(alias, root, fixture, run_id)
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert first.stderr == ""
+    assert "DOM_FIXTURE batches=2 candidates=4 targets=3 duplicates=1 details=3" in first.stdout
+    assert "blocked_requests=1" in first.stdout
+    assert "status=COMPLETE source=SYNTHETIC_FIXTURE" in first.stdout
+    assert "scanned=4" in first.stdout
+    assert "vacancy=1" in first.stdout
+    for private_value in (alias, os.fspath(root), os.fspath(fixture), recruiter_body):
+        assert private_value not in first.stdout + first.stderr
+    assert "threads.example.invalid" not in first.stdout + first.stderr
+
+    archive_path = _archive_path(root, alias)
+    checkpoint_path = _checkpoint_path(root, alias)
+    archive_bytes = archive_path.read_bytes()
+    checkpoint_bytes = checkpoint_path.read_bytes()
+    archive = _document(archive_path)
+    posts = _objects(archive["posts"])
+    assert len(posts) == 3
+    assert all(_objects(post["observations"])[0]["source"] == "SYNTHETIC_FIXTURE" for post in posts)
+    recruiter_record = _post_record(archive, _url(1))
+    seeker_record = _post_record(
+        archive,
+        _url(2).replace("synthetic-shop", "synthetic-seeker"),
+    )
+    quote_record = _post_record(
+        archive,
+        _url(3).replace("synthetic-shop", "synthetic-sharer"),
+    )
+    vacancy_revisions = [
+        vacancy
+        for post in posts
+        for revision in _objects(post["revisions"])
+        for vacancy in _objects(revision["vacancy_revisions"])
+    ]
+    assert len(vacancy_revisions) == 1
+    assert _objects(_objects(seeker_record["revisions"])[0]["vacancy_revisions"]) == []
+    assert _objects(_objects(quote_record["revisions"])[0]["vacancy_revisions"]) == []
+    fields = _object(vacancy_revisions[0]["fields"])
+    assert _object(fields["role_title"])["state"] == "SOURCE_SPAN"
+    assert _object(fields["headcount"])["value"] == 2
+    location = _object(fields["location"])
+    assert _object(location["province_city"])["value"] == "TP.HCM"
+    salary = _object(fields["salary"])
+    assert _object(salary["amount_min"])["value"] == 8_000_000
+    assert _object(salary["amount_max"])["value"] == 12_000_000
+    assert _objects(_objects(recruiter_record["revisions"])[0]["vacancy_revisions"])
+    assert "https://threads.example.invalid" not in json.dumps(
+        _document(checkpoint_path), ensure_ascii=False
+    )
+    assert _document(checkpoint_path)["completed_cycles"] == 1
+
+    replay = _run_installed_dom_cli(alias, root, fixture, run_id)
+
+    assert replay.returncode == 0, replay.stdout + replay.stderr
+    assert "status=COMPLETE source=SYNTHETIC_FIXTURE" in replay.stdout
+    assert "scanned=0" in replay.stdout
+    assert "vacancy=0" in replay.stdout
+    assert archive_path.read_bytes() == archive_bytes
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+
+    changed = _write_dom_manifest(
+        fixture_dir,
+        _dom_manifest("Cần tuyển 02 nhân viên bán hàng tại Q.7, TP.HCM; lương 9–12 triệu/tháng."),
+        name="dom-fixture-changed.json",
+    )
+    conflict = _run_installed_dom_cli(alias, root, changed, run_id)
+
+    assert conflict.returncode == 1
+    assert "status=FAILED source=SYNTHETIC_FIXTURE reason=CHECKPOINT_CONFLICT" in conflict.stdout
+    assert archive_path.read_bytes() == archive_bytes
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
 
 
 def test_one_cycle_cli_archives_parser_evidence_and_redacts_output(
@@ -526,7 +756,7 @@ def test_explicit_export_hides_synthetic_contact_after_raw_expiry_and_escapes_fo
     assert requirement["spans"] == []
 
 
-def test_nested_browser_watch_help_exposes_only_fixture_and_manual_sources(
+def test_nested_browser_watch_help_exposes_only_synthetic_and_manual_sources(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit) as help_exit:
@@ -534,6 +764,6 @@ def test_nested_browser_watch_help_exposes_only_fixture_and_manual_sources(
 
     captured = capsys.readouterr()
     assert help_exit.value.code == 0
-    assert "--source {fixture,manual}" in captured.out
+    assert "--source {fixture,dom-fixture,manual}" in captured.out
     assert "--fixture-file" in captured.out
-    assert "--source {fixture,manual,browser}" not in captured.out
+    assert "browser}" not in captured.out
