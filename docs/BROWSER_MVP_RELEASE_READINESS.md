@@ -1,5 +1,7 @@
 # Browser MVP release readiness
 
+**Historical S1–S5 release checkpoint.** The current [owner Browser/API separation and development decision](PRODUCT_DIRECTION.md) supersedes legacy generic Meta Terms/approval demands as Browser coding prerequisites. This historical record is not authority to start a live session and does not supersede operator-selected account, remote-effect, privacy, or QA controls.
+
 This runbook covers the S1–S5 operator workflow. It does not authorize a live Threads session, automated reading, API request, reply, or customer-data test. Synthetic readiness and production readiness are separate gates.
 
 ## Feature and effect matrix

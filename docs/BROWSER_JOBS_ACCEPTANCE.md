@@ -1,5 +1,7 @@
 # Browser Jobs acceptance contract (BJ-00)
 
+**Current Browser-development owner direction (2026-10-13):** [AGENTS.md](../AGENTS.md) and [PRODUCT_DIRECTION.md](PRODUCT_DIRECTION.md) supersede this historical proposal wherever it treats generic Meta/Threads Terms review, express written platform permission, or #64/#103 closure as a prerequisite to writing, integrating, testing, or reviewing the Browser automation workflow. Keep account isolation, data minimization, technical integrity, and remote-effect safeguards. The documented `NO_GO` / `DISABLED_PERMISSION_PENDING` entries still describe today's live runtime, not a ban on implementing it. This clarification neither enables the currently disabled source nor claims Meta authorization. For actual live operation, follow the explicit operator task and applicable external obligations.
+
 **Status: proposed contract; coordinator acceptance is pending.** This is a documentation-only design for [BJ-00 #97](https://github.com/pumni/threads-standalone/issues/97), under [Browser Jobs #96](https://github.com/pumni/threads-standalone/issues/96). It does not authorize a browser read, contact collection, UI effect, release, or a later BJ slice.
 
 Reviewed against the refreshed `origin/main@1db96e2ec2fcd7533f289ebfdc1693c3ce4291bb` on 2026-10-12. The current `AGENTS.md` requires a separate explicit handoff for each slice and keeps platform permission distinct from implementation permission.
@@ -8,7 +10,7 @@ Reviewed against the refreshed `origin/main@1db96e2ec2fcd7533f289ebfdc1693c3ce42
 
 Browser Jobs is a future, private, bounded workflow for identifying Vietnamese recruiter vacancy posts. It is a separate product from S7 job-seeker qualification and from the existing S6/S11A opportunity queues. A vacancy record must never be encoded as an S6/S11A queue item or an official API object.
 
-The first usable mode is offline/manual input. The eventual command is foreground-only, operates on one explicitly selected account per invocation, has finite item/cycle/time caps, and exits on a stop signal or an unclassified platform state. It must not start a daemon, schedule work, or perform engagement. Live automated reads remain disabled until the independent permission gates below are cleared.
+The first usable mode is offline/manual input. The eventual command is foreground-only, operates on one explicitly selected account per invocation, has finite item/cycle/time caps, and exits on a stop signal or an unclassified platform state. It must not start a daemon, schedule work, or perform engagement. The current implementation leaves live reads disabled; an explicit live-integration/owner-opt-in task with bounded UAT is distinct from developing and accepting Browser source code.
 
 This contract does not change existing source, CLI behavior, browser runtime, account state, queues, or journals. It defines no migration and grants no right to collect or reuse platform data.
 
@@ -34,7 +36,7 @@ One observation describes one exact post-like source item. It records what was a
 | `post_identity_key` | Stable local identity for `(account_uuid, canonical_post_url)`. `post_kind` remains revisioned evidence, not a second post identity. |
 | `post_revision_id` | Optional local opaque identity for an exact supplied-text revision; absent when no text was supplied. Repeated captures may share this revision while retaining separate observation IDs. |
 | `canonical_post_url` | Exact canonical permalink for the item. Do not infer an API ID from it. Unknown hosts, redirects, or ambiguous targets stop processing. |
-| `source` | Exactly `SYNTHETIC_FIXTURE`, `MANUAL_URL`, or `BROWSER_UI`. This says how the target entered the workflow; it does not prove that text or author data was observed. `BROWSER_UI` is valid only after authorized live UI evidence. |
+| `source` | Exactly `SYNTHETIC_FIXTURE`, `MANUAL_URL`, or `BROWSER_UI`. This says how the target entered the workflow; it does not prove that text or author data was observed. `BROWSER_UI` is valid only for genuinely observed live UI evidence, never synthetic or manually supplied content. |
 | `observed_at_utc` | When this local observation was made. Keep distinct from any source-published timestamp. |
 | `observed_author` | Optional author label plus its evidence status. A URL or operator-supplied text does not verify an author; keep unknown/unverified labels separate from verified visible attribution and from quoted/reposted attribution. A reader's author marker remains `UNVERIFIED`; a visible handle does not authenticate the account owner. |
 | `post_kind` | `ORIGINAL`, `REPOST`, `QUOTE`, `REPLY`, or `UNKNOWN`, with any parent/quoted permalink and relationship recorded separately when available. |
@@ -51,11 +53,11 @@ Target source and text provenance are separate, and neither grants permission. A
 | --- | --- | --- |
 | `SYNTHETIC_FIXTURE` | `SYNTHETIC_FIXTURE_TEXT` | Synthetic text from a fixture with fixture-declared completeness; never live evidence. |
 | `MANUAL_URL` | `NONE` or `OPERATOR_SUPPLIED_TEXT` | The URL is operator-supplied. URL-only input has no post text, author, salary, contact, or completeness evidence. Separately supplied text can be parsed offline, but its provenance remains operator supplied. |
-| `BROWSER_UI` | `BROWSER_UI_VISIBLE_TEXT` | Only actual visible text from a separately authorized UI reader after the required source contract and private UAT are accepted. |
+| `BROWSER_UI` | `BROWSER_UI_VISIBLE_TEXT` | Only actual visible text from a scoped, tested real UI reader; synthetic evidence cannot be promoted into this source. |
 
 Reject mismatched source/provenance pairs. `MANUAL_URL` alone produces a URL-only `UNKNOWN` observation and no vacancy record. Do not derive text or metadata from the URL. For operator-supplied text, `COMPLETE` can mean only that the operator asserts the supplied text is complete; retain `completeness_basis=OPERATOR_ASSERTION` and never promote it to independently verified visible UI completeness. `COMPLETE` with `text_truncated=true` is invalid. `BROWSER_VISIBLE_VERIFIED` is allowed only when the exact target was opened and the full available visible body was captured under the reader contract. Hitting the 10,000-code-point cap, unresolved collapsed text, or any other clipping requires `PARTIAL`; never label cap-clipped text `FULL_VISIBLE` or `COMPLETE_VISIBLE`. Image-only input has no extractable text and remains `UNKNOWN` unless separately authorized evidence supplies text.
 
-Opening a manually supplied URL or copying content from a live service remains subject to separately reviewed manual-use and data-rights rules. Do not capture cookies, full DOM, hidden fields, network traffic, private endpoints, or screenshots as an alternate evidence channel.
+Opening a manually supplied URL or copying live content is an operator-controlled activity; preserve attribution, data handling and account boundaries. Do not capture cookies, full DOM, hidden fields, network traffic, private endpoints, or screenshots as an alternate evidence channel.
 
 Use this vacancy-specific classification, independently of S7's intent classifier:
 
@@ -143,7 +145,7 @@ Fixtures and examples in source, CI, issues, and public logs must use synthetic 
 
 The proposed purpose is private review of employer vacancy information for the recruitment workflow. It does not include contacting an employer, profiling job-seekers, enriching a CRM, training a model, or transferring data to a third party. Public visibility does not by itself establish permission, consent, or a lawful basis.
 
-Before any real contact is extracted or retained, the owner/coordinator must document the applicable platform authorization, lawful purpose/basis, minimization, access controls, retention, contact opt-out/deletion handling, and any required consent. Those are unresolved decisions, not legal conclusions in this document. Until they are documented, contact extraction and storage are **BLOCKED**. No live/customer text, contact, URL, account identifier, or private evidence may enter this repository, fixtures, CI, logs, screenshots, or PR discussion.
+Before any real contact is extracted or retained, the owner/coordinator must document the intended purpose and applicable data-handling basis, minimization, access controls, retention, contact opt-out/deletion handling, and any required consent. Those are unresolved decisions, not legal conclusions in this document. Until they are documented, contact extraction and storage are **BLOCKED**. No live/customer text, contact, URL, account identifier, or private evidence may enter this repository, fixtures, CI, logs, screenshots, or PR discussion.
 
 Proposed local data rules, subject to coordinator approval:
 
@@ -180,24 +182,24 @@ The public browser/source limits below are reserved for a later, separately auth
 
 The product goal in #102 is one command that can observe across multiple foreground cycles until STOP. This is a future profile, distinct from the finite initial delivery. It must use a configured interval of at least 15 minutes, the per-cycle query/candidate/post/time caps above, a single account lock, and an explicit session limit. Proposed CLI policy is `--max-session-minutes` default 60, hard maximum 240; STOP/Ctrl+C exits promptly. The session deadline bounds total cycles; there is no catch-up burst, daemon, scheduler, or background worker. These session values are proposals for coordinator acceptance, not enabled behavior.
 
-Future `--source browser --keywords-file ...` remains `DISABLED_PERMISSION_PENDING` until #64 and #103 record narrow `GO_RESTRICTED` authority for the intended collection/use, the operator gives the required GO, #18/#46 fresh-root and test-account gates pass, #106's separately owned reader and bounded private UAT are accepted, and #102 grants its CLI integration/file lease. No issue or synthetic success enables that source. If a later authorized reader encounters a challenge, unknown actor, origin change, redirect, changed target, missing author, selector ambiguity, rate limit, timeout, or incomplete state, stop with a fixed safe status. Do not bypass, retry, or continue with another account. A later invocation must not silently replay/catch up an interrupted cycle.
+Today `--source browser --keywords-file ...` still returns `DISABLED_PERMISSION_PENDING` because the installed source path is explicitly disabled. This is an existing implementation state, **not** a requirement to obtain a Meta Terms verdict, express written permission, or #64/#103 closure before implementing Browser automation. A separate owned code change may enable a bounded reader after an explicit operator account/session selection, fresh-root/test-account handling and private technical UAT. No documentation edit or synthetic success alone enables the installed source. If a later authorized reader encounters a challenge, unknown actor, origin change, redirect, changed target, missing author, selector ambiguity, rate limit, timeout, or incomplete state, stop with a fixed safe status. Do not bypass, retry, or continue with another account. A later invocation must not silently replay/catch up an interrupted cycle.
 
-## Capability and permission matrix
+## Browser capability and runtime-readiness matrix
 
-Implementation approval does not grant platform permission. Each capability is separate; a GO for reading never grants an effect.
+A design or code approval does not trigger a live account operation. A reader and a remote UI effect are separate capabilities, and a read-only operator opt-in never implies permission to send or engage.
 
-| Capability | BJ-00 proposed status | Required evidence before enabling |
+| Capability | Current runtime status / target | Technical and operator checks |
 | --- | --- | --- |
 | Synthetic fixtures and offline extraction | Allowed for synthetic-only development after its own handoff | Fake inputs/adapters, temporary synthetic roots, no Threads network. Synthetic success is not live evidence. |
 | Operator-supplied permalink (`MANUAL_URL`) | Offline intake only; no application fetch implied | A manually supplied URL can be stored/processed locally only under an accepted purpose/retention policy. Manual navigation or capture is a separate capability. |
-| Human manual UI navigation/capture | Not decided by this document | Verify applicable policy and data rights for the exact manual operation; do not infer permission from this issue or account ownership. |
-| Automated search UI read | **NO_GO / disabled** | Written, current, express authorization for the intended use: automated search of public Vietnamese recruiter posts and the resulting structured vacancy/contact processing. Review the [Automated Data Collection Terms](https://www.facebook.com/legal/automated_data_collection_terms) and [Meta help terms](https://help.instagram.com/769983657850450); document authority, purpose/basis, account/query/data bounds, retention, and private root. Clear [#64](https://github.com/pumni/threads-standalone/issues/64) and [BJ-05 #103](https://github.com/pumni/threads-standalone/issues/103) with narrow `GO_RESTRICTED` evidence and operator GO; pass the [#18](https://github.com/pumni/threads-standalone/issues/18)/[#46](https://github.com/pumni/threads-standalone/issues/46) fresh-root/test-account gates; accept the separately owned [#106](https://github.com/pumni/threads-standalone/issues/106) reader and bounded private UAT; then obtain the separate #102 CLI lease and coordinator handoff. |
-| Automated exact-post detail read | **NO_GO / disabled** | Same independent authorization and UAT, specifically covering post-detail text, attribution, disclosed contact fields, retention/export, and completeness claims. |
+| Human manual UI navigation/capture | Existing manually controlled browser operation | Use the operator-selected account/profile and preserve any applicable data-handling restrictions. |
+| Automated search UI read | **Runtime disabled; first-class Browser development target** | Complete reader/CLI integration, exact visible UI provenance, bounded search/scroll, account/profile isolation, privacy controls, explicit operator live opt-in and scoped UAT. Old #64/#103 Terms reviews are not coding prerequisites; this code path still must be deliberately enabled, not assumed active. |
+| Automated exact-post detail read | **Runtime disabled; first-class Browser development target** | Exact target and author validation, visibility/completeness evidence, bounded archive, contact minimization and the same scoped operator/UAT controls as search. |
 | Automated like/follow/repost | **Out of scope / disabled** | No unattended engagement. This contract supplies no gate or permission for these effects. |
-| UI reply compose or Send | **NO_GO / disabled** | Separate interaction authorization and per-action design/UAT under [#67](https://github.com/pumni/threads-standalone/issues/67). Read permission is insufficient. |
+| UI reply compose or Send | **Runtime disabled; separate effect feature** | Exact operator-reviewed account, target, draft and single-action confirmation, with effect journal/recovery and scoped technical UAT under [#67](https://github.com/pumni/threads-standalone/issues/67). A read-only session does not auto-send. |
 | Official API reads or mutations | Outside Browser Jobs | Separate documented endpoint scopes and task authorization; no token/API fallback is part of the browser reader. See [API-AUTO #71](https://github.com/pumni/threads-standalone/issues/71). |
 
-As checked for BJ-00, #64, #103, and #67 are OPEN and have no decision comments. No GO evidence was found. The Meta terms referenced by those gates must be reviewed and the exact decision recorded by the responsible coordinator; this document makes no legal interpretation of them. `BROWSER_UI` provenance must not be emitted until the applicable read gate and exact UAT have passed. Any permission expiry/revocation immediately returns the live reader to disabled state.
+Historical BJ-00 records #64/#103 as unresolved policy discussions. Under the current owner direction, they are not prerequisites for Browser source development. Real `BROWSER_UI` provenance requires actual scoped UI evidence and private technical UAT; loss of operator authorization or invalid session binding must stop the real reader. No text here claims platform endorsement or overrides actual external obligations.
 
 ## Release states
 
@@ -205,14 +207,14 @@ As checked for BJ-00, #64, #103, and #67 are OPEN and have no decision comments.
 | --- | --- |
 | `SYNTHETIC_READY` | A future implementation passes offline fake-source acceptance. It says nothing about live access, completeness on Threads, or permission. |
 | `MANUAL_INPUT_READY` | A future implementation safely processes operator-supplied local text without fetching Threads. A URL alone is target intake, not text evidence, and cannot produce vacancy fields. This state does not authorize or automate manual UI activity. |
-| `AUTHORIZED_BROWSER_READ_READY` | Only the exact read capability/account/purpose/bounds with documented authorization and private UAT is enabled. It is not a blanket permission for other reads, contact exports, or effects. |
-| `NO_GO` | Permission is denied, missing, expired, or unclear; live browser access stays disabled. Offline synthetic/manual processing may continue only if independently accepted. |
+| `AUTHORIZED_BROWSER_READ_READY` | Exact operator-selected account, read scope and limits are enabled after successful private technical UAT. This does not approve remote effects or contact export. |
+| `NO_GO` | Existing live source is disabled, session binding is invalid, or required operator opt-in is absent/revoked. Offline Browser development continues normally. |
 
 **Current Browser Jobs gate:** `CONTRACT=PROPOSED`; `AUTOMATED_BROWSER_READ=NO_GO`; `CONTACT_EXTRACTION=BLOCKED`; `UI_EFFECTS=NO_GO`. A docs-only BJ-00 review does not make the product `SYNTHETIC_READY` or `MANUAL_INPUT_READY`.
 
 ## Slice boundaries and coordinator decisions
 
-This contract covers BJ-00 only. BJ-01 is a pure offline extractor; BJ-02 is a synthetic bounded observation reader; BJ-03 is a separate private archive/export; BJ-04A/B adds a foreground engine and later CLI integration; BJ-05/#103 is the authorization gate; BJ-05B/#106 is separately permission-gated UI integration; BJ-06 is design-only for optional reviewed engagement; BJ-07 is release acceptance. Each requires its own explicit handoff. Do not edit existing queues, journals, S4/S6/S11A schemas, browser runtime, or shared CLI as part of this document. #92/S10B is merged; BJ-04B #102 still requires its own explicit shared-CLI integration/file lease.
+This contract covers BJ-00 only. BJ-01 is a pure offline extractor; BJ-02 is a synthetic bounded observation reader; BJ-03 is a separate private archive/export; BJ-04A/B adds a foreground engine and later CLI integration; BJ-05/#103 is a historical policy review, not a Browser coding prerequisite; BJ-05B/#106 is a distinct UI integration and technical UAT feature; BJ-06 is design-only for optional reviewed engagement; BJ-07 is release acceptance. Each requires its own explicit handoff. Do not edit existing queues, journals, S4/S6/S11A schemas, browser runtime, or shared CLI as part of this document. #92/S10B is merged; BJ-04B #102 still requires its own explicit shared-CLI integration/file lease.
 
 Coordinator acceptance should explicitly decide:
 
