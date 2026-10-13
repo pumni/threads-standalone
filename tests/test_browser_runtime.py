@@ -19,7 +19,7 @@ from threads_platform.browser.contracts import (
 )
 from threads_platform.locks.filesystem import FilesystemProcessLock
 from threads_platform.locks.process_lock import ProcessAlreadyRunning
-from threads_platform.standalone.accounts import LocalAccountStore
+from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 
 
@@ -84,6 +84,21 @@ class _FakeEngine:
         session = self._session_factory()
         self.sessions.append(session)
         return session
+
+
+class _ControlledTimeout:
+    def __init__(self) -> None:
+        self._timeout_factory = asyncio.timeout
+        self._active_timeout: asyncio.Timeout | None = None
+
+    def __call__(self, delay: float | None) -> asyncio.Timeout:
+        timeout = self._timeout_factory(delay)
+        self._active_timeout = timeout
+        return timeout
+
+    def expire(self) -> None:
+        assert self._active_timeout is not None
+        self._active_timeout.reschedule(asyncio.get_running_loop().time())
 
 
 def _add_account(root: Path, alias: str = "synthetic_account") -> LocalAccountStore:
@@ -558,7 +573,7 @@ def test_profile_and_lock_paths_do_not_cross_accounts(tmp_path: Path) -> None:
         first_lock.release()
 
 
-def test_browser_read_timeout_is_sanitized_and_releases_session_and_lock(
+def test_browser_read_timeout_before_session_is_sanitized_and_releases_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     accounts = _add_account(tmp_path)
@@ -566,18 +581,63 @@ def test_browser_read_timeout_is_sanitized_and_releases_session_and_lock(
     profile_directory = tmp_path / "profiles" / str(account.id)
     profile_directory.mkdir(parents=True)
 
-    class _SlowSession(_FakeSession):
-        async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
-            await asyncio.sleep(0.05)
+    timeout = _ControlledTimeout()
+    monkeypatch.setattr(runtime_module.asyncio, "timeout", timeout)
 
-    engine = _FakeEngine(_SlowSession)
+    class _PausedOpenEngine(_FakeEngine):
+        async def open(self, request: BrowserLaunchRequest) -> BrowserEngineSession:
+            await asyncio.Event().wait()
+            self.requests.append(request)
+            return await super().open(request)
+
+    engine = _PausedOpenEngine()
     runtime = LocalRuntime(tmp_path, accounts, engine)
-    monkeypatch.setattr(runtime_module, "_BROWSER_READ_TIMEOUT_SECONDS", 0.005)
+    resolve_profile_directory = runtime._profile_directory
+
+    def expire_before_open(local_account: LocalAccount) -> Path:
+        directory = resolve_profile_directory(local_account)
+        timeout.expire()
+        return directory
+
+    monkeypatch.setattr(runtime, "_profile_directory", expire_before_open)
 
     with pytest.raises(StandaloneRuntimeError) as caught:
         asyncio.run(runtime.open_profile("synthetic_account", "synthetic"))
 
     assert caught.value.code == "BROWSER_NAVIGATION_TIMEOUT"
+    assert engine.requests == []
+    assert engine.sessions == []
+    probe = FilesystemProcessLock(tmp_path / "locks" / f"{account.id}.lock")
+    probe.acquire()
+    probe.release()
+
+
+def test_browser_read_timeout_during_navigation_closes_session_and_releases_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    accounts = _add_account(tmp_path)
+    account = accounts.get("synthetic_account")
+    profile_directory = tmp_path / "profiles" / str(account.id)
+    profile_directory.mkdir(parents=True)
+    timeout = _ControlledTimeout()
+    monkeypatch.setattr(runtime_module.asyncio, "timeout", timeout)
+
+    class _PausedNavigationSession(_FakeSession):
+        async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
+            self.navigations.append((url, allowed_origins))
+            timeout.expire()
+            await asyncio.Event().wait()
+
+    engine = _FakeEngine(_PausedNavigationSession)
+    runtime = LocalRuntime(tmp_path, accounts, engine)
+
+    with pytest.raises(StandaloneRuntimeError) as caught:
+        asyncio.run(runtime.open_profile("synthetic_account", "synthetic"))
+
+    assert caught.value.code == "BROWSER_NAVIGATION_TIMEOUT"
+    assert len(engine.requests) == 1
+    assert len(engine.sessions) == 1
+    assert engine.sessions[0].navigations
     assert engine.sessions[0].closed
     probe = FilesystemProcessLock(tmp_path / "locks" / f"{account.id}.lock")
     probe.acquire()
