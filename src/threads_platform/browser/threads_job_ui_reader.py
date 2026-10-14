@@ -220,17 +220,6 @@ _PAGE_STATE_SCRIPT = r"""
     const parent = card.parentElement;
     return visible(card) && (!parent || !parent.closest(cardSelector));
   });
-  const detailRootCount = expectedPath.startsWith('/@')
-    ? Array.from(document.querySelectorAll('a[href]')).filter((anchor) => {
-        if (!visible(anchor) || anchor.closest('nav, aside, footer, blockquote')) return false;
-        try {
-          const url = new URL(anchor.getAttribute('href'), window.location.href);
-          return url.origin === expectedOrigin && !url.search && !url.hash &&
-            url.pathname === expectedPath &&
-            /^\/@[A-Za-z0-9._:-]{1,96}\/(?:post-[A-Za-z0-9._:-]{1,128}|post\/[A-Za-z0-9._:-]{1,128})$/.test(url.pathname);
-        } catch (_) { return false; }
-      }).length
-    : 0;
   const visibleBodyChildCount = document.body
     ? Array.from(document.body.children).filter(visible).length
     : 0;
@@ -249,7 +238,6 @@ _PAGE_STATE_SCRIPT = r"""
     actorLinks: verifiedActorLinks,
     searchValues,
     searchQueryMatches,
-    detailRootCount,
     searchPanelMode,
     visibleBodyChildCount
   };
@@ -813,6 +801,9 @@ _DETAIL_SCRIPT = r"""
   const targetPath = new URL(target).pathname;
   const postPathPattern = /^\/@([A-Za-z0-9._:-]{1,96})\/(?:post-[A-Za-z0-9._:-]{1,128}|post\/[A-Za-z0-9._:-]{1,128})$/;
   const profilePathPattern = /^\/@[A-Za-z0-9._:-]{1,96}$/;
+  const targetPathMatch = targetPath.match(postPathPattern);
+  if (!targetPathMatch) return {ok: false, reason: 'root'};
+  const targetAuthorPath = `/@${targetPathMatch[1]}`;
   const isAuxiliary = (element) => {
     let current = element.parentElement;
     while (current && current !== main) {
@@ -838,51 +829,70 @@ _DETAIL_SCRIPT = r"""
     if (postPaths.includes(targetPath)) semanticMatches.push({card, ownAnchors, postPaths, semantic: true});
   }
   let candidates = semanticMatches;
-  let failedAuthor = false;
   if (candidates.length === 0) {
-    const targetAnchors = Array.from(main.querySelectorAll('a[href]')).filter((anchor) =>
-      visible(anchor) && !anchor.closest('blockquote, nav, footer, aside') &&
+    const allAnchors = Array.from(main.querySelectorAll('a[href]'));
+    const bodyNodes = Array.from(main.querySelectorAll('div[dir="auto"]')).filter((body) => {
+      if (!visible(body) || isAuxiliary(body) || body.closest('header, blockquote, aside, nav, footer')) {
+        return false;
+      }
+      if (body.querySelector('article, [role="article"], blockquote, aside, nav, footer')) return false;
+      return !Array.from(body.querySelectorAll('div[dir="auto"]')).some((child) => visible(child));
+    });
+    if (allAnchors.length > 3000 || bodyNodes.length > 256) return {ok: false, reason: 'dom_bound'};
+    const authorAnchors = allAnchors.filter((anchor) =>
+      visible(anchor) && !isAuxiliary(anchor) && !anchor.closest('blockquote, nav, footer, aside') &&
+      canonicalPath(anchor.getAttribute('href')) === targetAuthorPath
+    );
+    if (authorAnchors.length > 128 || authorAnchors.length * bodyNodes.length > 256) {
+      return {ok: false, reason: 'dom_bound'};
+    }
+    const targetAnchors = allAnchors.filter((anchor) =>
+      visible(anchor) && !isAuxiliary(anchor) && !anchor.closest('blockquote, nav, footer, aside') &&
       canonicalPath(anchor.getAttribute('href')) === targetPath
     );
-    if (targetAnchors.length === 0) return {ok: false, reason: 'root'};
-    if (targetAnchors.length > 1) return {ok: false, reason: 'permalink'};
-    const anchor = targetAnchors[0];
-    let fallbackCandidate = null;
-    let current = anchor.parentElement;
-    for (let depth = 0; current && current !== main && depth < 12; depth++, current = current.parentElement) {
-      if (current.matches('blockquote, nav, footer, aside') || !visible(current)) continue;
-      const ownAnchors = Array.from(current.querySelectorAll('a[href]')).filter((item) =>
-        visible(item) && !item.closest('blockquote, nav, footer, aside')
-      );
-      const postPaths = ownAnchors.map((item) => canonicalPath(item.getAttribute('href')))
-        .filter((path) => typeof path === 'string' && postPathPattern.test(path));
-      if (postPaths.length !== 1 || postPaths[0] !== targetPath) continue;
-      const headerAnchors = Array.from(current.querySelectorAll('header a[href]')).filter((item) =>
-        visible(item) && !item.closest('blockquote, nav, footer, aside')
-      );
-      const profileAnchors = headerAnchors.length ? headerAnchors : ownAnchors;
-      const authorPaths = Array.from(new Set(profileAnchors.map((item) => canonicalPath(item.getAttribute('href')))
-        .filter((path) => typeof path === 'string' && profilePathPattern.test(path))));
-      if (authorPaths.length === 1) {
-        if (!fallbackCandidate) fallbackCandidate = {card: current, ownAnchors, postPaths, semantic: false};
-        if (current.querySelector('div[dir="auto"], img')) {
-          candidates = [{card: current, ownAnchors, postPaths, semantic: false}];
-          break;
+
+    const genericCandidates = new Map();
+    for (const authorAnchor of authorAnchors) {
+      for (const body of bodyNodes) {
+        let current = authorAnchor.parentElement;
+        let depth = 1;
+        while (current && current !== main && depth <= 12 && !current.contains(body)) {
+          current = current.parentElement;
+          depth++;
         }
-        continue;
+        if (!current || !current.contains(body) || depth > 12 ||
+            (current === document.body && main === document.body) ||
+            !visible(current) || current.closest('blockquote, nav, footer, aside')) {
+          continue;
+        }
+        if (Array.from(current.querySelectorAll(cardSelector)).some((card) => visible(card))) continue;
+        if (targetAnchors.some((anchor) => !current.contains(anchor))) continue;
+
+        const ownAnchors = allAnchors.filter((anchor) =>
+          current.contains(anchor) && visible(anchor) && !anchor.closest('blockquote, nav, footer, aside')
+        );
+        const authorPaths = Array.from(new Set(ownAnchors.map((item) => canonicalPath(item.getAttribute('href')))
+          .filter((path) => typeof path === 'string' && profilePathPattern.test(path))));
+        if (authorPaths.length !== 1 || authorPaths[0] !== targetAuthorPath) continue;
+        const postPaths = Array.from(new Set(ownAnchors.map((item) => canonicalPath(item.getAttribute('href')))
+          .filter((path) => typeof path === 'string' && postPathPattern.test(path))));
+        if (postPaths.length > 1 || (postPaths.length === 1 && postPaths[0] !== targetPath)) continue;
+        const containedBodies = bodyNodes.filter((candidateBody) => current.contains(candidateBody));
+        if (containedBodies.length !== 1 || containedBodies[0] !== body) continue;
+        genericCandidates.set(current, {card: current, ownAnchors, postPaths, semantic: false});
       }
-      failedAuthor = true;
-      if (authorPaths.length > 1) break;
     }
-    if (candidates.length === 0 && fallbackCandidate) candidates = [fallbackCandidate];
-    if (candidates.length === 0) return {ok: false, reason: failedAuthor ? 'author' : 'root'};
+    if (genericCandidates.size !== 1) return {ok: false, reason: 'root'};
+    candidates = Array.from(genericCandidates.values());
   }
   if (candidates.length !== 1) return {ok: false, reason: 'root'};
   const candidate = candidates[0];
   const owns = (element) => candidate.semantic
     ? element.closest(cardSelector) === candidate.card
     : candidate.card.contains(element);
-  if (candidate.postPaths.length !== 1) return {ok: false, reason: 'permalink'};
+  const postPaths = Array.from(new Set(candidate.postPaths));
+  if (postPaths.length > 1 || (postPaths.length === 1 && postPaths[0] !== targetPath) ||
+      (candidate.semantic && postPaths[0] !== targetPath)) return {ok: false, reason: 'permalink'};
 
   const headerAnchors = Array.from(candidate.card.querySelectorAll('header a[href]')).filter((anchor) =>
     owns(anchor) && !anchor.closest('blockquote, nav, footer, aside') && visible(anchor)
@@ -890,7 +900,7 @@ _DETAIL_SCRIPT = r"""
   const profileAnchors = headerAnchors.length ? headerAnchors : candidate.ownAnchors;
   const authorPaths = Array.from(new Set(profileAnchors.map((anchor) => canonicalPath(anchor.getAttribute('href')))
     .filter((path) => typeof path === 'string' && profilePathPattern.test(path))));
-  if (authorPaths.length !== 1) return {ok: false, reason: 'author'};
+  if (authorPaths.length !== 1 || authorPaths[0] !== targetAuthorPath) return {ok: false, reason: 'author'};
 
   const bodies = Array.from(candidate.card.querySelectorAll('div[dir="auto"]')).filter((body) => {
     if (!owns(body, candidate.card) || !visible(body) || body.closest('header, blockquote, aside, nav, footer')) {
@@ -1864,6 +1874,7 @@ class AsyncThreadsJobUiReader:
 
             mains = result.get("mains")
             navigations = result.get("navigations")
+            visible_body_child_count = result.get("visibleBodyChildCount")
             search_values_value = result.get("searchValues")
             search_values = (
                 cast(list[object], search_values_value)
@@ -1886,7 +1897,10 @@ class AsyncThreadsJobUiReader:
             elif stage == "SEARCH" and mains == 0:
                 root_ready = len(search_values) == 1 and search_values[0] == expected_query
             elif stage == "DETAIL" and mains == 0:
-                root_ready = result.get("detailRootCount") == 1
+                # The exact route and configured actor are checked independently.
+                # A visible shell lets the bounded Detail reader wait for one
+                # author/body container; a self permalink is not required there.
+                root_ready = type(visible_body_child_count) is int and visible_body_child_count > 0
 
             query_ready = True
             if require_search:
@@ -2016,7 +2030,10 @@ class AsyncThreadsJobUiReader:
             if len(values) == 1 and values[0] != expected_query:
                 return "BROWSER_QUERY_MISMATCH"
             return "SEARCH_UI_NOT_READY" if not values else "SEARCH_ACTOR_UNVERIFIED"
-        root_ready = mains == 1 or (mains == 0 and result.get("detailRootCount") == 1)
+        visible_body_child_count = result.get("visibleBodyChildCount")
+        root_ready = mains == 1 or (
+            mains == 0 and type(visible_body_child_count) is int and visible_body_child_count > 0
+        )
         if not root_ready:
             return "DETAIL_ROOT_UNRECOGNIZED"
         return "DETAIL_ACTOR_UNVERIFIED"

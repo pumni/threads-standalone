@@ -330,6 +330,32 @@ def _visual_detail(actor: str, post_id: str) -> str:
     )
 
 
+def _generic_div_detail(
+    actor: str,
+    *,
+    primary_author: str = "synthetic.author",
+    duplicate_primary: bool = False,
+) -> str:
+    primary = (
+        f'<div><div><a href="/@{primary_author}">@{primary_author}</a></div>'
+        f'<div dir="auto">{_BODIES["001"]}</div></div>'
+    )
+    if duplicate_primary:
+        primary += (
+            f'<div><div><a href="/@{primary_author}">@{primary_author}</a></div>'
+            f'<div dir="auto">{_BODIES["001"]}</div></div>'
+        )
+    return _with_two_area_navigation(
+        "<!doctype html><html><head><meta charset=utf-8></head><body><div>"
+        f"{primary}"
+        '<div><div><a href="/@related.author">@related.author</a>'
+        '<a href="/@related.author/post/related">time</a></div>'
+        '<div dir="auto">A synthetic related reply remains separate.</div></div>'
+        "</div></body></html>",
+        actor,
+    )
+
+
 def _fixture_document(
     *,
     actor: str = _ACTOR,
@@ -791,6 +817,12 @@ def _manual_assist_pages(
         else '<div class="search-overlay">'
     )
     root_close = "</div>"
+    search_results = (
+        f'<section role="region" aria-label="Search results">{card}</section>'
+        if scoped_search
+        else ""
+    )
+    unscoped_results = "" if scoped_search else f"<section>{card}</section>"
     search = (
         "<!doctype html><html><head><meta charset=utf-8></head><body>"
         '<nav role="navigation"><a href="/@'
@@ -802,7 +834,7 @@ def _manual_assist_pages(
         '<input type="search" role="searchbox" aria-label="Search" value="design">'
         '<div role="tablist"><button role="tab" aria-selected="true">Top</button>'
         '<button role="tab" aria-selected="false">Recent</button></div>'
-        f'<section role="region" aria-label="Search results">{card}</section>{root_close}'
+        f"{search_results}{root_close}{unscoped_results}"
         "</body></html>"
     )
     detail = (
@@ -1805,7 +1837,6 @@ def test_browser_source_rejects_unrecognized_search_panel_without_checkpoint(
     assert "ERROR SEARCH_RESULTS_REGION_UNPROVEN" in output.err
     assert requested_urls == [
         f"{BROWSER_FEED_ORIGIN}/",
-        f"{BROWSER_FEED_ORIGIN}/search",
         f"{BROWSER_FEED_ORIGIN}/search?q=design",
     ]
     assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
@@ -1929,6 +1960,160 @@ def test_browser_source_rejects_unproven_exact_details(
     assert exit_code == 1
     assert f"ERROR {reason}" in output.err
     assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+
+
+def test_browser_source_reads_generic_div_detail_without_self_permalink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "detail-generic-div-no-self-link-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    state = BrowserNurtureStateStore(root)
+    config = state.load_config(account.id)
+    assert config is not None
+    checkpoint = state.load_checkpoint(
+        account.id,
+        policy_fingerprint=browser_nurture_policy_fingerprint(config),
+    )
+    state.save_checkpoint(replace(checkpoint, completed_cycles=2, scanned=3))
+    checkpoint_path = root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json"
+    checkpoint_before = checkpoint_path.read_bytes()
+
+    pages = _offline_live_pages(actor)
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _generic_search_results(
+        actor,
+        "design",
+        _visual_card("001"),
+        home_cards=_visual_card("002"),
+    )
+    detail_url = _target("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    detail_html = _generic_div_detail(actor)
+    target_path = "/@synthetic.author/post/001"
+    assert "<main" not in detail_html and "<article" not in detail_html
+    assert target_path not in detail_html
+    assert "/@related.author/post/related" in detail_html
+    pages[detail_url] = detail_html
+    read_details: list[UiPostDetail] = []
+    original_read = playwright_engine_module._PlaywrightBrowserSession.read_exact_ui_post
+
+    async def record_detail(session: Any, target: str, **kwargs: Any) -> UiPostDetail:
+        detail = await original_read(session, target, **kwargs)
+        read_details.append(detail)
+        return detail
+
+    monkeypatch.setattr(
+        playwright_engine_module._PlaywrightBrowserSession,
+        "read_exact_ui_post",
+        record_detail,
+    )
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+        smoke=True,
+    )
+
+    assert exit_code == 0, output.out + output.err
+    assert "AUTO_READ status=COMPLETE reason=NONE posts_read=1" in output.out
+    assert "classification=RELEVANT checkpoint=UNCHANGED" in output.out
+    assert len(read_details) == 1
+    assert read_details[0].author_username == "synthetic.author"
+    assert read_details[0].body == _BODIES["001"]
+    assert read_details[0].body_visibility is UiBodyVisibility.FULL_VISIBLE
+    assert requested_urls.count(detail_url) == 1
+    assert checkpoint_path.read_bytes() == checkpoint_before
+    assert all(
+        secret not in output.out + output.err
+        for secret in (
+            actor,
+            "synthetic.author",
+            _BODIES["001"],
+            detail_url,
+            BROWSER_FEED_ORIGIN,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ("wrong-author", "multiple-primary-containers", "wrong-permalink"),
+)
+def test_browser_source_stops_on_unproven_generic_div_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variant: str,
+) -> None:
+    _require_local_chromium()
+    monkeypatch.setattr(ui_reader_module, "_READINESS_TIMEOUT_MS", 300)
+    root = tmp_path / f"detail-generic-div-{variant}-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    state = BrowserNurtureStateStore(root)
+    config = state.load_config(account.id)
+    assert config is not None
+    checkpoint = state.load_checkpoint(
+        account.id,
+        policy_fingerprint=browser_nurture_policy_fingerprint(config),
+    )
+    state.save_checkpoint(replace(checkpoint, completed_cycles=2, scanned=3))
+    checkpoint_path = root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json"
+    checkpoint_before = checkpoint_path.read_bytes()
+
+    pages = _offline_live_pages(actor)
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _generic_search_results(
+        actor,
+        "design",
+        _visual_card("001"),
+    )
+    detail_url = _target("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    detail_html = _generic_div_detail(
+        actor,
+        primary_author="offline.other" if variant == "wrong-author" else "synthetic.author",
+        duplicate_primary=variant == "multiple-primary-containers",
+    )
+    if variant == "wrong-permalink":
+        detail_html = detail_html.replace(
+            '<a href="/@synthetic.author">@synthetic.author</a>',
+            '<a href="/@synthetic.author">@synthetic.author</a>'
+            '<a href="/@synthetic.author/post/002">time</a>',
+            1,
+        )
+    pages[detail_url] = detail_html
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+        smoke=True,
+    )
+
+    assert exit_code == 1
+    assert "AUTO_READ status=STOPPED reason=DETAIL_ROOT_UNRECOGNIZED posts_read=0" in output.out
+    assert "checkpoint=UNCHANGED" in output.out
+    assert requested_urls.count(detail_url) == 1
+    assert checkpoint_path.read_bytes() == checkpoint_before
+    assert all(
+        secret not in output.out + output.err
+        for secret in (
+            actor,
+            "synthetic.author",
+            "offline.other",
+            _BODIES["001"],
+            detail_url,
+            BROWSER_FEED_ORIGIN,
+        )
+    )
 
 
 def test_browser_source_keeps_missing_visible_body_unknown_and_checkpoints_exact_read(
@@ -2555,6 +2740,7 @@ def test_manual_assist_rejects_unscoped_search_container_without_reading_home(
     assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
     assert "Home feed must stay outside Search results." not in output.out + output.err
     assert "Home-only synthetic content." not in output.out + output.err
+    assert not any("/post/" in url for url in requested_urls)
     assert all(url in pages for url in requested_urls)
 
 
