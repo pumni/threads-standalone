@@ -1,42 +1,71 @@
-name: cheap
+name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
   pull-requests: read
 
 jobs:
-  secret-scan:
-    name: full-history Gitleaks
+  classify:
+    name: classify, docs checks, and full-history Gitleaks
     runs-on: ubuntu-latest
+    outputs:
+      lane: ${{ steps.route.outputs.lane }}
+      has_docs: ${{ steps.route.outputs.has_docs }}
+      docs_result: ${{ steps.docs.outputs.result }}
     steps:
-      - name: Checkout full history for secret scan
+      - name: Checkout full history for change routing and secret scans
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - name: Scan for secrets
+      - name: Scan pull request or push commits with Gitleaks
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_COMMENTS: "false"
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
 
-      - name: Scan complete Git history
+      - name: Scan all reachable Git history
         run: gitleaks detect --source . --redact --exit-code=2 --log-opts=--all
 
-  quality:
-    name: locked QA (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.14"]
+      - name: Classify changed files
+        id: route
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_BEFORE_SHA: ${{ github.event.before }}
+          CI_AFTER_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/ci.py classify
+
+      - name: Check changed Markdown links and diff whitespace
+        id: docs
+        if: steps.route.outputs.has_docs == 'true'
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_BEFORE_SHA: ${{ github.event.before }}
+          CI_AFTER_SHA: ${{ github.sha }}
+        run: |
+          python3 .github/scripts/ci.py docs
+          echo "result=success" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Ubuntu locked QA and installed-wheel smoke
+    needs: classify
+    if: needs.classify.result == 'success' && needs.classify.outputs.lane != 'DOCS_ONLY'
+    runs-on: ubuntu-latest
     defaults:
       run:
         shell: pwsh
@@ -48,18 +77,14 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.12.23"
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.14"
 
       - name: Sync locked environment
         run: uv sync --locked
 
       - name: Install Chromium and Linux browser dependencies
-        if: runner.os == 'Linux'
+        if: needs.classify.outputs.lane != 'API_ONLY'
         run: uv run --locked playwright install --with-deps chromium
-
-      - name: Install Chromium
-        if: runner.os == 'Windows'
-        run: uv run --locked playwright install chromium
 
       - name: Audit locked runtime dependency tree
         run: uv tree --locked --no-dev
@@ -73,44 +98,128 @@ jobs:
       - name: Pyright
         run: uv run --locked pyright
 
-      - name: Full synthetic test suite
-        run: uv run --locked pytest
+      - name: Run selected synthetic suite with duration diagnostics
+        env:
+          CI_LANE: ${{ needs.classify.outputs.lane }}
+        run: uv run --locked python .github/scripts/ci.py run-tests $env:CI_LANE
 
       - name: One-command synthetic recruitment shortlist demo
+        if: needs.classify.outputs.lane != 'BROWSER_ONLY'
         run: uv run --locked python scripts/demo_recruitment_shortlist.py
 
       - name: Build wheel and source distribution
         run: uv build
 
-      - name: Install wheel with locked dependencies and test outside the checkout
-        env:
-          PYTHONPATH: ""
-          THREADS_STANDALONE_WHEEL_SMOKE: "1"
+      - name: Install wheel with locked dependencies and run targeted source-free smoke
+        run: .github/scripts/wheel-smoke.ps1
+
+  windows-smoke:
+    name: Windows API and shared compatibility smoke
+    needs: classify
+    if: needs.classify.result == 'success' && (needs.classify.outputs.lane == 'API_ONLY' || needs.classify.outputs.lane == 'SHARED')
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.23"
+          python-version: "3.14"
+
+      - name: Sync locked environment
+        run: uv sync --locked
+
+      - name: Verify Windows API and Browser CLI startup
         run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          $requirements = Join-Path $env:RUNNER_TEMP 'locked-wheel-smoke-requirements.txt'
-          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
-          $wheel = Get-ChildItem -LiteralPath $dist -Filter 'threads_standalone-0.1.0-*.whl' | Select-Object -First 1
-          if (-not $wheel) { throw 'built wheel was not found' }
-          $env:THREADS_STANDALONE_WHEEL_PATH = $wheel.FullName
-          uv export --locked --no-emit-project --output-file $requirements | Out-Null
-          $venv = Join-Path $env:RUNNER_TEMP 'wheel-smoke-venv'
-          uv venv --python 3.14 $venv
-          if ($IsWindows) {
-            $python = Join-Path $venv 'Scripts/python.exe'
-            $cli = Join-Path $venv 'Scripts/threads-local.exe'
-          } else {
-            $python = Join-Path $venv 'bin/python'
-            $cli = Join-Path $venv 'bin/threads-local'
-          }
-          uv pip sync --python $python $requirements
-          uv pip install --python $python --no-deps $wheel.FullName
-          Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
-          Push-Location $env:RUNNER_TEMP
-          try {
-            & $cli --help
-            & $python -m pytest (Join-Path $env:GITHUB_WORKSPACE 'tests')
-          } finally {
-            Pop-Location
-          }
+          uv run --locked threads-local --help
+          uv run --locked threads-local api --help
+          uv run --locked threads-local browser --help
+
+      - name: Run Windows filesystem, lock, process, CLI, and Browser lifecycle smoke
+        run: uv run --locked python .github/scripts/ci.py run-tests windows-smoke
+
+  windows-browser:
+    name: Windows Browser acceptance
+    needs: classify
+    if: needs.classify.result == 'success' && needs.classify.outputs.lane == 'BROWSER_ONLY'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.23"
+          python-version: "3.14"
+
+      - name: Sync locked environment
+        run: uv sync --locked
+
+      - name: Install Chromium
+        run: uv run --locked playwright install chromium
+
+      - name: Run Browser and Windows compatibility acceptance with duration diagnostics
+        run: uv run --locked python .github/scripts/ci.py run-tests windows-browser
+
+  windows-full:
+    name: Windows full synthetic regression and packaging smoke
+    needs: classify
+    if: needs.classify.result == 'success' && needs.classify.outputs.lane == 'FULL'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.23"
+          python-version: "3.14"
+
+      - name: Sync locked environment
+        run: uv sync --locked
+
+      - name: Install Chromium
+        run: uv run --locked playwright install chromium
+
+      - name: Run full synthetic suite with duration diagnostics
+        run: uv run --locked python .github/scripts/ci.py run-tests windows-full
+
+      - name: Build wheel and source distribution
+        run: uv build
+
+      - name: Install wheel with locked dependencies and run targeted source-free smoke
+        run: .github/scripts/wheel-smoke.ps1
+
+  required:
+    name: required CI gate
+    if: always()
+    needs: [classify, linux, windows-smoke, windows-browser, windows-full]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Enforce the selected lane's required results
+        env:
+          CI_LANE: ${{ needs.classify.outputs.lane }}
+          CI_HAS_DOCS: ${{ needs.classify.outputs.has_docs }}
+          CI_DOCS_RESULT: ${{ needs.classify.outputs.docs_result }}
+          CI_CLASSIFY_RESULT: ${{ needs.classify.result }}
+          CI_LINUX_RESULT: ${{ needs.linux.result }}
+          CI_WINDOWS_SMOKE_RESULT: ${{ needs.windows-smoke.result }}
+          CI_WINDOWS_BROWSER_RESULT: ${{ needs.windows-browser.result }}
+          CI_WINDOWS_FULL_RESULT: ${{ needs.windows-full.result }}
+        run: python3 .github/scripts/ci.py gate

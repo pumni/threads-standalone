@@ -72,11 +72,26 @@ uv sync --locked
 uv run --locked ruff check .
 uv run --locked ruff format --check .
 uv run --locked pyright
-uv run --locked pytest
-uv build
+uv run --locked pytest tests/test_api_runtime.py tests/test_cli_smoke.py
 ```
 
-CI installs Playwright Chromium for offline browser acceptance and installs the built wheel with locked runtime dependencies in an isolated environment outside the checkout. It clears `PYTHONPATH`, verifies the `threads-local` entry point and package contents, and runs the synthetic suite against the installed wheel. Chromium-dependent Browser Nurture E2E fails instead of skipping when the browser is unavailable; synthetic fixtures use temporary roots and the live-source routing test intercepts every browser request locally.
+## Development and CI verification
+
+For local development, run tests directly related to the change and the relevant lint/type checks. API changes do not need the full Browser E2E suite; Browser changes do not need API-specific tests by default. The explicit API, Browser, shared, and full-only test-file lists and source-file routing rules are maintained in the [CI routing helper](.github/scripts/ci.py). Any unmapped path, dependency/packaging change, or CI/test-infrastructure change selects full regression.
+
+The `CI` workflow always starts for pull requests and pushes to `main`; it does not use workflow-level path filters. Each PR gets full-history Gitleaks, and changed Markdown gets local-link and diff-whitespace checks. Code PRs also build a wheel and install it with locked dependencies in an isolated environment outside the checkout. `PYTHONPATH` is unset; the wheel smoke checks package metadata and contents, the `threads-local` entry point, API/Browser parser contracts, and one synthetic fake-engine CLI flow. The source lane checks the lazy Browser import boundary. Wheel smoke runs only the package/CLI files, requires zero skips, and does not rerun full pytest.
+
+| Change group | Required regression | Browser install | Windows coverage |
+| --- | --- | --- | --- |
+| `DOCS_ONLY` | Markdown links, `git diff --check`, and Gitleaks | No | No Python QA |
+| `API_ONLY` | API + shared test lists on Ubuntu; targeted wheel smoke | No | API runtime/mutation plus filesystem, lock, process, CLI, state, and Browser lifecycle smoke |
+| `BROWSER_ONLY` | Browser + shared test lists on Ubuntu; targeted wheel smoke | Ubuntu | Browser + Windows compatibility acceptance |
+| `SHARED` | Full API and Browser synthetic suite on Ubuntu; targeted wheel smoke | Ubuntu | Windows compatibility smoke |
+| `FULL` | Full synthetic suite, package build, and wheel smoke on Ubuntu and Windows | Both | Full Windows regression |
+
+Pytest reports the 30 slowest tests that take at least 0.5 seconds, with skipped/failure counts in the job output. Pushes to `main`, manual `workflow_dispatch`, and unclassified/critical changes use `FULL`. Newer runs cancel older runs for the same PR; main runs are not cancelled. The stable status check is named `required CI gate`; the repository owner must mark it required in branch protection after review.
+
+CI uses synthetic inputs and temporary roots only. Browser acceptance installs Chromium only in jobs that run Browser tests; fixtures use local/fake browser sessions and never send Threads requests. Both the Gitleaks Action event scan and the CLI `--all` history scan remain enabled because they provide event-commit reporting and repository-history coverage, respectively.
 
 Browser Nurture acceptance launches local Playwright Chromium against generated synthetic pages. Both the fixture source and the live-source routing test block all real network access; neither uses a Threads account or sends a Threads request. See [the Browser Nurture notes](docs/BROWSER_NURTURE.md).
 
