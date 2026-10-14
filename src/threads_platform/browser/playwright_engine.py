@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 from playwright.async_api import (
@@ -43,10 +44,18 @@ from threads_platform.browser.threads_job_ui_reader import (
     UiFeedBatch,
     UiPageState,
     UiPostDetail,
+    UiPostTarget,
+)
+from threads_platform.browser.ui_diagnostic import (
+    DIAGNOSTIC_SCRIPT,
+    UiDiagnosticSchemaError,
+    UiDiagnosticSnapshot,
+    validate_ui_diagnostic_snapshot,
 )
 
 _MAX_SYNTHETIC_FIXTURE_PAGES = 128
 _MAX_SYNTHETIC_FIXTURE_HTML_CODEPOINTS = 1_100_000
+_MANUAL_ASSIST_CLICK_TIMEOUT_SECONDS = 20
 
 _FEED_SCAN_SCRIPT = r"""
 ({allowedOrigin, candidateBound}) => {
@@ -182,6 +191,136 @@ _THREAD_OPEN_SCRIPT = r"""
 }
 """
 
+
+_OPERATOR_CLICK_OBSERVER_SCRIPT = r"""
+({allowedOrigin, sourceRoute, bindingName}) => {
+  const stateKey = '__threadsLocalUiDiagnosticClickState';
+  if (window[stateKey] && window[stateKey].installed === true) return true;
+  const state = {installed: true, armed: true, expectedOrigin: allowedOrigin, sourceRoute};
+  const bucket = (count) => count === 0 ? 'ZERO' : count === 1 ? 'ONE' : 'MANY';
+  const normalize = (value) => typeof value === 'string'
+    ? value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase() : '';
+  const safeTag = (element) => [
+    'A', 'BUTTON', 'INPUT', 'TEXTAREA', 'NAV', 'MAIN', 'ARTICLE', 'HEADER',
+    'SECTION', 'ASIDE', 'DIV', 'FORM'
+  ].includes(element.tagName) ? element.tagName : 'OTHER';
+  const safeRole = (element) => {
+    const role = (element.getAttribute('role') || '').trim().toLowerCase();
+    if (role === 'button') return 'BUTTON';
+    if (role === 'link') return 'LINK';
+    if (element.tagName === 'BUTTON') return 'BUTTON';
+    if (element.tagName === 'A') return 'LINK';
+    return 'OTHER';
+  };
+  const safeLabel = (element) => {
+    const name = (element.getAttribute('aria-label') || element.getAttribute('title') || '')
+      .replace(/\s+/g, ' ').trim().toLowerCase();
+    if (name === 'search' || name === 'search and explore') return 'SEARCH';
+    if (['profile', 'your profile', 'my profile', 'account', 'your account'].includes(name)) {
+      return 'PROFILE';
+    }
+    if (name === 'home') return 'HOME';
+    if (name === 'for you') return 'FOR_YOU';
+    if (name === 'top') return 'TOP';
+    if (name === 'recent') return 'RECENT';
+    return 'OTHER';
+  };
+  const roleOf = (element) => {
+    const role = normalize(element.getAttribute('role'));
+    if (role === 'button' || element.tagName === 'BUTTON') return 'BUTTON';
+    if (role === 'link' || element.tagName === 'A') return 'LINK';
+    return 'OTHER';
+  };
+  const visible = (element) => {
+    let current = element;
+    for (let depth = 0; current && depth < 32; current = current.parentElement, depth += 1) {
+      if (current.hidden || current.getAttribute('aria-hidden') === 'true') return false;
+      const style = window.getComputedStyle(current);
+      if (style.display === 'none' || style.visibility === 'hidden' ||
+          style.visibility === 'collapse' || style.contentVisibility === 'hidden' ||
+          current.hasAttribute('inert') || Number.parseFloat(style.opacity) === 0) return false;
+    }
+    if (current !== null) return false;
+    const rects = Array.from(element.getClientRects());
+    return rects.some((rect) => rect.width > 0 && rect.height > 0 && rect.right > 0 &&
+      rect.left < window.innerWidth && rect.bottom > 0 && rect.top < window.innerHeight);
+  };
+  const routeClass = () => {
+    if (window.location.origin !== state.expectedOrigin) return 'OTHER';
+    const path = window.location.pathname.replace(/\/$/, '') || '/';
+    if (/^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}$/i.test(path)) return 'POST';
+    if (/\/(search|explore)(\/|$)/i.test(path) || new URL(window.location.href).searchParams.has('q')) {
+      return 'SEARCH';
+    }
+    if (path === '/' || /^\/(home|for_you)$/i.test(path)) return 'HOME';
+    return 'OTHER';
+  };
+  const visibleSearchboxes = () => Array.from(document.querySelectorAll(
+    'input,textarea,[role="searchbox"],[role="textbox"]'
+  )).filter((element) => {
+    if (!visible(element)) return false;
+    const role = normalize(element.getAttribute('role'));
+    const isTextEntry = ['INPUT', 'TEXTAREA'].includes(element.tagName);
+    return role === 'searchbox' || isTextEntry &&
+      (safeLabel(element) === 'SEARCH' || normalize(element.getAttribute('type')) === 'search');
+  });
+  window.addEventListener('click', (event) => {
+    if (!state.armed || !event.isTrusted || routeClass() !== state.sourceRoute) return;
+    const control = event.composedPath().slice(0, 32).find((item) => item instanceof Element &&
+      item.matches('a[href],button,[role="button"],[role="link"]'));
+    if (!(control instanceof Element) || !visible(control)) return;
+    const navigationCandidates = Array.from(document.querySelectorAll('nav,[role="navigation"]'));
+    const controlCandidates = Array.from(document.querySelectorAll(
+      'a[href],button,[role="button"],[role="link"]'
+    ));
+    const searchboxCandidates = visibleSearchboxes();
+    if (navigationCandidates.length > 3_000 || controlCandidates.length > 3_000 ||
+        searchboxCandidates.length > 3_000) return;
+    state.armed = false;
+    const navigation = navigationCandidates.filter(visible);
+    const label = safeLabel(control);
+    const role = safeRole(control);
+    const tag = safeTag(control);
+    const semanticMatches = label === 'OTHER' ? [] : controlCandidates.filter((candidate) =>
+      visible(candidate) && safeRole(candidate) === role && safeLabel(candidate) === label
+    );
+    const anchor = control.closest('a[href]');
+    let targetPath = null;
+    if (anchor) {
+      try {
+        const target = new URL(anchor.getAttribute('href'), window.location.href);
+        const path = target.pathname.replace(/\/$/, '');
+        if (target.origin === state.expectedOrigin && !target.username && !target.password &&
+            !target.search && !target.hash &&
+            /^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}$/.test(path)) {
+          targetPath = path;
+        }
+      } catch (_) { /* Keep malformed destinations out of the diagnostic. */ }
+    }
+    const report = {
+      event_is_trusted: true,
+      source_route: routeClass(),
+      role,
+      tag,
+      label,
+      within_unique_navigation: navigation.length === 1 && navigation[0].contains(control),
+      stable_semantic_locator_unique: semanticMatches.length === 1,
+      before_searchboxes: bucket(searchboxCandidates.length),
+      is_post_permalink: targetPath !== null,
+      target_path: targetPath
+    };
+    try {
+      window[bindingName](JSON.stringify(report));
+    } catch (_) { /* A lost CDP binding leaves the action unverified. */ }
+  }, true);
+  window[stateKey] = state;
+  return true;
+}
+"""
+
+_UI_DIAGNOSTIC_CDP_WORLD_PREFIX = "threadsLocalUiDiagnostic"
+_UI_DIAGNOSTIC_CDP_BINDING_PREFIX = "threadsLocalUiDiagnosticRecord"
+
 _BROWSER_READ_READINESS_TIMEOUT_SECONDS = 2.0
 _BROWSER_READ_READINESS_POLL_SECONDS = 0.05
 
@@ -316,6 +455,17 @@ class _PlaywrightBrowserSession:
         self._synthetic_blocked_request_count = 0
         self._async_ui_reader: AsyncThreadsJobUiReader | None = None
         self._async_ui_reader_origin: str | None = None
+        self._ui_diagnostic_cdp_session: Any = None
+        self._ui_diagnostic_cdp_sequence = 0
+        self._ui_diagnostic_cdp_context_frames: dict[int, str] = {}
+        self._ui_diagnostic_click_armed_route: str | None = None
+        self._ui_diagnostic_click_context_id: int | None = None
+        self._ui_diagnostic_click_binding_name: str | None = None
+        self._ui_diagnostic_click_main_frame_id: str | None = None
+        self._ui_diagnostic_action_status = "UNVERIFIED"
+        self._ui_diagnostic_operator_click: dict[str, object] | None = None
+        # Volatile comparison input only; it is never copied to a report or log.
+        self._ui_diagnostic_operator_click_path: str | None = None
         page.on("crash", self._on_page_crash)
         context.on("close", self._on_context_close)
 
@@ -379,12 +529,14 @@ class _PlaywrightBrowserSession:
         *,
         expected_actor: str,
         origin: str,
+        one_post: bool = False,
     ) -> tuple[UiFeedBatch, ...]:
         self._ensure_alive()
         try:
             result = await self._get_async_ui_reader(origin).search(
                 query,
                 expected_actor=expected_actor,
+                one_post=one_post,
             )
         except BrowserAdapterError:
             self._ensure_alive()
@@ -414,6 +566,437 @@ class _PlaywrightBrowserSession:
         self._ensure_alive()
         await self._raise_ui_policy_error()
         return result
+
+    async def assisted_search_ui_results(
+        self,
+        query: str,
+        *,
+        expected_actor: str,
+        origin: str,
+    ) -> tuple[UiPostTarget, ...]:
+        self._ensure_alive()
+        try:
+            result = await self._get_async_ui_reader(origin).assisted_search_results(
+                query,
+                expected_actor=expected_actor,
+            )
+        except BrowserAdapterError:
+            self._ensure_alive()
+            await self._raise_ui_policy_error()
+            raise
+        self._ensure_alive()
+        await self._raise_ui_policy_error()
+        return result
+
+    async def wait_for_assisted_post_click(
+        self,
+        candidates: tuple[UiPostTarget, ...],
+        *,
+        origin: str,
+    ) -> str:
+        """Bind one trusted Search-result click to the currently opened same-origin post."""
+
+        self._ensure_alive()
+        normalized_origin = _normalized_browser_origin(origin)
+        if (
+            normalized_origin not in {BROWSER_FEED_ORIGIN, "https://threads.example.invalid"}
+            or self._allowed_navigation_origins != frozenset({normalized_origin})
+            or not candidates
+        ):
+            raise UnsupportedUIState()
+        paths: dict[str, str] = {}
+        for candidate in candidates:
+            parsed = urlsplit(candidate.canonical_post_url)
+            if (
+                _normalized_browser_origin(candidate.canonical_post_url) != normalized_origin
+                or parsed.query
+                or parsed.fragment
+                or not re.fullmatch(
+                    r"/@[A-Za-z0-9._:-]{1,96}/(?:post-[A-Za-z0-9._:-]{1,128}|post/[A-Za-z0-9._:-]{1,128})",
+                    parsed.path,
+                )
+            ):
+                raise BrowserAdapterError("SEARCH_RESULTS_UNPROVEN")
+            paths[parsed.path] = candidate.canonical_post_url
+        if len(paths) != len(candidates):
+            raise BrowserAdapterError("SEARCH_RESULTS_UNPROVEN")
+
+        if (
+            self._ui_diagnostic_click_armed_route != "SEARCH"
+            and self._ui_diagnostic_operator_click is None
+        ):
+            raise UnsupportedUIState()
+        deadline = asyncio.get_running_loop().time() + _MANUAL_ASSIST_CLICK_TIMEOUT_SECONDS
+        while True:
+            self._ensure_alive()
+            await self._raise_navigation_policy_error()
+            click = self._ui_diagnostic_operator_click
+            clicked_path = self._ui_diagnostic_operator_click_path
+            if click is not None:
+                if click.get("source_route") != "SEARCH":
+                    raise BrowserAdapterError("DETAIL_SELECTION_NOT_IN_RESULTS")
+                if click.get("is_post_permalink") is not True:
+                    raise BrowserAdapterError("DETAIL_SELECTION_UNVERIFIED")
+                if clicked_path not in paths:
+                    raise BrowserAdapterError("DETAIL_SELECTION_NOT_IN_RESULTS")
+                try:
+                    current = urlsplit(self._page.url)
+                except ValueError:
+                    raise BrowserAdapterError("DETAIL_PROVENANCE_UNVERIFIED") from None
+                if (
+                    _normalized_browser_origin(self._page.url) != normalized_origin
+                    or current.path != clicked_path
+                    or current.query
+                    or current.fragment
+                ):
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise BrowserAdapterError("DETAIL_PROVENANCE_UNVERIFIED")
+                else:
+                    return paths[clicked_path]
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise BrowserAdapterError("DETAIL_SELECTION_UNVERIFIED")
+            await asyncio.sleep(min(0.1, remaining))
+
+    async def read_current_ui_post(
+        self,
+        target: str,
+        *,
+        expected_actor: str,
+        origin: str,
+    ) -> UiPostDetail:
+        self._ensure_alive()
+        try:
+            result = await self._get_async_ui_reader(origin).read_current_exact_post(
+                target,
+                expected_actor=expected_actor,
+            )
+        except BrowserAdapterError:
+            self._ensure_alive()
+            await self._raise_ui_policy_error()
+            raise
+        self._ensure_alive()
+        await self._raise_ui_policy_error()
+        return result
+
+    async def _ensure_ui_diagnostic_cdp(self) -> Any:
+        if self._ui_diagnostic_cdp_session is not None:
+            return self._ui_diagnostic_cdp_session
+        session = cast(Any, await self._context.new_cdp_session(self._page))
+        try:
+            await session.send("Page.enable")
+            await session.send("Runtime.enable")
+        except PlaywrightError:
+            try:
+                await session.detach()
+            except PlaywrightError:
+                pass
+            raise
+        session.on("Runtime.bindingCalled", self._receive_ui_diagnostic_operator_click)
+        self._ui_diagnostic_cdp_session = session
+        return session
+
+    async def _create_ui_diagnostic_world(self) -> tuple[Any, int, str]:
+        session = await self._ensure_ui_diagnostic_cdp()
+        frame_reply = cast(dict[str, object], await session.send("Page.getFrameTree"))
+        raw_frame_tree = frame_reply.get("frameTree")
+        if not isinstance(raw_frame_tree, dict):
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        frame_tree = cast(dict[str, object], raw_frame_tree)
+        frame = frame_tree.get("frame")
+        if not isinstance(frame, dict):
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        frame_dict = cast(dict[str, object], frame)
+        frame_id = frame_dict.get("id")
+        frame_url = frame_dict.get("url")
+        if (
+            not isinstance(frame_id, str)
+            or not isinstance(frame_url, str)
+            or _normalized_browser_origin(frame_url)
+            not in {
+                BROWSER_FEED_ORIGIN,
+                "https://threads.example.invalid",
+            }
+        ):
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        self._ui_diagnostic_cdp_sequence += 1
+        world_name = f"{_UI_DIAGNOSTIC_CDP_WORLD_PREFIX}{self._ui_diagnostic_cdp_sequence}"
+        world_reply = cast(
+            dict[str, object],
+            await session.send(
+                "Page.createIsolatedWorld",
+                {"frameId": frame_id, "worldName": world_name},
+            ),
+        )
+        context_id = world_reply.get("executionContextId")
+        if type(context_id) is not int:
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        return session, context_id, frame_id
+
+    @staticmethod
+    async def _evaluate_ui_diagnostic_world(
+        session: Any,
+        context_id: int,
+        script: str,
+        parameters: Mapping[str, object],
+    ) -> object:
+        expression = f"({script})({json.dumps(parameters, separators=(',', ':'))})"
+        reply = cast(
+            dict[str, object],
+            await session.send(
+                "Runtime.evaluate",
+                {
+                    "expression": expression,
+                    "contextId": context_id,
+                    "returnByValue": True,
+                    "awaitPromise": False,
+                },
+            ),
+        )
+        if "exceptionDetails" in reply:
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        raw_result = reply.get("result")
+        if not isinstance(raw_result, dict) or "value" not in raw_result:
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        result = cast(dict[str, object], raw_result)
+        return result["value"]
+
+    async def inspect_ui_diagnostic(
+        self,
+        *,
+        expected_username: str,
+        configured_topic: str,
+    ) -> UiDiagnosticSnapshot:
+        """Return only the fixed, privacy-validated semantic graph for the current page."""
+
+        self._ensure_alive()
+        origin = self._async_ui_reader_origin
+        if origin is None and len(self._allowed_navigation_origins) == 1:
+            origin = next(iter(self._allowed_navigation_origins))
+        if origin not in {
+            BROWSER_FEED_ORIGIN,
+            "https://threads.example.invalid",
+        } or self._allowed_navigation_origins != frozenset({origin}):
+            raise UnsupportedUIState()
+        await self._raise_navigation_policy_error()
+        try:
+            operator_click = self._ui_diagnostic_operator_click
+            cdp_session, context_id, _ = await self._create_ui_diagnostic_world()
+            raw_snapshot = await asyncio.wait_for(
+                self._evaluate_ui_diagnostic_world(
+                    cdp_session,
+                    context_id,
+                    DIAGNOSTIC_SCRIPT,
+                    {
+                        "allowedOrigin": origin,
+                        "expectedUsername": expected_username,
+                        "configuredTopic": configured_topic,
+                        "maxCandidates": 3_000,
+                        "maxNodes": 180,
+                        "maxRelations": 480,
+                        "operatorClick": operator_click,
+                        "operatorClickPath": self._ui_diagnostic_operator_click_path,
+                        "operatorActionStatus": self._ui_diagnostic_action_status,
+                    },
+                ),
+                timeout=3.0,
+            )
+        except TimeoutError, PlaywrightError:
+            self._ensure_alive()
+            await self._raise_navigation_policy_error()
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE") from None
+        self._ensure_alive()
+        await self._raise_navigation_policy_error()
+        try:
+            return validate_ui_diagnostic_snapshot(raw_snapshot)
+        except UiDiagnosticSchemaError:
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_SCHEMA_INVALID") from None
+
+    async def arm_ui_diagnostic_operator_click(self, *, source_route: str) -> None:
+        """Observe one trusted main-frame click in a CDP isolated world."""
+
+        if source_route not in {"HOME", "SEARCH", "POST", "OTHER"}:
+            raise UnsupportedUIState()
+        self._ensure_alive()
+        origin = self._async_ui_reader_origin
+        if origin is None and len(self._allowed_navigation_origins) == 1:
+            origin = next(iter(self._allowed_navigation_origins))
+        if origin not in {
+            BROWSER_FEED_ORIGIN,
+            "https://threads.example.invalid",
+        } or self._allowed_navigation_origins != frozenset({origin}):
+            raise UnsupportedUIState()
+        await self._raise_navigation_policy_error()
+        if self._ui_diagnostic_click_context_id is not None:
+            self._ui_diagnostic_cdp_context_frames.pop(self._ui_diagnostic_click_context_id, None)
+        self._ui_diagnostic_operator_click = None
+        self._ui_diagnostic_operator_click_path = None
+        self._ui_diagnostic_click_armed_route = source_route
+        self._ui_diagnostic_action_status = "UNVERIFIED"
+        context_id: int | None = None
+        try:
+            cdp_session, context_id, frame_id = await self._create_ui_diagnostic_world()
+            binding_name = f"{_UI_DIAGNOSTIC_CDP_BINDING_PREFIX}{self._ui_diagnostic_cdp_sequence}"
+            # The context ID was created from Page.getFrameTree's main-frame ID;
+            # the site and child frames have no access to this isolated-world binding.
+            await cdp_session.send(
+                "Runtime.addBinding",
+                {"name": binding_name, "executionContextId": context_id},
+            )
+            self._ui_diagnostic_click_context_id = context_id
+            self._ui_diagnostic_click_binding_name = binding_name
+            self._ui_diagnostic_click_main_frame_id = frame_id
+            self._ui_diagnostic_cdp_context_frames[context_id] = frame_id
+            armed = await self._evaluate_ui_diagnostic_world(
+                cdp_session,
+                context_id,
+                _OPERATOR_CLICK_OBSERVER_SCRIPT,
+                {
+                    "allowedOrigin": origin,
+                    "sourceRoute": source_route,
+                    "bindingName": binding_name,
+                },
+            )
+        except PlaywrightError:
+            self._ensure_alive()
+            await self._raise_navigation_policy_error()
+            self._ui_diagnostic_click_armed_route = None
+            self._ui_diagnostic_click_context_id = None
+            self._ui_diagnostic_click_binding_name = None
+            self._ui_diagnostic_click_main_frame_id = None
+            if context_id is not None:
+                self._ui_diagnostic_cdp_context_frames.pop(context_id, None)
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE") from None
+        except BrowserRuntimeUnavailable:
+            self._ui_diagnostic_click_armed_route = None
+            self._ui_diagnostic_click_context_id = None
+            self._ui_diagnostic_click_binding_name = None
+            self._ui_diagnostic_click_main_frame_id = None
+            if context_id is not None:
+                self._ui_diagnostic_cdp_context_frames.pop(context_id, None)
+            raise
+        if armed is not True:
+            self._ui_diagnostic_click_armed_route = None
+            self._ui_diagnostic_click_context_id = None
+            self._ui_diagnostic_click_binding_name = None
+            self._ui_diagnostic_click_main_frame_id = None
+            self._ui_diagnostic_cdp_context_frames.pop(context_id, None)
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        await self._raise_navigation_policy_error()
+
+    def _receive_ui_diagnostic_operator_click(self, event: object) -> None:
+        expected_route = self._ui_diagnostic_click_armed_route
+        expected_context_id = self._ui_diagnostic_click_context_id
+        expected_binding_name = self._ui_diagnostic_click_binding_name
+        expected_frame_id = self._ui_diagnostic_click_main_frame_id
+        if (
+            expected_route is None
+            or self._ui_diagnostic_operator_click is not None
+            or type(expected_context_id) is not int
+            or not isinstance(expected_binding_name, str)
+            or not isinstance(expected_frame_id, str)
+            or not isinstance(event, dict)
+        ):
+            return
+        event_dict = cast(dict[str, object], event)
+        context_id = event_dict.get("executionContextId")
+        payload = event_dict.get("payload")
+        if (
+            event_dict.get("name") != expected_binding_name
+            or type(context_id) is not int
+            or context_id != expected_context_id
+            or self._ui_diagnostic_cdp_context_frames.get(context_id) != expected_frame_id
+            or not isinstance(payload, str)
+            or len(payload) > 4_096
+        ):
+            return
+        try:
+            parsed_payload = json.loads(payload)
+        except TypeError, json.JSONDecodeError:
+            return
+        if not isinstance(parsed_payload, dict):
+            return
+        value = cast(dict[str, object], parsed_payload)
+        expected_keys = {
+            "event_is_trusted",
+            "source_route",
+            "role",
+            "tag",
+            "label",
+            "within_unique_navigation",
+            "stable_semantic_locator_unique",
+            "before_searchboxes",
+            "is_post_permalink",
+            "target_path",
+        }
+        source_route = value.get("source_route")
+        role = value.get("role")
+        tag = value.get("tag")
+        label = value.get("label")
+        within_unique_navigation = value.get("within_unique_navigation")
+        stable_semantic_locator_unique = value.get("stable_semantic_locator_unique")
+        before_searchboxes = value.get("before_searchboxes")
+        is_post_permalink = value.get("is_post_permalink")
+        target_path = value.get("target_path")
+        if (
+            set(value) != expected_keys
+            or value.get("event_is_trusted") is not True
+            or source_route != expected_route
+            or not isinstance(role, str)
+            or role not in {"BUTTON", "LINK", "OTHER"}
+            or not isinstance(tag, str)
+            or tag
+            not in {
+                "A",
+                "BUTTON",
+                "INPUT",
+                "TEXTAREA",
+                "NAV",
+                "MAIN",
+                "ARTICLE",
+                "HEADER",
+                "SECTION",
+                "ASIDE",
+                "DIV",
+                "FORM",
+                "OTHER",
+            }
+            or not isinstance(label, str)
+            or label not in {"HOME", "SEARCH", "PROFILE", "FOR_YOU", "TOP", "RECENT", "OTHER"}
+            or type(within_unique_navigation) is not bool
+            or type(stable_semantic_locator_unique) is not bool
+            or not isinstance(before_searchboxes, str)
+            or before_searchboxes not in {"ZERO", "ONE", "MANY"}
+            or type(is_post_permalink) is not bool
+            or (target_path is not None and not isinstance(target_path, str))
+        ):
+            return
+        safe_path = (
+            target_path
+            if isinstance(target_path, str)
+            and re.fullmatch(r"/@[A-Za-z0-9._]{1,30}/post/[A-Za-z0-9_-]{1,120}", target_path)
+            else None
+        )
+        if bool(safe_path) is not is_post_permalink:
+            return
+        self._ui_diagnostic_operator_click = {
+            "source_route": source_route,
+            "role": role,
+            "tag": tag,
+            "label": label,
+            "within_unique_navigation": within_unique_navigation,
+            "stable_semantic_locator_unique": stable_semantic_locator_unique,
+            "before_searchboxes": before_searchboxes,
+            "is_post_permalink": is_post_permalink,
+        }
+        self._ui_diagnostic_operator_click_path = safe_path
+        self._ui_diagnostic_action_status = "VERIFIED"
+        self._ui_diagnostic_click_armed_route = None
+        self._ui_diagnostic_click_context_id = None
+        self._ui_diagnostic_click_binding_name = None
+        self._ui_diagnostic_click_main_frame_id = None
+        self._ui_diagnostic_cdp_context_frames.clear()
 
     async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
         self._ensure_alive()
@@ -685,6 +1268,19 @@ class _PlaywrightBrowserSession:
         if self._closed:
             return
         self._closed = True
+        self._ui_diagnostic_click_armed_route = None
+        self._ui_diagnostic_click_context_id = None
+        self._ui_diagnostic_click_binding_name = None
+        self._ui_diagnostic_click_main_frame_id = None
+        self._ui_diagnostic_cdp_context_frames.clear()
+        self._ui_diagnostic_operator_click = None
+        self._ui_diagnostic_operator_click_path = None
+        if self._ui_diagnostic_cdp_session is not None:
+            try:
+                await self._ui_diagnostic_cdp_session.detach()
+            except Exception:  # noqa: BLE001, S110
+                pass
+            self._ui_diagnostic_cdp_session = None
         try:
             await self._context.close()
         except Exception:  # noqa: BLE001, S110

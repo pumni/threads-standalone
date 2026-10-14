@@ -4,11 +4,7 @@ Browser Nurture is a read-only, account-scoped workflow. It uses the registered 
 
 ## Status and boundaries
 
-The owner reported a private Windows UAT on the verified `main@bb415886` baseline. The existing profile, authenticated Home session, and data-root ACL were confirmed, but the one-shot run stopped with `BROWSER_SELECTOR_DRIFT` before Home had visibly finished loading. A privacy-safe aggregate inspection of that rendered Home reported `ready=complete`, `mains=0`, and `bannerLinks=0`. This confirms the previous readiness and Home selectors did not cover that observed structure.
-
-This update polls visible UI state for up to eight seconds per page operation. Home accepts one visible `main` root or one visible semantic `header` outside post cards. Its header fallback requires exactly one visible same-origin profile link with an accessible label beginning `Your profile`, `My profile`, `Your account`, or `My account`; the link must match the configured expected username. This generic semantic structure has only synthetic Chromium coverage. It is not a claim that the live Threads page uses that structure. Search and detail fallbacks remain bound to the exact visible query and exact post permalink, with unique author evidence. Stage-specific fixed errors include `HOME_UI_NOT_READY`, `HOME_ROOT_UNRECOGNIZED`, `HOME_ACTOR_UNVERIFIED`, `SEARCH_UI_NOT_READY`, `SEARCH_ROOT_UNRECOGNIZED`, `SEARCH_CARD_UNRECOGNIZED`, and `DETAIL_ROOT_UNRECOGNIZED`.
-
-The corrected reader's compatibility with the owner's live session remains **unverified** until the supervised rerun below succeeds. Synthetic CI results do not establish current Threads UI compatibility.
+Draft PR #172 is implementing a one-shot automatic read smoke on the existing Browser Nurture runner. The command verifies the signed-in actor on Home, navigates the headed Chromium profile to `/search`, submits the first configured topic, and reads at most one result after proving Search context, same-card permalink and author, exact detail provenance, and a complete visible body. The smoke does not write a cycle checkpoint. Live UI compatibility remains **unverified**; Codex and CI use offline synthetic pages only.
 
 The `browser` source requires an explicit source selection and a headed interactive one-shot confirmation. It reads only visible UI and stops on an account mismatch, login wall, challenge, rate limit, redirect, unsupported structure, timeout, or browser crash. The CLI does not expose likes, follows, replies, posts, or other engagement actions.
 
@@ -16,9 +12,39 @@ The `ui-fixture` source is for offline development and CI. It accepts only a pri
 
 Topic-search metrics describe only visible posts returned by configured searches. They are labeled `search_*` in CLI output. They do not measure the home or For You recommendation feed and cannot establish that a recommendation changed.
 
-For a manual before/after feed sample, use the same account and device and sample the first 20 visible posts from the same Home or For You tab at the same local time on three days before and three days after the observation period. Do not click, like, follow, reply, or open posts during the sample. Privately tally relevant, irrelevant, and unknown counts using the configured topics; retain aggregate counts and dates only, without post text, URLs, or actor details. Compare the six samples descriptively and do not attribute a difference to Nurture alone.
+## Manual-assisted read without a cycle checkpoint
 
-## Configure and run one supervised cycle
+`manual-assist` remains available as a separate supervised workflow. It requires operator navigation and is not the automatic P0 smoke described below.
+
+Run this separate command for one manual Search → post read:
+
+```powershell
+threads-local browser-nurture manual-assist <alias> --confirm-live-read-only
+```
+
+The command opens the selected account's headed Chromium profile under the existing account lock and verifies the configured actor on Home. In Chromium, manually open Search, submit the first configured topic, then press Enter in the terminal. The reader waits for at most eight seconds per attempt and continues only when the query input and URL match, a uniquely scoped Search region has a Top/Recent control, and visible result cards with one same-card permalink and author remain stable across polls. Cards from the underlying Home feed are outside that region and are ignored.
+
+After the Search region is verified, manually open one of its results and press Enter in the terminal. The selected URL must come from a trusted main-frame click and match a result in the verified Search region. The detail reader then requires the exact permalink, matching author, and visible body to belong to the same post container. It never derives post text from a permalink. If Search or Detail cannot be proven, no post is counted as read.
+
+The privacy-filtered V2 observation did not establish a Search-only region or visible result permalink: the observed Search surface had no `main`/`article` landmarks and no Search-labelled dialog. The manual-assist reader therefore keeps that shape fail-closed with `SEARCH_RESULTS_REGION_UNPROVEN`; it does not reuse Home content. The positive semantic Chromium fixture checks the reader contract only and is not evidence that the observed V2 Search surface is currently readable. A delegated Detail click without a captured permalink likewise reports `DETAIL_SELECTION_UNVERIFIED` and does not read the page body.
+
+Recoverable UI errors print a fixed code while Chromium remains open and offer Retry, Skip, or Stop. Manual prompts expire after five minutes; error decisions expire after one minute. Browser crashes, account mismatch, challenge/rate-limit states, and origin-guard failures stop the run. The UI reader is read-only: the command does not like, follow, comment, post, or message. It prints only stages, safe status codes, counts, and classification; it does not print the topic, account, URL, post text, screenshot, or DOM.
+
+This manual-assisted result is not an automated cycle. It does not read, create, or update the Browser Nurture cycle checkpoint, so output reports `checkpoint=UNCHANGED`. It has Chromium offline regression coverage only; it has not been exercised against live Threads from Codex or CI.
+
+## One-shot automatic read without a cycle checkpoint
+
+After ChatGPT Lead accepts the exact Draft PR HEAD and CI, run one command from the interactive PowerShell session that owns the registered account and its existing logged-in Chromium profile:
+
+```powershell
+uv run --locked threads-local browser-nurture run <alias> --source browser --confirm-live-read-only --smoke
+```
+
+After startup, the command proceeds without Search or Detail input from the operator. It verifies the configured actor on Home, uses ordinary same-origin Playwright navigation to `/search`, fills the first configured topic into the unique visible Search input, submits it with Enter, then waits for the applied URL query and a stable visible Search result snapshot. Search candidates must be tied to the active Posts/Top/Recent tab and each candidate's permalink and author must share one visible result container. A visible post outside that Search context, an ambiguous result, a missing body, or an unverified actor stops the smoke without reading a post.
+
+The smoke reads at most one post, reports only a fixed status, reason code, count and classification, and never creates or updates the cycle checkpoint. It does not like, follow, comment, post, message, use a hidden API, or run continuously. It requires the selected account's existing profile lock, a headed browser, an interactive terminal and `--confirm-live-read-only`. Do not run it against live Threads until Lead accepts the exact source and CI head. Codex and CI never access a real Threads session.
+
+## Separate automated checkpointed workflow
 
 Configure the registered account alias, the expected username visible in the account banner, one or more search topics, relevance terms, a post bound, and an idle interval:
 
@@ -34,7 +60,7 @@ threads-local browser-nurture configure <alias> `
 
 Use the existing manually logged-in UUID profile for that alias. Do not copy the profile or paste cookies or tokens. The alias selects the local profile; only the visible UI actor check proves the signed-in account matches `--expected-username`.
 
-For new profile onboarding, `threads-local account login <alias>` opens a headed browser in the selected account profile. Use the browser address bar to open `https://www.threads.com/`, then sign in manually if needed. The command never enters a password and does not restrict navigation during onboarding. It ends with `authentication=NOT_VERIFIED`; use the supervised Browser Nurture run below to verify the configured actor.
+For new profile onboarding, `threads-local account login <alias>` opens a headed browser in the selected account profile. Use the browser address bar to open `https://www.threads.com/`, then sign in manually if needed. The command never enters a password and does not restrict navigation during onboarding. It ends with `authentication=NOT_VERIFIED`; after Lead acceptance, use the manual-assisted pilot above to verify the configured actor.
 
 Run one headed cycle from an interactive PowerShell console:
 
@@ -47,74 +73,15 @@ threads-local browser-nurture run <alias> `
 
 The live source uses the configured data root and does not accept `--data-root` or `--fixture-file`. It requires both interactive input and output, so it cannot be started accidentally from a scheduled or redirected one-shot command. The browser window remains visible. The runner verifies one visible actor marker before searching, reads a bounded number of visible search cards, opens only exact same-origin post pages, classifies full visible post text, and commits the checkpoint after the complete cycle.
 
-Output contains safe stage codes and aggregate counts such as `search_scanned` and `search_relevant`; it does not print post text, URLs, or account identifiers. For the next private Windows UAT, run this one-shot command once. A successful output has `status=COMPLETE source=BROWSER_UI`, `cycles=1`, and `checkpoint_cycles=1`; privately confirm the visible actor and that at least one visible search post opened at its exact detail page. Do not enable continuous mode or Task Scheduler as part of this rerun.
+The automated `run` command remains a separate checkpointed workflow and is not the manual-assisted pilot described here. This PR does not request a live run or authorize continuous mode. The reviewed manual-assisted command must be accepted before an operator runs it against a real Threads session.
 
-If the command stops with `HOME_ROOT_UNRECOGNIZED` or `HOME_ACTOR_UNVERIFIED`, inspect only aggregate structure in the authenticated Home tab. Open DevTools Console and run this snippet; enter the configured username only in the local prompt. The returned object contains counts only and no username, URL, text, DOM, storage, cookie, or network data:
+## Live-use handoff
 
-```javascript
-(() => {
-  const expected = prompt("Configured username for local matching only")?.trim();
-  const visible = (element) => {
-    if (!element || element.hidden || element.getAttribute("aria-hidden") === "true") return false;
-    let node = element;
-    while (node) {
-      const style = getComputedStyle(node);
-      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0 ||
-          node.getAttribute("aria-hidden") === "true") return false;
-      node = node.parentElement;
-    }
-    const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  };
-  const inPost = (element) => element.closest('article, [role="article"]') !== null;
-  const shellHeaders = [...document.querySelectorAll("header")].filter((header) =>
-    visible(header) && !inPost(header) && !header.closest('main, [role="main"]')
-  );
-  const shellProfiles = shellHeaders.flatMap((header) =>
-    [...header.querySelectorAll("a[href]")].filter(visible).filter((anchor) => {
-      try {
-        const url = new URL(anchor.getAttribute("href"), location.href);
-        return url.origin === location.origin && !url.search && !url.hash &&
-          /^\/@[A-Za-z0-9._:-]{1,96}$/.test(url.pathname);
-      } catch { return false; }
-    })
-  );
-  const selfShellProfiles = shellProfiles.filter((anchor) =>
-    /^(your|my)\s+(profile|account)\b/i.test(anchor.getAttribute("aria-label") || "")
-  );
-  const expectedPath = expected ? `/@${expected}` : "";
-  return {
-    readyState: document.readyState,
-    visibleMainRoots: [...document.querySelectorAll("main, [role=main]")].filter(visible).length,
-    visibleBannerLinks: [...document.querySelectorAll('[role="banner"] a[href]')].filter(visible).length,
-    visibleShellHeaders: shellHeaders.length,
-    visibleShellProfileLinks: shellProfiles.length,
-    selfLabelledShellProfileLinks: selfShellProfiles.length,
-    expectedActorShellLinks: selfShellProfiles.filter((anchor) => {
-      try { return new URL(anchor.getAttribute("href"), location.href).pathname === expectedPath; }
-      catch { return false; }
-    }).length
-  };
-})();
-```
+The automatic `--smoke` command is the proposed one-shot pilot for Draft PR #172. Do not use the older Home selector probe or manual-assisted output as evidence that automatic Search works. After Lead accepts the exact source and CI head, the owner may run the smoke once and share only safe status codes and aggregate counts; keep private account evidence out of GitHub. The checkpointed and continuous workflows remain separate.
 
-Share only the stage code and these aggregate counts privately. Do not paste a screenshot, URL, profile path, actor value, post content, or raw page markup into an issue or PR. If the expected actor count is not exactly one in a recognized visible structure, the reader must continue to fail closed until a safe visible marker can be established.
+## Continuous mode and rollback — outside this pilot
 
-## Private Windows UAT checklist
-
-Run this locally with the operator-selected account and the limits in its private configuration. Do not paste output that contains private paths or account evidence into GitHub.
-
-1. Run the one-shot command above. Confirm the visible account control shows the configured username. Let the bounded cycle complete and privately record its status, aggregate search counts, and `checkpoint_cycles=1`.
-2. Repeat the same one-shot command. Confirm the checkpoint resumes and previously read posts are deduplicated (`search_scanned` should be zero when the same results remain visible).
-3. To verify account mismatch handling, temporarily configure a deliberately different expected username, then run one supervised cycle. Confirm it stops with `BROWSER_SESSION_MISMATCH` before issuing a topic search. Restore the correct username afterward; changing configuration resets the policy-bound checkpoint epoch.
-4. Press Ctrl+C during a continuous foreground run. The current bounded cycle may finish and commit; the runner then reports `STOPPED`. Restart one-shot and confirm committed posts are not replayed.
-5. Redact the alias, expected username, local paths, screenshots, URLs, post text, and all profile evidence before sharing. Share only the status code and aggregate counts.
-
-This checklist is an operator action. Source code and offline E2E tests do not mark private UAT complete.
-
-## Continuous mode and rollback — separate authorization required
-
-Do not enable continuous mode or Task Scheduler during the selector-drift UAT. The owner or Lead must authorize that step separately after reviewing the corrected one-shot result.
+Do not enable continuous mode or Task Scheduler as part of the manual-assisted pilot. A separate authorization is required before using the automated checkpointed workflow continuously.
 
 After a successful supervised live cycle, review the visible account and aggregate result. From the same interactive user session, explicitly enable continuous operation for that account and current observation policy:
 

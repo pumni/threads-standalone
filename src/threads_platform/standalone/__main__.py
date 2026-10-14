@@ -716,7 +716,91 @@ def _format_browser_nurture_result(result: _BrowserNurtureRunResultView, *, sour
     )
 
 
+def _format_browser_nurture_smoke_result(result: _BrowserNurtureRunResultView) -> str:
+    if result.status.value != "COMPLETE" or result.scanned != 1:
+        reason = result.reason_code or "SEARCH_POST_NOT_FOUND"
+        return f"AUTO_READ status=STOPPED reason={reason} posts_read=0 checkpoint=UNCHANGED\n"
+    classification = (
+        "RELEVANT"
+        if result.relevant == 1
+        else "IRRELEVANT"
+        if result.irrelevant == 1
+        else "UNKNOWN"
+    )
+    return (
+        "AUTO_READ status=COMPLETE reason=NONE posts_read=1 "
+        f"classification={classification} checkpoint=UNCHANGED\n"
+    )
+
+
+def _handle_browser_ui_diagnostic(args: argparse.Namespace) -> int:
+    from threads_platform.standalone.browser_nurture import BrowserNurtureError
+    from threads_platform.standalone.browser_nurture_state import (
+        BrowserNurtureStateError,
+        BrowserNurtureStateStore,
+    )
+    from threads_platform.standalone.browser_ui_diagnostic import (
+        run_browser_ui_diagnostic,
+    )
+    from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
+
+    try:
+        if not args.confirm_local_read_only:
+            raise BrowserNurtureError("LOCAL_READ_CONFIRMATION_REQUIRED")
+        if not _browser_nurture_interactive_console():
+            raise BrowserNurtureError("INTERACTIVE_CONSOLE_REQUIRED")
+        data_root = resolve_standalone_data_root()
+        accounts = LocalAccountStore(data_root)
+        account = accounts.get(args.alias)
+        if (
+            re.fullmatch(
+                r"(?:test|synthetic)-[a-z0-9](?:[a-z0-9-]{0,29})",
+                account.alias.casefold(),
+            )
+            is not None
+        ):
+            raise BrowserNurtureError("LIVE_ACCOUNT_REQUIRED")
+        state = BrowserNurtureStateStore(data_root)
+        config = state.load_config(account.id)
+        if config is None:
+            raise BrowserNurtureError("CONFIG_NOT_FOUND")
+        report = asyncio.run(
+            run_browser_ui_diagnostic(
+                LocalRuntime(data_root, accounts),
+                account.alias,
+                config,
+                output=sys.stdout,
+            )
+        )
+    except (
+        BrowserNurtureError,
+        BrowserNurtureStateError,
+        StandaloneRuntimeError,
+        StandaloneAccountError,
+    ) as error:
+        sys.stderr.write(f"ERROR {error.code}\n")
+        return 1
+    except KeyboardInterrupt:
+        sys.stdout.write(
+            '{"schema":"THREADS_UI_DIAGNOSTIC_V2","status":"STOPPED",'
+            '"reason_code":"INTERRUPTED","stages":{'
+            '"home":{"status":"NOT_OBSERVED"},'
+            '"search":{"status":"NOT_OBSERVED"},'
+            '"detail":{"status":"NOT_OBSERVED"}}}\n'
+        )
+        return 0
+    except Exception:  # noqa: BLE001 - fixed CLI boundary for private browser data.
+        sys.stderr.write("ERROR DIAGNOSTIC_FAILED\n")
+        return 1
+    return 0 if report["status"] in {"COMPLETE", "STOPPED"} else 1
+
+
 def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
+    if args.browser_nurture_command == "inspect-ui":
+        return _handle_browser_ui_diagnostic(args)
+    if args.browser_nurture_command == "manual-assist":
+        return _handle_browser_nurture_manual_assist(args)
+
     from threads_platform.standalone.browser_nurture import (
         BrowserNurtureError,
         BrowserNurtureRunner,
@@ -828,7 +912,13 @@ def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
         return 0
 
     try:
+        if args.smoke and args.source != "browser":
+            raise BrowserNurtureError("RUN_POLICY_INVALID")
         if args.source == "browser":
+            if args.smoke and (
+                args.continuous or args.max_cycles not in (None, 1) or args.idle_seconds is not None
+            ):
+                raise BrowserNurtureError("RUN_POLICY_INVALID")
             if not args.continuous and args.max_cycles not in (None, 1):
                 raise BrowserNurtureError("RUN_POLICY_INVALID")
             if args.fixture_file is not None or args.data_root is not None:
@@ -860,6 +950,7 @@ def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
                 max_cycles=cycles,
                 continuous=args.continuous,
                 idle_seconds=args.idle_seconds,
+                smoke=args.smoke,
             )
             output_source = "BROWSER_UI"
         else:
@@ -914,9 +1005,19 @@ def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
         StandaloneRuntimeError,
         StandaloneAccountError,
     ) as error:
-        sys.stderr.write(f"ERROR {error.code}\n")
+        if args.smoke:
+            sys.stdout.write(
+                f"AUTO_READ status=STOPPED reason={error.code} posts_read=0 checkpoint=UNCHANGED\n"
+            )
+        else:
+            sys.stderr.write(f"ERROR {error.code}\n")
         return 1
     except KeyboardInterrupt:
+        if args.smoke:
+            sys.stdout.write(
+                "AUTO_READ status=STOPPED reason=INTERRUPTED posts_read=0 checkpoint=UNCHANGED\n"
+            )
+            return 130
         output_source = "BROWSER_UI" if args.source == "browser" else "SYNTHETIC_FIXTURE"
         sys.stdout.write(
             f"BROWSER_NURTURE status=STOPPED source={output_source} "
@@ -927,14 +1028,175 @@ def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
         )
         return 130
     except Exception:  # noqa: BLE001 - fixed safe CLI boundary for fixture failures.
+        if args.smoke:
+            sys.stdout.write(
+                "AUTO_READ status=STOPPED reason=BROWSER_NURTURE_FAILED "
+                "posts_read=0 checkpoint=UNCHANGED\n"
+            )
+            return 1
         sys.stderr.write("ERROR BROWSER_NURTURE_FAILED\n")
         return 1
+    if args.smoke:
+        sys.stdout.write(_format_browser_nurture_smoke_result(result))
+        return 0 if result.status.value == "COMPLETE" and result.scanned == 1 else 1
     sys.stdout.write(_format_browser_nurture_result(result, source=output_source))
     return 0 if result.status.value == "COMPLETE" else 1
 
 
 def _browser_nurture_interactive_console() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _handle_browser_nurture_manual_assist(args: argparse.Namespace) -> int:
+    from threads_platform.standalone.browser_nurture import (
+        BrowserNurtureError,
+        BrowserNurtureRunner,
+    )
+    from threads_platform.standalone.browser_nurture_state import (
+        BrowserNurtureStateError,
+        BrowserNurtureStateStore,
+    )
+    from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
+
+    try:
+        if not args.confirm_live_read_only:
+            raise BrowserNurtureError("LIVE_READ_CONFIRMATION_REQUIRED")
+        if not _browser_nurture_interactive_console():
+            raise BrowserNurtureError("INTERACTIVE_CONSOLE_REQUIRED")
+        data_root = resolve_standalone_data_root()
+        accounts = LocalAccountStore(data_root)
+        account = accounts.get(args.alias)
+        state = BrowserNurtureStateStore(data_root)
+
+        async def operator_step(stage: str) -> None:
+            if stage == "OPEN_SEARCH":
+                sys.stdout.write(
+                    "ACTION OPEN_SEARCH browser=OPEN "
+                    "manually open Search, submit the configured topic, "
+                    "then press Enter here (timeout=300s)\n"
+                )
+                sys.stdout.flush()
+                if await _read_terminal_line(timeout_seconds=300) is None:
+                    raise BrowserNurtureError("OPERATOR_WAIT_TIMEOUT")
+            elif stage == "RETURN_TO_SEARCH":
+                sys.stdout.write(
+                    "ACTION RETURN_TO_SEARCH browser=OPEN "
+                    "return to the verified Search results, then press Enter here (timeout=300s)\n"
+                )
+                sys.stdout.flush()
+                if await _read_terminal_line(timeout_seconds=300) is None:
+                    raise BrowserNurtureError("OPERATOR_WAIT_TIMEOUT")
+            elif stage == "OPEN_DETAIL":
+                sys.stdout.write(
+                    "ACTION OPEN_DETAIL browser=OPEN "
+                    "manually open one verified Search result, then press Enter here "
+                    "(timeout=300s); read-only inspection only\n"
+                )
+                sys.stdout.flush()
+                if await _read_terminal_line(timeout_seconds=300) is None:
+                    raise BrowserNurtureError("OPERATOR_WAIT_TIMEOUT")
+            elif stage == "CONFIRM_CLOSE":
+                sys.stdout.write(
+                    "ACTION CLOSE_BROWSER browser=OPEN press Enter to close Chromium "
+                    "(automatic close in 60s)\n"
+                )
+                sys.stdout.flush()
+                if await _read_terminal_line(timeout_seconds=60) is None:
+                    sys.stderr.write(
+                        "STATUS CLOSE_CONFIRMATION_TIMEOUT chromium=OPEN action=AUTO_CLOSE\n"
+                    )
+                    sys.stderr.flush()
+
+        async def decide(stage: str, code: str, choices: tuple[str, ...]) -> str:
+            sys.stderr.write(f"ERROR {code} chromium=OPEN stage={stage}\n")
+            choice_text = "/".join(
+                {"RETRY": "Retry", "SKIP": "Skip", "STOP": "Stop"}[choice] for choice in choices
+            )
+            sys.stderr.write(f"Choose {choice_text} [R/K/S] (timeout=60s): ")
+            sys.stderr.flush()
+            line = await _read_terminal_line(timeout_seconds=60)
+            if line is None:
+                return "STOP"
+            response = line.strip().casefold()
+            selected = {"r": "RETRY", "k": "SKIP", "s": "STOP"}.get(response)
+            return selected if selected in choices else "STOP"
+
+        def progress(stage: str, count: int | None) -> None:
+            if stage == "HOME_VERIFIED":
+                sys.stdout.write("BROWSER_NURTURE_ASSIST home=VERIFIED\n")
+            elif stage == "SEARCH_RESULTS_VERIFIED":
+                sys.stdout.write(
+                    "BROWSER_NURTURE_ASSIST search_region=VERIFIED "
+                    f"search_candidates={count or 0}\n"
+                )
+            elif stage == "DETAIL_PROVENANCE_VERIFIED":
+                sys.stdout.write("BROWSER_NURTURE_ASSIST detail_provenance=VERIFIED\n")
+            sys.stdout.flush()
+
+        result = asyncio.run(
+            BrowserNurtureRunner(LocalRuntime(data_root, accounts), state).manual_assist(
+                account.alias,
+                operator_step=operator_step,
+                decide=decide,
+                progress=progress,
+            )
+        )
+    except (
+        BrowserNurtureError,
+        BrowserNurtureStateError,
+        StandaloneRuntimeError,
+        StandaloneAccountError,
+    ) as error:
+        sys.stderr.write(f"ERROR {error.code}\n")
+        return 1
+    except KeyboardInterrupt:
+        sys.stdout.write(
+            "BROWSER_NURTURE_ASSIST status=STOPPED stage=INTERRUPTED "
+            "reason=INTERRUPTED posts_read=0 checkpoint=UNCHANGED effects=NONE\n"
+        )
+        return 130
+    except Exception:  # noqa: BLE001 - keep private browser data out of CLI errors.
+        sys.stderr.write("ERROR BROWSER_NURTURE_ASSIST_FAILED\n")
+        return 1
+
+    reason = result.reason_code or "-"
+    region = "VERIFIED" if result.search_candidates else "NOT_VERIFIED"
+    sys.stdout.write(
+        f"BROWSER_NURTURE_ASSIST status={result.status.value} stage={result.stage} "
+        f"reason={reason} search_region={region} "
+        f"search_candidates={result.search_candidates} posts_read={result.scanned} "
+        f"classification={result.classification} body={result.body_status} "
+        "checkpoint=UNCHANGED effects=NONE "
+        f"sessions_opened={result.sessions_opened}\n"
+    )
+    return 1 if result.status.value == "FAILED" else 0
+
+
+async def _read_terminal_line(*, timeout_seconds: float) -> str | None:
+    """Read operator input on a daemon thread while the async browser loop stays live."""
+
+    from queue import Empty, Queue
+    from threading import Thread
+
+    lines: Queue[str | None] = Queue(maxsize=1)
+
+    def read_line() -> None:
+        try:
+            lines.put(sys.stdin.readline())
+        except Exception:  # noqa: BLE001 - terminal failure is a bounded stop.
+            lines.put(None)
+
+    Thread(target=read_line, name="browser-nurture-terminal-input", daemon=True).start()
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while True:
+        try:
+            value = lines.get_nowait()
+            return value if value else None
+        except Empty:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(0.05, remaining))
 
 
 def _run_browser_nurture_with_stop(
@@ -946,6 +1208,7 @@ def _run_browser_nurture_with_stop(
     max_cycles: int | None,
     continuous: bool,
     idle_seconds: int | None,
+    smoke: bool = False,
 ) -> Any:
     async def run() -> Any:
         loop = asyncio.get_running_loop()
@@ -964,6 +1227,7 @@ def _run_browser_nurture_with_stop(
                 max_cycles=max_cycles,
                 continuous=continuous,
                 idle_seconds=idle_seconds,
+                smoke=smoke,
                 stop_event=stop_event,
             )
         finally:
@@ -1138,6 +1402,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="disable the account-scoped continuous-run opt-in",
     )
     disable_browser_nurture_continuous.add_argument("alias")
+    inspect_browser_ui = browser_nurture_commands.add_parser(
+        "inspect-ui",
+        help="inspect Home, Search and one Detail page with a private read-only report",
+    )
+    inspect_browser_ui.add_argument("alias")
+    inspect_browser_ui.add_argument(
+        "--confirm-local-read-only",
+        action="store_true",
+        help="confirm this supervised session only observes the current page",
+    )
+    manual_assist_browser_nurture = browser_nurture_commands.add_parser(
+        "manual-assist",
+        help="read one manually opened Search result without updating cycle checkpoints",
+    )
+    manual_assist_browser_nurture.add_argument("alias")
+    manual_assist_browser_nurture.add_argument(
+        "--confirm-live-read-only",
+        action="store_true",
+        help="confirm this supervised session only reads the selected account UI",
+    )
     run_browser_nurture = browser_nurture_commands.add_parser(
         "run",
         help="run one bounded cycle or remain in the foreground until stopped",
@@ -1159,6 +1443,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_browser_nurture.add_argument("--max-cycles", type=int)
     run_browser_nurture.add_argument("--idle-seconds", type=int)
+    run_browser_nurture.add_argument(
+        "--smoke",
+        action="store_true",
+        help="read at most one verified post without writing the Browser Nurture checkpoint",
+    )
 
     recruitment_parser = commands.add_parser("recruitment")
     recruitment_commands = recruitment_parser.add_subparsers(

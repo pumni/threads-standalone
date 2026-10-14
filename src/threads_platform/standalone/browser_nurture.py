@@ -9,7 +9,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -55,6 +55,7 @@ MAX_SYNTHETIC_NURTURE_FIXTURE_BYTES = 1_100_000
 MAX_NURTURE_FEED_CANDIDATES_PER_CYCLE = 100
 MAX_NURTURE_CYCLES_PER_INVOCATION = 5
 MAX_NURTURE_CYCLE_SECONDS = 180
+MAX_MANUAL_ASSIST_RETRIES = 3
 
 _ACCOUNT_ALIAS = re.compile(r"^(?:test|synthetic)-[a-z0-9](?:[a-z0-9-]{0,29})$")
 _SYNTHETIC_ACTOR = re.compile(r"^(?:test|synthetic|fixture)[._-][A-Za-z0-9._-]{1,28}$")
@@ -82,6 +83,7 @@ class BrowserNurtureStatus(StrEnum):
     COMPLETE = "COMPLETE"
     STOPPED = "STOPPED"
     FAILED = "FAILED"
+    PARTIAL = "PARTIAL"
 
 
 class BrowserNurtureSource(StrEnum):
@@ -137,6 +139,18 @@ class BrowserNurtureRunResult:
     checkpoint_cycles: int
 
 
+@dataclass(frozen=True, slots=True)
+class BrowserNurtureAssistResult:
+    status: BrowserNurtureStatus
+    reason_code: str | None
+    stage: str
+    search_candidates: int
+    scanned: int
+    classification: str
+    body_status: str
+    sessions_opened: int
+
+
 class BrowserNurtureUiSession(Protocol):
     async def install_synthetic_fixture_pages(
         self,
@@ -155,7 +169,16 @@ class BrowserNurtureUiSession(Protocol):
         *,
         expected_actor: str,
         origin: str,
+        one_post: bool = False,
     ) -> tuple[UiFeedBatch, ...]: ...
+
+    async def assisted_search_ui_results(
+        self,
+        query: str,
+        *,
+        expected_actor: str,
+        origin: str,
+    ) -> tuple[UiPostTarget, ...]: ...
 
     async def read_exact_ui_post(
         self,
@@ -165,7 +188,76 @@ class BrowserNurtureUiSession(Protocol):
         origin: str,
     ) -> UiPostDetail: ...
 
+    async def arm_ui_diagnostic_operator_click(self, *, source_route: str) -> None: ...
+
+    async def wait_for_assisted_post_click(
+        self,
+        candidates: tuple[UiPostTarget, ...],
+        *,
+        origin: str,
+    ) -> str: ...
+
+    async def read_current_ui_post(
+        self,
+        target: str,
+        *,
+        expected_actor: str,
+        origin: str,
+    ) -> UiPostDetail: ...
+
     async def close(self) -> None: ...
+
+
+ManualAssistStep = Callable[[str], Awaitable[None]]
+ManualAssistDecision = Callable[[str, str, tuple[str, ...]], Awaitable[str]]
+ManualAssistProgress = Callable[[str, int | None], None]
+
+
+@dataclass(frozen=True, slots=True)
+class _ManualAssistAttempt[AssistValue]:
+    action: str
+    value: AssistValue | None = None
+    reason_code: str | None = None
+
+
+async def _retry_manual_assist_step[AssistValue](
+    stage: str,
+    operation: Callable[[], Awaitable[AssistValue]],
+    decide: ManualAssistDecision,
+) -> _ManualAssistAttempt[AssistValue]:
+    retries = 0
+    while True:
+        try:
+            return _ManualAssistAttempt("READY", await operation())
+        except BrowserProcessCrashed:
+            return _ManualAssistAttempt("FAILED", reason_code="BROWSER_PROCESS_CRASHED")
+        except (BrowserAdapterError, BrowserNurtureError) as error:
+            code = error.code
+            if _manual_assist_fatal_error(code):
+                return _ManualAssistAttempt("FAILED", reason_code=code)
+            choices = (
+                ("RETRY", "SKIP", "STOP")
+                if retries < MAX_MANUAL_ASSIST_RETRIES
+                else ("SKIP", "STOP")
+            )
+            decision = await decide(stage, code, choices)
+            if decision == "RETRY" and retries < MAX_MANUAL_ASSIST_RETRIES:
+                retries += 1
+                continue
+            if decision == "SKIP":
+                return _ManualAssistAttempt("SKIP", reason_code=code)
+            return _ManualAssistAttempt("STOP", reason_code=code)
+
+
+def _manual_assist_fatal_error(code: str) -> bool:
+    return code.startswith("REMOTE_") or code in {
+        "BROWSER_NAVIGATION_BLOCKED",
+        "BROWSER_PROCESS_CRASHED",
+        "BROWSER_SESSION_MISMATCH",
+        "CHALLENGE_REQUIRED",
+        "RATE_LIMITED",
+        "SESSION_EXPIRED",
+    }
 
 
 def validate_synthetic_nurture_root(path: Path) -> Path:
@@ -316,6 +408,7 @@ class BrowserNurtureRunner:
         max_cycles: int | None = 1,
         continuous: bool = False,
         idle_seconds: int | None = None,
+        smoke: bool = False,
         stop_event: asyncio.Event | None = None,
     ) -> BrowserNurtureRunResult:
         if source is None and fixture is None:
@@ -330,11 +423,20 @@ class BrowserNurtureRunner:
             raise BrowserNurtureError("RUN_POLICY_INVALID") from None
         if (
             type(continuous) is not bool
+            or type(smoke) is not bool
             or (not continuous and max_cycles is None)
             or (
                 selected_source is BrowserNurtureSource.BROWSER_UI
                 and not continuous
                 and max_cycles != 1
+            )
+            or (
+                smoke
+                and (
+                    selected_source is not BrowserNurtureSource.BROWSER_UI
+                    or continuous
+                    or max_cycles != 1
+                )
             )
             or (selected_source is BrowserNurtureSource.UI_FIXTURE) != (fixture is not None)
         ):
@@ -381,7 +483,9 @@ class BrowserNurtureRunner:
                     raise BrowserNurtureError("RUN_POLICY_INVALID")
                 checkpoint = self._state.load_checkpoint(
                     lease.account.id,
-                    policy_fingerprint=browser_nurture_policy_fingerprint(config),
+                    policy_fingerprint=(
+                        None if smoke else browser_nurture_policy_fingerprint(config)
+                    ),
                 )
                 if (
                     continuous
@@ -412,8 +516,16 @@ class BrowserNurtureRunner:
                             session_open_count,
                         )
                     try:
-                        cycle = await self._run_cycle(session, config, origin, checkpoint)
+                        cycle = await self._run_cycle(
+                            session,
+                            config,
+                            origin,
+                            checkpoint,
+                            smoke=smoke,
+                        )
                     except BrowserProcessCrashed:
+                        if smoke:
+                            raise BrowserNurtureError("BROWSER_PROCESS_CRASHED") from None
                         if checkpoint.crash_recovery_pending:
                             return _run_result(
                                 BrowserNurtureStatus.FAILED,
@@ -447,9 +559,19 @@ class BrowserNurtureRunner:
                                 checkpoint,
                                 session_open_count,
                             )
-                    checkpoint = self._commit_cycle(checkpoint, cycle, len(config.topics))
                     run_counts.add(cycle)
                     attempt_count += 1
+                    if smoke:
+                        if cycle.scanned != 1:
+                            raise BrowserNurtureError("SEARCH_POST_NOT_FOUND")
+                        return _run_result(
+                            BrowserNurtureStatus.COMPLETE,
+                            None,
+                            run_counts,
+                            checkpoint,
+                            session_open_count,
+                        )
+                    checkpoint = self._commit_cycle(checkpoint, cycle, len(config.topics))
                     if stop_event is not None and stop_event.is_set():
                         return _run_result(
                             BrowserNurtureStatus.STOPPED,
@@ -490,12 +612,213 @@ class BrowserNurtureRunner:
         except BrowserAdapterError as error:
             raise BrowserNurtureError(error.code) from None
 
+    async def manual_assist(
+        self,
+        alias: str,
+        *,
+        operator_step: ManualAssistStep,
+        decide: ManualAssistDecision,
+        progress: ManualAssistProgress,
+    ) -> BrowserNurtureAssistResult:
+        """Read one manually selected Search result without touching cycle checkpoints."""
+
+        try:
+            async with self._runtime.own_browser_profile(alias, headless=False) as lease:
+                config = self._state.load_config(lease.account.id)
+                if config is None:
+                    raise BrowserNurtureError("CONFIG_NOT_FOUND")
+                config = validate_browser_nurture_config(config.to_document())
+                if _ACCOUNT_ALIAS.fullmatch(lease.account.alias):
+                    raise BrowserNurtureError("LIVE_ACCOUNT_REQUIRED")
+                origin = BROWSER_FEED_ORIGIN
+                await lease.start()
+                session = _leased_nurture_session(lease)
+
+                def result(
+                    status: BrowserNurtureStatus,
+                    reason_code: str | None,
+                    stage: str,
+                    *,
+                    search_candidates: int = 0,
+                    scanned: int = 0,
+                    classification: str = "UNKNOWN",
+                    body_status: str = "NOT_READ",
+                ) -> BrowserNurtureAssistResult:
+                    return BrowserNurtureAssistResult(
+                        status=status,
+                        reason_code=reason_code,
+                        stage=stage,
+                        search_candidates=search_candidates,
+                        scanned=scanned,
+                        classification=classification,
+                        body_status=body_status,
+                        sessions_opened=lease.open_count,
+                    )
+
+                async def finish(outcome: BrowserNurtureAssistResult) -> BrowserNurtureAssistResult:
+                    if outcome.status is not BrowserNurtureStatus.FAILED:
+                        await operator_step("CONFIRM_CLOSE")
+                    return outcome
+
+                async def verify_home() -> None:
+                    await session.navigate(
+                        f"{origin}/",
+                        allowed_origins=frozenset({origin}),
+                    )
+                    state = await session.verify_ui_account(config.expected_username, origin=origin)
+                    _require_ready_state(state)
+
+                home = await _retry_manual_assist_step("HOME", verify_home, decide)
+                if home.action != "READY":
+                    status = (
+                        BrowserNurtureStatus.FAILED
+                        if home.action == "FAILED"
+                        else BrowserNurtureStatus.STOPPED
+                    )
+                    reason = (
+                        home.reason_code
+                        if status is BrowserNurtureStatus.FAILED
+                        else ("OPERATOR_STOP" if home.action == "STOP" else "HOME_SKIPPED")
+                    )
+                    return await finish(result(status, reason, "HOME"))
+                progress("HOME_VERIFIED", None)
+
+                async def read_search_region() -> tuple[UiPostTarget, ...]:
+                    return await session.assisted_search_ui_results(
+                        config.topics[0],
+                        expected_actor=config.expected_username,
+                        origin=origin,
+                    )
+
+                async def open_search_and_read() -> tuple[UiPostTarget, ...]:
+                    await operator_step("OPEN_SEARCH")
+                    return await read_search_region()
+
+                search = await _retry_manual_assist_step("SEARCH", open_search_and_read, decide)
+                if search.action != "READY" or search.value is None:
+                    status = (
+                        BrowserNurtureStatus.FAILED
+                        if search.action == "FAILED"
+                        else BrowserNurtureStatus.STOPPED
+                    )
+                    reason = (
+                        search.reason_code
+                        if status is BrowserNurtureStatus.FAILED
+                        else ("OPERATOR_STOP" if search.action == "STOP" else "SEARCH_SKIPPED")
+                    )
+                    return await finish(result(status, reason, "SEARCH"))
+                targets = search.value
+                progress("SEARCH_RESULTS_VERIFIED", len(targets))
+                if not targets:
+                    return await finish(
+                        result(
+                            BrowserNurtureStatus.STOPPED,
+                            "SEARCH_NO_RESULTS",
+                            "SEARCH",
+                        )
+                    )
+
+                detail_attempts = 0
+
+                async def read_selected_detail() -> tuple[UiPostTarget, UiPostDetail, str]:
+                    nonlocal targets, detail_attempts
+                    if detail_attempts > 0:
+                        await operator_step("RETURN_TO_SEARCH")
+                        targets = await read_search_region()
+                    detail_attempts += 1
+                    await session.arm_ui_diagnostic_operator_click(source_route="SEARCH")
+                    await operator_step("OPEN_DETAIL")
+                    target_url = await session.wait_for_assisted_post_click(targets, origin=origin)
+                    matching_targets = tuple(
+                        target for target in targets if target.canonical_post_url == target_url
+                    )
+                    if len(matching_targets) != 1:
+                        raise BrowserNurtureError("DETAIL_SELECTION_NOT_IN_RESULTS")
+                    target = matching_targets[0]
+                    detail = await session.read_current_ui_post(
+                        target_url,
+                        expected_actor=config.expected_username,
+                        origin=origin,
+                    )
+                    _require_ready_state(detail.state)
+                    if (
+                        detail.canonical_post_url != target.canonical_post_url
+                        or detail.author_username != target.author_username
+                    ):
+                        raise BrowserNurtureError("DETAIL_PROVENANCE_UNVERIFIED")
+                    if detail.body is None or detail.body_visibility is UiBodyVisibility.UNKNOWN:
+                        raise BrowserNurtureError("DETAIL_BODY_UNVERIFIED")
+                    classification = classify_browser_nurture_post(
+                        detail,
+                        config.relevance_terms,
+                    )
+                    return target, detail, classification
+
+                selected = await _retry_manual_assist_step(
+                    "DETAIL",
+                    read_selected_detail,
+                    decide,
+                )
+                if selected.action != "READY" or selected.value is None:
+                    status = (
+                        BrowserNurtureStatus.FAILED
+                        if selected.action == "FAILED"
+                        else BrowserNurtureStatus.STOPPED
+                    )
+                    reason = (
+                        selected.reason_code
+                        if status is BrowserNurtureStatus.FAILED
+                        else ("OPERATOR_STOP" if selected.action == "STOP" else "DETAIL_SKIPPED")
+                    )
+                    return await finish(
+                        result(
+                            status,
+                            reason,
+                            "DETAIL",
+                            search_candidates=len(targets),
+                        )
+                    )
+
+                _target, detail, classification = selected.value
+                status = (
+                    BrowserNurtureStatus.PARTIAL
+                    if classification == "UNKNOWN"
+                    else BrowserNurtureStatus.COMPLETE
+                )
+                reason = (
+                    "DETAIL_CLASSIFICATION_UNKNOWN"
+                    if status is BrowserNurtureStatus.PARTIAL
+                    else None
+                )
+                progress("DETAIL_PROVENANCE_VERIFIED", 1)
+                return await finish(
+                    result(
+                        status,
+                        reason,
+                        "COMPLETE" if status is BrowserNurtureStatus.COMPLETE else "PARTIAL",
+                        search_candidates=len(targets),
+                        scanned=1,
+                        classification=classification,
+                        body_status=detail.body_visibility.value,
+                    )
+                )
+        except BrowserNurtureError:
+            raise
+        except BrowserNurtureStateError as error:
+            raise BrowserNurtureError(error.code) from None
+        except StandaloneRuntimeError as error:
+            raise BrowserNurtureError(error.code) from None
+        except BrowserAdapterError as error:
+            raise BrowserNurtureError(error.code) from None
+
     async def _run_cycle(
         self,
         session: BrowserNurtureUiSession,
         config: BrowserNurtureConfigV1,
         origin: str,
         checkpoint: BrowserNurtureCheckpointV2,
+        *,
+        smoke: bool = False,
     ) -> BrowserNurtureCycleMetrics:
         try:
             async with asyncio.timeout(MAX_NURTURE_CYCLE_SECONDS):
@@ -504,21 +827,32 @@ class BrowserNurtureRunner:
                     origin=origin,
                 )
                 _require_ready_state(state)
-                already_seen = set(checkpoint.seen_fingerprints)
+                already_seen: set[str] = set() if smoke else set(checkpoint.seen_fingerprints)
                 current_fingerprints: set[str] = set()
                 targets: list[tuple[str, UiPostTarget]] = []
                 duplicates = 0
                 feed_candidates = 0
                 scrolls = 0
                 topic_queries = 0
-                topic_start = checkpoint.next_topic_index % len(config.topics)
-                ordered_topics = config.topics[topic_start:] + config.topics[:topic_start]
+                if smoke:
+                    ordered_topics = config.topics[:1]
+                else:
+                    topic_start = checkpoint.next_topic_index % len(config.topics)
+                    ordered_topics = config.topics[topic_start:] + config.topics[:topic_start]
                 for topic in ordered_topics:
-                    batches = await session.search_ui_feed(
-                        topic,
-                        expected_actor=config.expected_username,
-                        origin=origin,
-                    )
+                    if smoke:
+                        batches = await session.search_ui_feed(
+                            topic,
+                            expected_actor=config.expected_username,
+                            origin=origin,
+                            one_post=True,
+                        )
+                    else:
+                        batches = await session.search_ui_feed(
+                            topic,
+                            expected_actor=config.expected_username,
+                            origin=origin,
+                        )
                     topic_queries += 1
                     scrolls += _ui_reader_scroll_count(session)
                     for batch in batches:
@@ -529,15 +863,21 @@ class BrowserNurtureRunner:
                             if fingerprint in already_seen or fingerprint in current_fingerprints:
                                 duplicates += 1
                                 continue
-                            if len(targets) >= config.max_posts_per_cycle:
+                            if len(targets) >= (1 if smoke else config.max_posts_per_cycle):
                                 continue
                             current_fingerprints.add(fingerprint)
                             targets.append((fingerprint, target))
+                            if smoke:
+                                break
                             if feed_candidates >= MAX_NURTURE_FEED_CANDIDATES_PER_CYCLE:
                                 break
+                        if smoke and targets:
+                            break
                         if feed_candidates >= MAX_NURTURE_FEED_CANDIDATES_PER_CYCLE:
                             break
-                    if feed_candidates >= MAX_NURTURE_FEED_CANDIDATES_PER_CYCLE:
+                    if (
+                        smoke and targets
+                    ) or feed_candidates >= MAX_NURTURE_FEED_CANDIDATES_PER_CYCLE:
                         break
                 relevant = 0
                 irrelevant = 0
@@ -554,6 +894,12 @@ class BrowserNurtureRunner:
                         or detail.author_username != target.author_username
                     ):
                         raise BrowserNurtureError("BROWSER_TARGET_MISMATCH")
+                    if smoke and (
+                        detail.body_visibility is not UiBodyVisibility.FULL_VISIBLE
+                        or detail.body is None
+                        or not detail.body.strip()
+                    ):
+                        raise BrowserNurtureError("DETAIL_BODY_UNVERIFIED")
                     classification = classify_browser_nurture_post(
                         detail,
                         config.relevance_terms,
