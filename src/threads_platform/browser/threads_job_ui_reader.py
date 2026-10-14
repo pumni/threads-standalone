@@ -580,11 +580,6 @@ _DETAIL_SCRIPT = r"""
   const authorPaths = Array.from(new Set(profileAnchors.map((anchor) => canonicalPath(anchor.getAttribute('href')))
     .filter((path) => typeof path === 'string' && profilePathPattern.test(path))));
   if (authorPaths.length !== 1) return {ok: false, reason: 'author'};
-  const postMatch = postPathPattern.exec(candidate.postPaths[0]);
-  const authorMatch = profilePathPattern.exec(authorPaths[0]);
-  if (!postMatch || !authorMatch || postMatch[1] !== authorMatch[0].slice(2)) {
-    return {ok: false, reason: 'author'};
-  }
 
   const bodies = Array.from(candidate.card.querySelectorAll('div[dir="auto"]')).filter((body) => {
     if (!owns(body, candidate.card) || !visible(body) || body.closest('header, blockquote, aside, nav, footer')) {
