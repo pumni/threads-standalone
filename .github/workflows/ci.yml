@@ -59,7 +59,7 @@ jobs:
           CI_AFTER_SHA: ${{ github.sha }}
         run: |
           python3 .github/scripts/ci.py docs
-          "result=success" >> "$GITHUB_OUTPUT"
+          echo "result=success" >> "$GITHUB_OUTPUT"
 
   linux:
     name: Ubuntu locked QA and installed-wheel smoke
