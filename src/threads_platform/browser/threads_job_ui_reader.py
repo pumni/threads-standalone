@@ -600,11 +600,12 @@ _ASSISTED_SEARCH_SNAPSHOT_SCRIPT = r"""
   const withinActiveTab = (card) => {
     const context = commonAncestor(activeFilter, card);
     return Boolean(context && context !== document.body && context !== document.documentElement &&
-      context.contains(input) && !context.matches('nav,footer,blockquote') && visible(context, root));
+      !context.matches('nav,footer,blockquote') && visible(context, root));
   };
+  const searchSemanticCards = semanticCards.filter(withinActiveTab);
   const candidateCards = [];
   let unverifiedPostAnchor = false;
-  for (const card of semanticCards) {
+  for (const card of searchSemanticCards) {
     const data = cardData(card, true);
     if (data.postLinks.length === 0) continue;
     if (data.postLinks.length !== 1 || data.headerLinks.length !== 1) {
@@ -617,19 +618,23 @@ _ASSISTED_SEARCH_SNAPSHOT_SCRIPT = r"""
     }
     candidateCards.push(data);
   }
-  const rootPostAnchors = Array.from(root.querySelectorAll('a[href]')).filter((anchor) => {
+  const visiblePostAnchors = Array.from(root.querySelectorAll('a[href]')).filter((anchor) => {
     if (!visible(anchor, root) || anchor.closest('blockquote,nav,footer')) return false;
     try {
       const url = new URL(anchor.getAttribute('href'), window.location.href);
       return url.origin === window.location.origin && !url.search && !url.hash && postPath.test(url.pathname);
     } catch (_) { return false; }
   });
-  if (rootPostAnchors.length > 300 || semanticCards.length > maxCards) {
+  const rootPostAnchors = visiblePostAnchors.filter(withinActiveTab);
+  if (rootPostAnchors.length > 300 || searchSemanticCards.length > maxCards) {
     return {state: 'SEARCH_RESULTS_LIMIT_EXCEEDED'};
+  }
+  if (rootPostAnchors.length === 0 && visiblePostAnchors.length > 0 && !noResults) {
+    return {state: 'SEARCH_RESULTS_UNPROVEN', regionKind};
   }
 
   const coveredAnchors = new Set();
-  for (const card of semanticCards) {
+  for (const card of searchSemanticCards) {
     const data = cardData(card, true);
     if (data.postLinks.length === 1 && data.headerLinks.length === 1) {
       for (const anchor of Array.from(card.querySelectorAll('a[href]'))) {

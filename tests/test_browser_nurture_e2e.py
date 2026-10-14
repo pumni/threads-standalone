@@ -1099,11 +1099,23 @@ def test_browser_nurture_smoke_automates_search_and_reads_one_generic_result_wit
 
     pages = _offline_live_pages(actor)
     search_url = f"{BROWSER_FEED_ORIGIN}/search?{urlencode({'q': query})}"
-    pages[search_url] = _generic_search_results(
+    search_html = _generic_search_results(
         actor,
         query,
         _visual_card("001"),
+        home_cards=_visual_card("002"),
     )
+    input_form = (
+        '<form action="/search" method="get">'
+        f'<input type="text" name="q" role="textbox" aria-label="Search" value="{query}">'
+        "</form>"
+    )
+    search_html = search_html.replace(
+        f'<div class="search-surface">{input_form}<div role="tablist">',
+        f'{input_form}<div class="search-surface"><div role="tablist">',
+    )
+    assert search_html.index(input_form) < search_html.index('<div class="search-surface">')
+    pages[search_url] = search_html
     exit_code, output, requested_urls = _run_offline_browser_source_cli(
         root,
         account,
@@ -1114,12 +1126,14 @@ def test_browser_nurture_smoke_automates_search_and_reads_one_generic_result_wit
     )
 
     detail_url = _target("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    home_decoy_url = _target("002").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
     assert exit_code == 0, output.out + output.err
     assert output.err == ""
     assert "AUTO_READ status=COMPLETE reason=NONE posts_read=1" in output.out
     assert "classification=RELEVANT checkpoint=UNCHANGED" in output.out
     assert requested_urls[:2] == [f"{BROWSER_FEED_ORIGIN}/", search_url]
     assert requested_urls.count(detail_url) == 1
+    assert home_decoy_url not in requested_urls
     assert len([url for url in requested_urls if "/post/" in url]) == 1
     assert set(requested_urls).issubset(pages)
     assert checkpoint_path.read_bytes() == checkpoint_before
@@ -1330,6 +1344,44 @@ def test_browser_nurture_smoke_rejects_home_feed_outside_active_search_tab(
     assert "checkpoint=UNCHANGED" in output.out
     assert not any("/post/" in url for url in requested_urls)
     assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+
+
+def test_browser_nurture_smoke_rejects_ambiguous_search_author(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "automatic-search-ambiguous-author-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    card = _visual_card("001").replace(
+        "</header>",
+        '<a href="/@other.author">Other author</a></header>',
+    )
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _generic_search_results(
+        actor,
+        "design",
+        card,
+    )
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+        smoke=True,
+    )
+
+    assert exit_code == 1
+    assert "AUTO_READ status=STOPPED reason=SEARCH_RESULTS_UNPROVEN posts_read=0" in output.out
+    assert "checkpoint=UNCHANGED" in output.out
+    assert not any("/post/" in url for url in requested_urls)
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+    assert "design" not in output.out + output.err
 
 
 def test_browser_nurture_smoke_stops_when_search_has_no_posts(
