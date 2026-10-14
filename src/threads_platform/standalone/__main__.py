@@ -716,7 +716,73 @@ def _format_browser_nurture_result(result: _BrowserNurtureRunResultView, *, sour
     )
 
 
+def _handle_browser_ui_diagnostic(args: argparse.Namespace) -> int:
+    from threads_platform.standalone.browser_nurture import BrowserNurtureError
+    from threads_platform.standalone.browser_nurture_state import (
+        BrowserNurtureStateError,
+        BrowserNurtureStateStore,
+    )
+    from threads_platform.standalone.browser_ui_diagnostic import (
+        format_browser_ui_diagnostic,
+        run_browser_ui_diagnostic,
+    )
+    from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
+
+    try:
+        if not args.confirm_local_read_only:
+            raise BrowserNurtureError("LOCAL_READ_CONFIRMATION_REQUIRED")
+        if not _browser_nurture_interactive_console():
+            raise BrowserNurtureError("INTERACTIVE_CONSOLE_REQUIRED")
+        data_root = resolve_standalone_data_root()
+        accounts = LocalAccountStore(data_root)
+        account = accounts.get(args.alias)
+        if (
+            re.fullmatch(
+                r"(?:test|synthetic)-[a-z0-9](?:[a-z0-9-]{0,29})",
+                account.alias.casefold(),
+            )
+            is not None
+        ):
+            raise BrowserNurtureError("LIVE_ACCOUNT_REQUIRED")
+        state = BrowserNurtureStateStore(data_root)
+        config = state.load_config(account.id)
+        if config is None:
+            raise BrowserNurtureError("CONFIG_NOT_FOUND")
+        report = asyncio.run(
+            run_browser_ui_diagnostic(
+                LocalRuntime(data_root, accounts),
+                account.alias,
+                config,
+            )
+        )
+    except (
+        BrowserNurtureError,
+        BrowserNurtureStateError,
+        StandaloneRuntimeError,
+        StandaloneAccountError,
+    ) as error:
+        sys.stderr.write(f"ERROR {error.code}\n")
+        return 1
+    except KeyboardInterrupt:
+        sys.stdout.write(
+            '{"schema":"THREADS_UI_DIAGNOSTIC_V1","status":"STOPPED",'
+            '"reason_code":"INTERRUPTED","stages":{'
+            '"home":{"status":"NOT_OBSERVED"},'
+            '"search":{"status":"NOT_OBSERVED"},'
+            '"detail":{"status":"NOT_OBSERVED"}}}\n'
+        )
+        return 0
+    except Exception:  # noqa: BLE001 - fixed CLI boundary for private browser data.
+        sys.stderr.write("ERROR DIAGNOSTIC_FAILED\n")
+        return 1
+    sys.stdout.write(format_browser_ui_diagnostic(report))
+    return 0 if report["status"] in {"COMPLETE", "STOPPED"} else 1
+
+
 def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
+    if args.browser_nurture_command == "inspect-ui":
+        return _handle_browser_ui_diagnostic(args)
+
     from threads_platform.standalone.browser_nurture import (
         BrowserNurtureError,
         BrowserNurtureRunner,
@@ -1138,6 +1204,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="disable the account-scoped continuous-run opt-in",
     )
     disable_browser_nurture_continuous.add_argument("alias")
+    inspect_browser_ui = browser_nurture_commands.add_parser(
+        "inspect-ui",
+        help="inspect Home, Search and one Detail page with a private read-only report",
+    )
+    inspect_browser_ui.add_argument("alias")
+    inspect_browser_ui.add_argument(
+        "--confirm-local-read-only",
+        action="store_true",
+        help="confirm this supervised session only observes the current page",
+    )
     run_browser_nurture = browser_nurture_commands.add_parser(
         "run",
         help="run one bounded cycle or remain in the foreground until stopped",

@@ -44,6 +44,12 @@ from threads_platform.browser.threads_job_ui_reader import (
     UiPageState,
     UiPostDetail,
 )
+from threads_platform.browser.ui_diagnostic import (
+    DIAGNOSTIC_SCRIPT,
+    UiDiagnosticSchemaError,
+    UiDiagnosticSnapshot,
+    validate_ui_diagnostic_snapshot,
+)
 
 _MAX_SYNTHETIC_FIXTURE_PAGES = 128
 _MAX_SYNTHETIC_FIXTURE_HTML_CODEPOINTS = 1_100_000
@@ -414,6 +420,50 @@ class _PlaywrightBrowserSession:
         self._ensure_alive()
         await self._raise_ui_policy_error()
         return result
+
+    async def inspect_ui_diagnostic(
+        self,
+        *,
+        expected_username: str,
+        configured_topic: str,
+    ) -> UiDiagnosticSnapshot:
+        """Return only the fixed, privacy-validated semantic graph for the current page."""
+
+        self._ensure_alive()
+        origin = self._async_ui_reader_origin
+        if origin is None and len(self._allowed_navigation_origins) == 1:
+            origin = next(iter(self._allowed_navigation_origins))
+        if origin not in {
+            BROWSER_FEED_ORIGIN,
+            "https://threads.example.invalid",
+        } or self._allowed_navigation_origins != frozenset({origin}):
+            raise UnsupportedUIState()
+        await self._raise_navigation_policy_error()
+        try:
+            raw_snapshot = await asyncio.wait_for(
+                self._page.evaluate(
+                    DIAGNOSTIC_SCRIPT,
+                    {
+                        "allowedOrigin": origin,
+                        "expectedUsername": expected_username,
+                        "configuredTopic": configured_topic,
+                        "maxCandidates": 3_000,
+                        "maxNodes": 180,
+                        "maxRelations": 480,
+                    },
+                ),
+                timeout=3.0,
+            )
+        except TimeoutError, PlaywrightError:
+            self._ensure_alive()
+            await self._raise_navigation_policy_error()
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE") from None
+        self._ensure_alive()
+        await self._raise_navigation_policy_error()
+        try:
+            return validate_ui_diagnostic_snapshot(raw_snapshot)
+        except UiDiagnosticSchemaError:
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_SCHEMA_INVALID") from None
 
     async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
         self._ensure_alive()
