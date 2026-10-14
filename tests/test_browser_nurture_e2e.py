@@ -192,7 +192,7 @@ def _shell(actor: str, main: str) -> str:
         "<!doctype html><html><head><meta charset=utf-8>"
         "<style>body{margin:0}main{display:block}.post-card{height:80px;"
         "border-bottom:1px solid #ddd}header[role=banner]{height:36px}</style></head><body>"
-        f'<header role="banner"><a href="/@{actor}">Account</a></header>{main}'
+        f'<header role="banner"><a href="/@{actor}" aria-label="Profile">Profile</a></header>{main}'
         "</body></html>"
     )
 
@@ -223,6 +223,81 @@ def _detail_for_actor(post_id: str, actor: str) -> str:
         '<a href="/@synthetic.author">@synthetic.author</a>'
         f'<a href="{target}">time</a>'
         f"</header>{body}</article></main>",
+    )
+
+
+def _two_area_home(actor: str) -> str:
+    return (
+        "<!doctype html><html><head><meta charset=utf-8>"
+        "<style>body{margin:0;font:16px sans-serif}[role=navigation]{width:220px;float:left}"
+        "[role=navigation] a{display:block;padding:12px}main{margin-left:240px}</style></head><body>"
+        '<div role="navigation">'
+        '<a href="/" aria-label="For you">For you</a>'
+        '<a href="/search" aria-label="Search">Search</a>'
+        f'<a href="/@{actor}" aria-label="Profile">Profile</a>'
+        "</div><section><h1>For you</h1>"
+        '<div role="textbox" contenteditable="true" aria-label="Start a thread"></div>'
+        "</section></body></html>"
+    )
+
+
+def _with_two_area_navigation(document: str, actor: str) -> str:
+    navigation = (
+        '<div role="navigation"><a href="/" aria-label="For you">For you</a>'
+        '<a href="/search" aria-label="Search">Search</a>'
+        f'<a href="/@{actor}" aria-label="Profile">Profile</a></div>'
+    )
+    return document.replace("<body>", f"<body>{navigation}", 1)
+
+
+def _visual_card(post_id: str) -> str:
+    target = _target(post_id).replace(_ORIGIN, "")
+    body = _BODIES[post_id]
+    expansion = ""
+    if post_id == "003":
+        body = "A synthetic engineering post with details hidden below."
+        expansion = "<button>See more</button>"
+    return (
+        '<div class="visual-post-card" style="min-height:320px">'
+        "<header>"
+        '<a href="/@synthetic.author">@synthetic.author</a>'
+        f'<a href="{target}">time</a>'
+        f'</header><div dir="auto">{body}{expansion}</div></div>'
+    )
+
+
+def _search_panel(actor: str, cards: str) -> str:
+    return (
+        "<!doctype html><html><head><meta charset=utf-8>"
+        "<style>body{margin:0;font:16px sans-serif}[role=navigation]{width:220px;float:left}"
+        "aside{margin-left:720px;width:400px;height:420px;overflow-y:auto;border-left:1px solid #ddd}"
+        ".visual-post-card{border-bottom:1px solid #ddd;padding:8px}</style></head><body>"
+        '<div role="navigation">'
+        '<a href="/" aria-label="For you">For you</a>'
+        '<a href="/search" aria-label="Search">Search</a>'
+        f'<a href="/@{actor}" aria-label="Profile">Profile</a>'
+        "</div><section><h1>For you</h1>"
+        '<article><a href="/@synthetic.author/post/home-only">Home-only post</a></article>'
+        "</section>"
+        '<aside role="complementary" aria-label="Search">'
+        '<input type="search" role="searchbox" aria-label="Search">'
+        '<div role="tablist"><button role="tab" aria-selected="true">Top</button>'
+        '<button role="tab" aria-selected="false">Recent</button></div>'
+        f'<section aria-label="Search results">{cards}</section></aside></body></html>'
+    )
+
+
+def _visual_detail(actor: str, post_id: str) -> str:
+    return (
+        "<!doctype html><html><head><meta charset=utf-8>"
+        "<style>body{margin:0;font:16px sans-serif}[role=navigation]{width:220px;float:left}"
+        "section{margin-left:240px}</style></head><body>"
+        '<div role="navigation">'
+        '<a href="/" aria-label="For you">For you</a>'
+        '<a href="/search" aria-label="Search">Search</a>'
+        f'<a href="/@{actor}" aria-label="Profile">Profile</a>'
+        f'</div><section><div class="visual-post-card">{_visual_card(post_id)}</div></section>'
+        "</body></html>"
     )
 
 
@@ -644,15 +719,15 @@ def test_browser_source_requires_explicit_read_only_selection_and_installed_cli_
 
 
 def _offline_live_pages(actor: str) -> dict[str, str]:
-    document = _fixture_document(actor=actor)
-    raw_pages = cast(list[dict[str, str]], document["pages"])
-    return {
-        page["url"].replace(_ORIGIN, BROWSER_FEED_ORIGIN): page["html"].replace(
-            _ORIGIN,
-            BROWSER_FEED_ORIGIN,
-        )
-        for page in raw_pages
+    cards = "".join(_visual_card(post_id) for post_id in _BODIES)
+    pages = {
+        f"{BROWSER_FEED_ORIGIN}/": _two_area_home(actor),
+        f"{BROWSER_FEED_ORIGIN}/search": _search_panel(actor, cards),
     }
+    for post_id in _BODIES:
+        target = _target(post_id).replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+        pages[target] = _visual_detail(actor, post_id)
+    return pages
 
 
 def _install_offline_live_browser_transport(
@@ -870,6 +945,43 @@ def test_browser_source_runs_live_cli_path_through_offline_chromium(
     )
 
 
+def test_browser_source_scrolls_nested_search_results_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "nested-search-scroll-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    pages = _offline_live_pages("offline.operator")
+    panel = _search_panel("offline.operator", "".join(_visual_card(post_id) for post_id in _BODIES))
+    panel = panel.replace("height:420px;overflow-y:auto", "height:420px;overflow-y:hidden")
+    panel = panel.replace(
+        "</style>",
+        'aside section[aria-label="Search results"]{height:380px;overflow-y:auto}</style>',
+    )
+    pages[f"{BROWSER_FEED_ORIGIN}/search"] = panel
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    assert exit_code == 0, output.out + output.err
+    assert "search_scanned=4" in output.out
+    scroll_count = next(
+        int(part.removeprefix("search_scrolls="))
+        for part in output.out.split()
+        if part.startswith("search_scrolls=")
+    )
+    assert scroll_count > 0
+    assert set(requested_urls).issubset(pages)
+
+
 def test_browser_source_stops_on_visible_actor_mismatch_before_search(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -917,15 +1029,13 @@ def test_browser_source_waits_for_delayed_home_hydration(
     account = _create_browser_source_account(root, actor)
     pages = _offline_live_pages(actor)
     pages[f"{BROWSER_FEED_ORIGIN}/"] = (
-        "<!doctype html><html><body><div id=app></div><script>"
-        "setTimeout(() => {"
-        "const header = document.createElement('header');"
-        "const link = document.createElement('a');"
-        f"link.href = '/@{actor}'; link.setAttribute('aria-label', 'Your profile'); "
-        "link.textContent = 'Profile'; header.append(link);"
-        "document.body.append(header);"
-        "const main = document.createElement('main');"
-        "main.textContent = 'Synthetic Home'; document.body.append(main);"
+        "<!doctype html><html><body><div id=app></div><script>setTimeout(() => {"
+        "const nav = document.createElement('div'); nav.setAttribute('role', 'navigation');"
+        f'nav.innerHTML = \'<a href="/" aria-label="For you">For you</a><a href="/search" aria-label="Search">Search</a><a href="/@{actor}" aria-label="Profile">Profile</a>\';'
+        "document.body.append(nav);"
+        "const section = document.createElement('section');"
+        'section.innerHTML = \'<h1>For you</h1><div role="textbox" contenteditable="true"></div>\';'
+        "document.body.append(section);"
         "}, 250);</script></body></html>"
     )
 
@@ -940,12 +1050,12 @@ def test_browser_source_waits_for_delayed_home_hydration(
     assert exit_code == 0, output.out + output.err
     assert "status=COMPLETE source=BROWSER_UI" in output.out
     assert requested_urls[0] == f"{BROWSER_FEED_ORIGIN}/"
-    assert requested_urls.count(f"{BROWSER_FEED_ORIGIN}/") == 1
+    assert requested_urls.count(f"{BROWSER_FEED_ORIGIN}/") >= 1
     assert set(requested_urls).issubset(pages)
     assert BrowserNurtureStateStore(root).load_checkpoint(account.id).completed_cycles == 1
 
 
-def test_browser_source_accepts_unique_self_profile_marker_in_semantic_header(
+def test_browser_source_accepts_explicit_self_profile_in_two_area_home(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -956,12 +1066,7 @@ def test_browser_source_accepts_unique_self_profile_marker_in_semantic_header(
     actor = "offline.operator"
     account = _create_browser_source_account(root, actor)
     pages = _offline_live_pages(actor)
-    pages[f"{BROWSER_FEED_ORIGIN}/"] = (
-        "<!doctype html><html><body>"
-        f'<header><a href="/@{actor}" aria-label="Your profile">Profile</a></header>'
-        "<section>Visible synthetic Home content</section>"
-        "</body></html>"
-    )
+    pages[f"{BROWSER_FEED_ORIGIN}/"] = _two_area_home(actor)
 
     exit_code, output, requested_urls = _run_offline_browser_source_cli(
         root,
@@ -976,6 +1081,48 @@ def test_browser_source_accepts_unique_self_profile_marker_in_semantic_header(
     assert requested_urls[0] == f"{BROWSER_FEED_ORIGIN}/"
     assert set(requested_urls).issubset(pages)
     assert BrowserNurtureStateStore(root).load_checkpoint(account.id).completed_cycles == 1
+
+
+@pytest.mark.parametrize("identity_case", ("arbitrary-profile-link", "duplicate-self-control"))
+def test_browser_source_does_not_guess_or_accept_ambiguous_self_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    identity_case: str,
+) -> None:
+    _require_local_chromium()
+    monkeypatch.setattr(ui_reader_module, "_READINESS_TIMEOUT_MS", 250)
+    root = tmp_path / f"ambiguous-self-{identity_case}"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    home = _two_area_home(actor)
+    if identity_case == "arbitrary-profile-link":
+        home = home.replace(
+            f'<a href="/@{actor}" aria-label="Profile">Profile</a>',
+            f'<a href="/@{actor}">@{actor}</a>',
+        )
+    else:
+        home = home.replace(
+            f'<a href="/@{actor}" aria-label="Profile">Profile</a>',
+            f'<a href="/@{actor}" aria-label="Profile">Profile</a>'
+            f'<a href="/@{actor}" aria-label="Profile">Profile</a>',
+        )
+    pages[f"{BROWSER_FEED_ORIGIN}/"] = home
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    assert exit_code == 1
+    assert "ERROR HOME_ACTOR_UNVERIFIED" in output.err
+    assert requested_urls == [f"{BROWSER_FEED_ORIGIN}/"]
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -995,17 +1142,25 @@ def test_browser_source_accepts_unique_self_profile_marker_in_semantic_header(
         ),
         (
             (
-                "<!doctype html><html><body>"
-                '<header><a href="/@offline.operator">Profile</a></header>'
-                "<section>Synthetic Home</section></body></html>"
+                "<!doctype html><html><body><main>Synthetic Home</main>"
+                '<header><a href="/@offline.operator" aria-label="Your profile">Profile</a></header>'
+                "</body></html>"
             ),
             "HOME_ACTOR_UNVERIFIED",
         ),
         (
             (
+                "<!doctype html><html><body>"
+                '<header><a href="/@offline.operator">Profile</a></header>'
+                "<section>Synthetic Home</section></body></html>"
+            ),
+            "HOME_ROOT_UNRECOGNIZED",
+        ),
+        (
+            (
                 "<!doctype html><html><body><main>Synthetic Home</main>"
                 '<header role="banner"><a href="/@offline.operator">Profile</a>'
-                '<a href="/@offline.other">Other</a></header></body></html>'
+                '<a href="/@offline.other" aria-label="Profile">Profile</a></header></body></html>'
             ),
             "HOME_ACTOR_UNVERIFIED",
         ),
@@ -1062,13 +1217,10 @@ def test_browser_source_waits_for_delayed_search_cards(
     actor = "offline.operator"
     account = _create_browser_source_account(root, actor)
     pages = _offline_live_pages(actor)
-    card = _card("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
-    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = (
-        "<!doctype html><html><body>"
-        f'<header role="banner"><a href="/@{actor}">Profile</a></header>'
-        '<main><form role="search"><input type="search" value="design"></form></main>'
-        "<script>setTimeout(() => document.querySelector('main').insertAdjacentHTML('beforeend', "
-        f"{json.dumps(card)}), 250);</script></body></html>"
+    card = _visual_card("001")
+    pages[f"{BROWSER_FEED_ORIGIN}/search"] = _search_panel(actor, "").replace(
+        "</section></aside>",
+        f"</section><script>setTimeout(() => document.querySelector('aside section').insertAdjacentHTML('beforeend', {json.dumps(card)}), 250);</script></aside>",
     )
 
     exit_code, output, requested_urls = _run_offline_browser_source_cli(
@@ -1081,9 +1233,73 @@ def test_browser_source_waits_for_delayed_search_cards(
 
     assert exit_code == 0, output.out + output.err
     assert "status=COMPLETE source=BROWSER_UI" in output.out
-    assert f"{BROWSER_FEED_ORIGIN}/search?q=design" in requested_urls
+    assert f"{BROWSER_FEED_ORIGIN}/search" in requested_urls
     assert set(requested_urls).issubset(pages)
     assert BrowserNurtureStateStore(root).load_checkpoint(account.id).completed_cycles == 1
+
+
+def test_browser_source_accepts_explicit_search_no_results_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "search-no-results-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    pages = _offline_live_pages("offline.operator")
+    pages[f"{BROWSER_FEED_ORIGIN}/search"] = _search_panel(
+        "offline.operator",
+        '<div role="status">No results found</div>',
+    )
+
+    exit_code, output, _ = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    assert exit_code == 0, output.out + output.err
+    assert "status=COMPLETE source=BROWSER_UI" in output.out
+    assert "search_scanned=0" in output.out
+    checkpoint = BrowserNurtureStateStore(root).load_checkpoint(account.id)
+    assert checkpoint.completed_cycles == 1
+    assert checkpoint.scanned == 0
+
+
+def test_browser_source_rejects_unrecognized_search_panel_without_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    monkeypatch.setattr(ui_reader_module, "_READINESS_TIMEOUT_MS", 250)
+    root = tmp_path / "search-panel-drift-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    pages = _offline_live_pages("offline.operator")
+    pages[f"{BROWSER_FEED_ORIGIN}/search"] = (
+        "<!doctype html><html><body>"
+        '<div role="navigation"><a href="/" aria-label="For you">For you</a>'
+        '<a href="/search" aria-label="Search">Search</a>'
+        '<a href="/@offline.operator" aria-label="Profile">Profile</a></div>'
+        '<section><input type="search" role="searchbox"></section></body></html>'
+    )
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+    )
+
+    assert exit_code == 1
+    assert "ERROR SEARCH_ROOT_UNRECOGNIZED" in output.err
+    assert requested_urls == [f"{BROWSER_FEED_ORIGIN}/", f"{BROWSER_FEED_ORIGIN}/search"]
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -1120,10 +1336,7 @@ def test_browser_source_rejects_unbound_search_cards(
             "</header>",
             '<a href="/@offline.other">Other author</a></header>',
         )
-    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _shell(
-        actor,
-        f'<main><form role="search"><input type="search" value="design"></form>{card}</main>',
-    ).replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    pages[f"{BROWSER_FEED_ORIGIN}/search"] = _search_panel(actor, card)
 
     exit_code, output, requested_urls = _run_offline_browser_source_cli(
         root,
@@ -1157,14 +1370,19 @@ def test_browser_source_rejects_unproven_exact_details(
     account = _create_browser_source_account(root, actor)
     pages = _offline_live_pages(actor)
     target = _target("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
-    detail = _detail_for_actor("001", actor).replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    detail = _with_two_area_navigation(
+        _detail_for_actor("001", actor).replace(_ORIGIN, BROWSER_FEED_ORIGIN), actor
+    )
     reason = (
         "DETAIL_ROOT_UNRECOGNIZED" if variant == "missing-root" else "DETAIL_PROVENANCE_UNVERIFIED"
     )
     if variant == "missing-root":
-        detail = _shell(actor, "<main><p>Synthetic unrelated detail</p></main>").replace(
-            _ORIGIN,
-            BROWSER_FEED_ORIGIN,
+        detail = _with_two_area_navigation(
+            _shell(actor, "<main><p>Synthetic unrelated detail</p></main>").replace(
+                _ORIGIN,
+                BROWSER_FEED_ORIGIN,
+            ),
+            actor,
         )
     elif variant == "missing-author":
         detail = detail.replace(
@@ -1216,7 +1434,9 @@ def test_browser_source_keeps_missing_visible_body_unknown_and_checkpoints_exact
     account = _create_browser_source_account(root, actor)
     pages = _offline_live_pages(actor)
     target = _target("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
-    detail = _detail_for_actor("001", actor).replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    detail = _with_two_area_navigation(
+        _detail_for_actor("001", actor).replace(_ORIGIN, BROWSER_FEED_ORIGIN), actor
+    )
     detail = detail.replace(
         '<div dir="auto">A synthetic design engineer opportunity is available.</div>',
         "",
