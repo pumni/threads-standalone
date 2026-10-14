@@ -529,12 +529,14 @@ class _PlaywrightBrowserSession:
         *,
         expected_actor: str,
         origin: str,
+        one_post: bool = False,
     ) -> tuple[UiFeedBatch, ...]:
         self._ensure_alive()
         try:
             result = await self._get_async_ui_reader(origin).search(
                 query,
                 expected_actor=expected_actor,
+                one_post=one_post,
             )
         except BrowserAdapterError:
             self._ensure_alive()

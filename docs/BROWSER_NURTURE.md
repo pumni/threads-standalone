@@ -4,7 +4,7 @@ Browser Nurture is a read-only, account-scoped workflow. It uses the registered 
 
 ## Status and boundaries
 
-This update adds a supervised manual-assisted read. The operator opens Search and submits the first configured topic, then opens one result; the reader proceeds only when the visible Search region, query, same-card permalink and author, trusted main-frame click, and exact detail body provenance are verified. It uses the registered account UUID, existing Chromium profile, and account lock. Live UI compatibility remains **unverified**; Codex and CI use offline synthetic pages only.
+Draft PR #172 is implementing a one-shot automatic read smoke on the existing Browser Nurture runner. The command verifies the signed-in actor on Home, navigates the headed Chromium profile to `/search`, submits the first configured topic, and reads at most one result after proving Search context, same-card permalink and author, exact detail provenance, and a complete visible body. The smoke does not write a cycle checkpoint. Live UI compatibility remains **unverified**; Codex and CI use offline synthetic pages only.
 
 The `browser` source requires an explicit source selection and a headed interactive one-shot confirmation. It reads only visible UI and stops on an account mismatch, login wall, challenge, rate limit, redirect, unsupported structure, timeout, or browser crash. The CLI does not expose likes, follows, replies, posts, or other engagement actions.
 
@@ -12,7 +12,9 @@ The `ui-fixture` source is for offline development and CI. It accepts only a pri
 
 Topic-search metrics describe only visible posts returned by configured searches. They are labeled `search_*` in CLI output. They do not measure the home or For You recommendation feed and cannot establish that a recommendation changed.
 
-## One supervised manual-assisted read without a cycle checkpoint
+## Manual-assisted read without a cycle checkpoint
+
+`manual-assist` remains available as a separate supervised workflow. It requires operator navigation and is not the automatic P0 smoke described below.
 
 Run this separate command for one manual Search → post read:
 
@@ -28,7 +30,19 @@ The privacy-filtered V2 observation did not establish a Search-only region or vi
 
 Recoverable UI errors print a fixed code while Chromium remains open and offer Retry, Skip, or Stop. Manual prompts expire after five minutes; error decisions expire after one minute. Browser crashes, account mismatch, challenge/rate-limit states, and origin-guard failures stop the run. The UI reader is read-only: the command does not like, follow, comment, post, or message. It prints only stages, safe status codes, counts, and classification; it does not print the topic, account, URL, post text, screenshot, or DOM.
 
-This manual-assisted result is not an automated cycle. It does not read, create, or update the Browser Nurture cycle checkpoint, so output reports `checkpoint=UNCHANGED`. This command has Chromium offline regression coverage only; it has not been exercised against live Threads from Codex or CI.
+This manual-assisted result is not an automated cycle. It does not read, create, or update the Browser Nurture cycle checkpoint, so output reports `checkpoint=UNCHANGED`. It has Chromium offline regression coverage only; it has not been exercised against live Threads from Codex or CI.
+
+## One-shot automatic read without a cycle checkpoint
+
+After ChatGPT Lead accepts the exact Draft PR HEAD and CI, run one command from the interactive PowerShell session that owns the registered account and its existing logged-in Chromium profile:
+
+```powershell
+uv run --locked threads-local browser-nurture run <alias> --source browser --confirm-live-read-only --smoke
+```
+
+After startup, the command proceeds without Search or Detail input from the operator. It verifies the configured actor on Home, uses ordinary same-origin Playwright navigation to `/search`, fills the first configured topic into the unique visible Search input, submits it with Enter, then waits for the applied URL query and a stable visible Search result snapshot. Search candidates must be tied to the active Posts/Top/Recent tab and each candidate's permalink and author must share one visible result container. A visible post outside that Search context, an ambiguous result, a missing body, or an unverified actor stops the smoke without reading a post.
+
+The smoke reads at most one post, reports only a fixed status, reason code, count and classification, and never creates or updates the cycle checkpoint. It does not like, follow, comment, post, message, use a hidden API, or run continuously. It requires the selected account's existing profile lock, a headed browser, an interactive terminal and `--confirm-live-read-only`. Do not run it against live Threads until Lead accepts the exact source and CI head. Codex and CI never access a real Threads session.
 
 ## Separate automated checkpointed workflow
 
@@ -63,7 +77,7 @@ The automated `run` command remains a separate checkpointed workflow and is not 
 
 ## Live-use handoff
 
-The manual-assisted command is the current supervised pilot. Do not use the older Home selector probe or automatic-cycle UAT checklist as acceptance evidence for this pilot. After Lead acceptance, use the manual-assisted command once and share only safe status codes and aggregate counts; keep private account evidence out of GitHub. The automated checkpoint and continuous workflows are separate and remain outside this pilot.
+The automatic `--smoke` command is the proposed one-shot pilot for Draft PR #172. Do not use the older Home selector probe or manual-assisted output as evidence that automatic Search works. After Lead accepts the exact source and CI head, the owner may run the smoke once and share only safe status codes and aggregate counts; keep private account evidence out of GitHub. The checkpointed and continuous workflows remain separate.
 
 ## Continuous mode and rollback — outside this pilot
 

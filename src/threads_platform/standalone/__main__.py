@@ -716,6 +716,23 @@ def _format_browser_nurture_result(result: _BrowserNurtureRunResultView, *, sour
     )
 
 
+def _format_browser_nurture_smoke_result(result: _BrowserNurtureRunResultView) -> str:
+    if result.status.value != "COMPLETE" or result.scanned != 1:
+        reason = result.reason_code or "SEARCH_POST_NOT_FOUND"
+        return f"AUTO_READ status=STOPPED reason={reason} posts_read=0 checkpoint=UNCHANGED\n"
+    classification = (
+        "RELEVANT"
+        if result.relevant == 1
+        else "IRRELEVANT"
+        if result.irrelevant == 1
+        else "UNKNOWN"
+    )
+    return (
+        "AUTO_READ status=COMPLETE reason=NONE posts_read=1 "
+        f"classification={classification} checkpoint=UNCHANGED\n"
+    )
+
+
 def _handle_browser_ui_diagnostic(args: argparse.Namespace) -> int:
     from threads_platform.standalone.browser_nurture import BrowserNurtureError
     from threads_platform.standalone.browser_nurture_state import (
@@ -895,7 +912,13 @@ def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
         return 0
 
     try:
+        if args.smoke and args.source != "browser":
+            raise BrowserNurtureError("RUN_POLICY_INVALID")
         if args.source == "browser":
+            if args.smoke and (
+                args.continuous or args.max_cycles not in (None, 1) or args.idle_seconds is not None
+            ):
+                raise BrowserNurtureError("RUN_POLICY_INVALID")
             if not args.continuous and args.max_cycles not in (None, 1):
                 raise BrowserNurtureError("RUN_POLICY_INVALID")
             if args.fixture_file is not None or args.data_root is not None:
@@ -927,6 +950,7 @@ def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
                 max_cycles=cycles,
                 continuous=args.continuous,
                 idle_seconds=args.idle_seconds,
+                smoke=args.smoke,
             )
             output_source = "BROWSER_UI"
         else:
@@ -981,9 +1005,19 @@ def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
         StandaloneRuntimeError,
         StandaloneAccountError,
     ) as error:
-        sys.stderr.write(f"ERROR {error.code}\n")
+        if args.smoke:
+            sys.stdout.write(
+                f"AUTO_READ status=STOPPED reason={error.code} posts_read=0 checkpoint=UNCHANGED\n"
+            )
+        else:
+            sys.stderr.write(f"ERROR {error.code}\n")
         return 1
     except KeyboardInterrupt:
+        if args.smoke:
+            sys.stdout.write(
+                "AUTO_READ status=STOPPED reason=INTERRUPTED posts_read=0 checkpoint=UNCHANGED\n"
+            )
+            return 130
         output_source = "BROWSER_UI" if args.source == "browser" else "SYNTHETIC_FIXTURE"
         sys.stdout.write(
             f"BROWSER_NURTURE status=STOPPED source={output_source} "
@@ -994,8 +1028,17 @@ def _handle_browser_nurture_command(args: argparse.Namespace) -> int:
         )
         return 130
     except Exception:  # noqa: BLE001 - fixed safe CLI boundary for fixture failures.
+        if args.smoke:
+            sys.stdout.write(
+                "AUTO_READ status=STOPPED reason=BROWSER_NURTURE_FAILED "
+                "posts_read=0 checkpoint=UNCHANGED\n"
+            )
+            return 1
         sys.stderr.write("ERROR BROWSER_NURTURE_FAILED\n")
         return 1
+    if args.smoke:
+        sys.stdout.write(_format_browser_nurture_smoke_result(result))
+        return 0 if result.status.value == "COMPLETE" and result.scanned == 1 else 1
     sys.stdout.write(_format_browser_nurture_result(result, source=output_source))
     return 0 if result.status.value == "COMPLETE" else 1
 
@@ -1165,6 +1208,7 @@ def _run_browser_nurture_with_stop(
     max_cycles: int | None,
     continuous: bool,
     idle_seconds: int | None,
+    smoke: bool = False,
 ) -> Any:
     async def run() -> Any:
         loop = asyncio.get_running_loop()
@@ -1183,6 +1227,7 @@ def _run_browser_nurture_with_stop(
                 max_cycles=max_cycles,
                 continuous=continuous,
                 idle_seconds=idle_seconds,
+                smoke=smoke,
                 stop_event=stop_event,
             )
         finally:
@@ -1398,6 +1443,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_browser_nurture.add_argument("--max-cycles", type=int)
     run_browser_nurture.add_argument("--idle-seconds", type=int)
+    run_browser_nurture.add_argument(
+        "--smoke",
+        action="store_true",
+        help="read at most one verified post without writing the Browser Nurture checkpoint",
+    )
 
     recruitment_parser = commands.add_parser("recruitment")
     recruitment_commands = recruitment_parser.add_subparsers(

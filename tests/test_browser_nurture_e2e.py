@@ -43,6 +43,7 @@ from threads_platform.standalone.browser_nurture import (
 )
 from threads_platform.standalone.browser_nurture_state import (
     BrowserNurtureCheckpointV1,
+    BrowserNurtureCheckpointV2,
     BrowserNurtureStateStore,
     browser_nurture_policy_fingerprint,
     validate_browser_nurture_checkpoint,
@@ -266,7 +267,7 @@ def _visual_card(post_id: str) -> str:
     )
 
 
-def _search_panel(actor: str, cards: str) -> str:
+def _search_panel(actor: str, cards: str, *, query: str = "design") -> str:
     return (
         "<!doctype html><html><head><meta charset=utf-8>"
         "<style>body{margin:0;font:16px sans-serif}[role=navigation]{width:220px;float:left}"
@@ -280,10 +281,38 @@ def _search_panel(actor: str, cards: str) -> str:
         '<article><a href="/@synthetic.author/post/home-only">Home-only post</a></article>'
         "</section>"
         '<aside role="complementary" aria-label="Search">'
-        '<input type="search" role="searchbox" aria-label="Search">'
+        '<form action="/search" method="get">'
+        f'<input type="text" name="q" role="textbox" aria-label="Search" value="{query}">'
+        "</form>"
         '<div role="tablist"><button role="tab" aria-selected="true">Top</button>'
         '<button role="tab" aria-selected="false">Recent</button></div>'
         f'<section aria-label="Search results">{cards}</section></aside></body></html>'
+    )
+
+
+def _search_landing(actor: str) -> str:
+    return (
+        "<!doctype html><html><head><meta charset=utf-8></head><body>"
+        f'<div role="navigation"><a href="/@{actor}" aria-label="Profile">Profile</a></div>'
+        '<form action="/search" method="get">'
+        '<input type="text" name="q" role="textbox" aria-label="Search">'
+        "</form></body></html>"
+    )
+
+
+def _generic_search_results(actor: str, query: str, cards: str, *, home_cards: str = "") -> str:
+    return (
+        "<!doctype html><html><head><meta charset=utf-8>"
+        "<style>body{margin:0;font:16px sans-serif}.search-surface{height:640px;overflow:auto}"
+        ".visual-post-card{min-height:320px;border-bottom:1px solid #ddd}</style></head><body>"
+        f'<div role="navigation"><a href="/@{actor}" aria-label="Profile">Profile</a></div>'
+        f'<div class="home-feed">{home_cards}</div>'
+        '<div class="search-surface">'
+        '<form action="/search" method="get">'
+        f'<input type="text" name="q" role="textbox" aria-label="Search" value="{query}">'
+        '</form><div role="tablist"><button role="tab" aria-selected="true">Posts</button>'
+        '<button role="tab" aria-selected="false">Recent</button></div>'
+        f'<div class="search-results">{cards}</div></div></body></html>'
     )
 
 
@@ -712,6 +741,7 @@ def test_browser_source_requires_explicit_read_only_selection_and_installed_cli_
     assert "--continuous" in help_result.stdout
     assert "--source {browser,ui-fixture}" in help_result.stdout
     assert "--confirm-live-read-only" in help_result.stdout
+    assert "--smoke" in help_result.stdout
     command_help = _run_cli(("browser-nurture", "--help"), cwd=tmp_path, root=None)
     assert command_help.returncode == 0
     assert "enable-continuous" in command_help.stdout
@@ -722,8 +752,14 @@ def _offline_live_pages(actor: str) -> dict[str, str]:
     cards = "".join(_visual_card(post_id) for post_id in _BODIES)
     pages = {
         f"{BROWSER_FEED_ORIGIN}/": _two_area_home(actor),
-        f"{BROWSER_FEED_ORIGIN}/search": _search_panel(actor, cards),
+        f"{BROWSER_FEED_ORIGIN}/search": _search_landing(actor),
     }
+    for topic in _TOPICS:
+        pages[f"{BROWSER_FEED_ORIGIN}/search?{urlencode({'q': topic})}"] = _search_panel(
+            actor,
+            cards,
+            query=topic,
+        )
     for post_id in _BODIES:
         target = _target(post_id).replace(_ORIGIN, BROWSER_FEED_ORIGIN)
         pages[target] = _visual_detail(actor, post_id)
@@ -880,6 +916,8 @@ def _run_offline_browser_source_cli(
     pages: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    *,
+    smoke: bool = False,
 ) -> tuple[int, Any, list[str]]:
     requested_urls = _install_offline_live_browser_transport(monkeypatch, pages)
     monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", os.fspath(root))
@@ -887,18 +925,19 @@ def _run_offline_browser_source_cli(
     from threads_platform.standalone import __main__ as cli_module
 
     monkeypatch.setattr(cli_module, "_browser_nurture_interactive_console", lambda: True)
-    exit_code = cli_module.main(
-        (
-            "browser-nurture",
-            "run",
-            account.alias,
-            "--source",
-            "browser",
-            "--confirm-live-read-only",
-            "--max-cycles",
-            "1",
-        )
-    )
+    args = [
+        "browser-nurture",
+        "run",
+        account.alias,
+        "--source",
+        "browser",
+        "--confirm-live-read-only",
+        "--max-cycles",
+        "1",
+    ]
+    if smoke:
+        args.append("--smoke")
+    exit_code = cli_module.main(tuple(args))
     return exit_code, capsys.readouterr(), requested_urls
 
 
@@ -1028,6 +1067,175 @@ def test_browser_source_runs_live_cli_path_through_offline_chromium(
     )
 
 
+def test_browser_nurture_smoke_automates_search_and_reads_one_generic_result_without_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "automatic-search-smoke-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    state = BrowserNurtureStateStore(root)
+    config = state.load_config(account.id)
+    assert config is not None
+    state.save_checkpoint(
+        BrowserNurtureCheckpointV2(
+            account_uuid=account.id,
+            completed_cycles=2,
+            scanned=3,
+            relevant=2,
+            irrelevant=1,
+            policy_fingerprint="f" * 64,
+            next_topic_index=1,
+            seen_fingerprints=("a" * 64,),
+        )
+    )
+    checkpoint_path = root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json"
+    checkpoint_before = checkpoint_path.read_bytes()
+
+    pages = _offline_live_pages(actor)
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _generic_search_results(
+        actor,
+        "design",
+        _visual_card("001"),
+    )
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+        smoke=True,
+    )
+
+    detail_url = _target("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    assert exit_code == 0, output.out + output.err
+    assert output.err == ""
+    assert "AUTO_READ status=COMPLETE reason=NONE posts_read=1" in output.out
+    assert "classification=RELEVANT checkpoint=UNCHANGED" in output.out
+    assert requested_urls[:3] == [
+        f"{BROWSER_FEED_ORIGIN}/",
+        f"{BROWSER_FEED_ORIGIN}/search",
+        f"{BROWSER_FEED_ORIGIN}/search?q=design",
+    ]
+    assert requested_urls.count(detail_url) == 1
+    assert len([url for url in requested_urls if "/post/" in url]) == 1
+    assert set(requested_urls).issubset(pages)
+    assert checkpoint_path.read_bytes() == checkpoint_before
+    assert all(
+        private_value not in output.out + output.err
+        for private_value in (
+            account.alias,
+            actor,
+            "design",
+            _BODIES["001"],
+            detail_url,
+            BROWSER_FEED_ORIGIN,
+        )
+    )
+
+
+def test_browser_nurture_smoke_rejects_home_feed_outside_active_search_tab(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    monkeypatch.setattr(ui_reader_module, "_READINESS_TIMEOUT_MS", 250)
+    root = tmp_path / "automatic-search-no-bleed-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _generic_search_results(
+        actor,
+        "design",
+        "",
+        home_cards=_visual_card("001"),
+    )
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+        smoke=True,
+    )
+
+    assert exit_code == 1
+    assert "AUTO_READ status=STOPPED reason=SEARCH_RESULTS_UNPROVEN posts_read=0" in output.out
+    assert "checkpoint=UNCHANGED" in output.out
+    assert not any("/post/" in url for url in requested_urls)
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+
+
+def test_browser_nurture_smoke_stops_when_search_has_no_posts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "automatic-search-empty-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    pages = _offline_live_pages("offline.operator")
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _generic_search_results(
+        "offline.operator",
+        "design",
+        '<div role="status">No results found</div>',
+    )
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+        smoke=True,
+    )
+
+    assert exit_code == 1
+    assert "AUTO_READ status=STOPPED reason=SEARCH_POST_NOT_FOUND posts_read=0" in output.out
+    assert "checkpoint=UNCHANGED" in output.out
+    assert not any("/post/" in url for url in requested_urls)
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+
+
+def test_browser_nurture_smoke_does_not_count_a_partial_detail_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "automatic-search-partial-detail-root"
+    _secure_directory(root)
+    account = _create_browser_source_account(root, "offline.operator")
+    pages = _offline_live_pages("offline.operator")
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _generic_search_results(
+        "offline.operator",
+        "design",
+        _visual_card("003"),
+    )
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+        smoke=True,
+    )
+
+    assert exit_code == 1
+    assert "AUTO_READ status=STOPPED reason=DETAIL_BODY_UNVERIFIED posts_read=0" in output.out
+    assert "checkpoint=UNCHANGED" in output.out
+    assert sum("/post/" in url for url in requested_urls) == 1
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+
+
 def test_browser_source_scrolls_nested_search_results_container(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1044,7 +1252,7 @@ def test_browser_source_scrolls_nested_search_results_container(
         "</style>",
         'aside section[aria-label="Search results"]{height:380px;overflow-y:auto}</style>',
     )
-    pages[f"{BROWSER_FEED_ORIGIN}/search"] = panel
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = panel
 
     exit_code, output, requested_urls = _run_offline_browser_source_cli(
         root,
@@ -1301,7 +1509,7 @@ def test_browser_source_waits_for_delayed_search_cards(
     account = _create_browser_source_account(root, actor)
     pages = _offline_live_pages(actor)
     card = _visual_card("001")
-    pages[f"{BROWSER_FEED_ORIGIN}/search"] = _search_panel(actor, "").replace(
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _search_panel(actor, "").replace(
         "</section></aside>",
         f"</section><script>setTimeout(() => document.querySelector('aside section').insertAdjacentHTML('beforeend', {json.dumps(card)}), 250);</script></aside>",
     )
@@ -1316,7 +1524,7 @@ def test_browser_source_waits_for_delayed_search_cards(
 
     assert exit_code == 0, output.out + output.err
     assert "status=COMPLETE source=BROWSER_UI" in output.out
-    assert f"{BROWSER_FEED_ORIGIN}/search" in requested_urls
+    assert f"{BROWSER_FEED_ORIGIN}/search?q=design" in requested_urls
     assert set(requested_urls).issubset(pages)
     assert BrowserNurtureStateStore(root).load_checkpoint(account.id).completed_cycles == 1
 
@@ -1331,10 +1539,12 @@ def test_browser_source_accepts_explicit_search_no_results_state(
     _secure_directory(root)
     account = _create_browser_source_account(root, "offline.operator")
     pages = _offline_live_pages("offline.operator")
-    pages[f"{BROWSER_FEED_ORIGIN}/search"] = _search_panel(
-        "offline.operator",
-        '<div role="status">No results found</div>',
-    )
+    for topic in _TOPICS:
+        pages[f"{BROWSER_FEED_ORIGIN}/search?{urlencode({'q': topic})}"] = _search_panel(
+            "offline.operator",
+            '<div role="status">No results found</div>',
+            query=topic,
+        )
 
     exit_code, output, _ = _run_offline_browser_source_cli(
         root,
@@ -1363,12 +1573,12 @@ def test_browser_source_rejects_unrecognized_search_panel_without_checkpoint(
     _secure_directory(root)
     account = _create_browser_source_account(root, "offline.operator")
     pages = _offline_live_pages("offline.operator")
-    pages[f"{BROWSER_FEED_ORIGIN}/search"] = (
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = (
         "<!doctype html><html><body>"
         '<div role="navigation"><a href="/" aria-label="For you">For you</a>'
         '<a href="/search" aria-label="Search">Search</a>'
         '<a href="/@offline.operator" aria-label="Profile">Profile</a></div>'
-        '<section><input type="search" role="searchbox"></section></body></html>'
+        '<section><input type="search" role="searchbox" value="design"></section></body></html>'
     )
 
     exit_code, output, requested_urls = _run_offline_browser_source_cli(
@@ -1380,8 +1590,12 @@ def test_browser_source_rejects_unrecognized_search_panel_without_checkpoint(
     )
 
     assert exit_code == 1
-    assert "ERROR SEARCH_ROOT_UNRECOGNIZED" in output.err
-    assert requested_urls == [f"{BROWSER_FEED_ORIGIN}/", f"{BROWSER_FEED_ORIGIN}/search"]
+    assert "ERROR SEARCH_RESULTS_REGION_UNPROVEN" in output.err
+    assert requested_urls == [
+        f"{BROWSER_FEED_ORIGIN}/",
+        f"{BROWSER_FEED_ORIGIN}/search",
+        f"{BROWSER_FEED_ORIGIN}/search?q=design",
+    ]
     assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
 
 
@@ -1419,7 +1633,7 @@ def test_browser_source_rejects_unbound_search_cards(
             "</header>",
             '<a href="/@offline.other">Other author</a></header>',
         )
-    pages[f"{BROWSER_FEED_ORIGIN}/search"] = _search_panel(actor, card)
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _search_panel(actor, card)
 
     exit_code, output, requested_urls = _run_offline_browser_source_cli(
         root,
@@ -2121,7 +2335,7 @@ def test_manual_assist_rejects_unscoped_search_container_without_reading_home(
 
     output = capsys.readouterr()
     assert exit_code == 0
-    assert "SEARCH_RESULTS_REGION_UNPROVEN chromium=OPEN stage=SEARCH" in output.err
+    assert "SEARCH_RESULTS_UNPROVEN chromium=OPEN stage=SEARCH" in output.err
     assert "status=STOPPED" in output.out
     assert "search_region=NOT_VERIFIED search_candidates=0 posts_read=0" in output.out
     assert "checkpoint=UNCHANGED effects=NONE" in output.out

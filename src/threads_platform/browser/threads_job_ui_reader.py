@@ -189,7 +189,7 @@ _PAGE_STATE_SCRIPT = r"""
   )).filter(visible);
   const searchInputs = requireSearch
     ? Array.from(document.querySelectorAll(searchPanelMode
-      ? 'input[type="search"], [role="searchbox"]'
+      ? 'input[type="search"], [role="searchbox"], input[role="textbox"][aria-label="Search" i], input[role="textbox"][title="Search" i], input[aria-label="Search and explore" i]'
       : 'form[role="search"] input[type="search"]')).filter(visible)
     : [];
   const searchPanelCandidates = searchRoots.filter((root) => {
@@ -259,7 +259,9 @@ _FEED_BATCH_SCRIPT = r"""
     return rect.width > 0 && rect.height > 0;
   };
   const mains = Array.from(document.querySelectorAll(mainSelector)).filter(renderedInPage);
-  const searchInputs = Array.from(document.querySelectorAll('input[type="search"], [role="searchbox"]'))
+  const searchInputs = Array.from(document.querySelectorAll(
+    'input[type="search"], [role="searchbox"], input[role="textbox"][aria-label="Search" i], input[aria-label="Search and explore" i]'
+  ))
     .filter(renderedInPage);
   const panels = Array.from(document.querySelectorAll(
     'aside, [role="complementary"], [role="dialog"], [role="region"][aria-label]'
@@ -465,7 +467,7 @@ _ASSISTED_SEARCH_SNAPSHOT_SCRIPT = r"""
     const label = normalize(element.getAttribute('aria-label') || element.getAttribute('title'));
     return role === 'searchbox' || type === 'search' ||
       (['INPUT', 'TEXTAREA'].includes(element.tagName) &&
-        (role === 'textbox' || label === 'search' || label === 'search and explore'));
+        (label === 'search' || label === 'search and explore'));
   });
   if (searchInputs.length !== 1) return {state: 'SEARCH_INPUT_UNVERIFIED'};
   const input = searchInputs[0];
@@ -506,6 +508,12 @@ _ASSISTED_SEARCH_SNAPSHOT_SCRIPT = r"""
     } else if (minimalSearchRegions.length === 1) {
       root = minimalSearchRegions[0];
       regionKind = 'SEARCH_OVERLAY';
+    } else if (routePath === '/search') {
+      // The observed Search route has a visible navigation and textbox but no
+      // main/article or labelled dialog. Result cards still need a positive
+      // relationship to the active Search tab below.
+      root = document.body;
+      regionKind = 'SEARCH_ROUTE_TAB';
     }
   } else if (['/', '/home', '/for_you'].includes(routePath) && minimalSearchRegions.length === 1) {
     root = minimalSearchRegions[0];
@@ -513,12 +521,19 @@ _ASSISTED_SEARCH_SNAPSHOT_SCRIPT = r"""
   }
   if (!root) return {state: 'SEARCH_RESULTS_REGION_UNPROVEN'};
 
+  const filterLabel = (element) => normalize(
+    element.getAttribute('aria-label') || element.getAttribute('title') || element.innerText || ''
+  );
   const filters = Array.from(root.querySelectorAll('button,[role="button"],[role="tab"],a[href]'))
     .filter((element) => visible(element, root))
-    .filter((element) => ['top', 'recent'].includes(normalize(
-      element.getAttribute('aria-label') || element.getAttribute('title') || element.innerText || ''
-    )));
-  if (filters.length === 0) return {state: 'SEARCH_RESULTS_REGION_UNPROVEN'};
+    .filter((element) => ['posts', 'top', 'recent'].includes(filterLabel(element)));
+  const activeFilters = filters.filter((element) =>
+    element.getAttribute('aria-selected') === 'true' ||
+    element.getAttribute('aria-pressed') === 'true' ||
+    element.getAttribute('aria-current') === 'page'
+  );
+  if (activeFilters.length !== 1) return {state: 'SEARCH_RESULTS_REGION_UNPROVEN'};
+  const activeFilter = activeFilters[0];
 
   const busy = root.getAttribute('aria-busy') === 'true' ||
     Array.from(root.querySelectorAll('[aria-busy="true"],[role="progressbar"]'))
@@ -535,9 +550,59 @@ _ASSISTED_SEARCH_SNAPSHOT_SCRIPT = r"""
   const postPath = /^\/@[A-Za-z0-9._:-]{1,96}\/(?:post-[A-Za-z0-9._:-]{1,128}|post\/[A-Za-z0-9._:-]{1,128})$/;
   const profilePath = /^\/@[A-Za-z0-9._:-]{1,96}$/;
   const semanticCard = 'article,[role="article"],[role="listitem"],li';
-  const semanticCards = Array.from(root.querySelectorAll(semanticCard)).filter((card) =>
-    visible(card, root)
-  );
+  const semanticCards = Array.from(root.querySelectorAll(semanticCard)).filter((card) => {
+    const parent = card.parentElement;
+    return visible(card, root) && (!parent || !parent.closest(semanticCard));
+  });
+  const cardData = (card, semantic) => {
+    const owns = (anchor) => semantic ? anchor.closest(semanticCard) === card : card.contains(anchor);
+    const anchors = Array.from(card.querySelectorAll('a[href]')).filter((anchor) =>
+      owns(anchor) && visible(anchor, root) && !anchor.closest('blockquote,nav,footer')
+    );
+    const posts = anchors.map((anchor) => {
+      try {
+        const url = new URL(anchor.getAttribute('href'), window.location.href);
+        return url.origin === window.location.origin && !url.search && !url.hash && postPath.test(url.pathname)
+          ? url.href : null;
+      } catch (_) { return null; }
+    }).filter((href) => typeof href === 'string');
+    const authors = Array.from(new Set(anchors.map((anchor) => {
+      try {
+        const url = new URL(anchor.getAttribute('href'), window.location.href);
+        return url.origin === window.location.origin && !url.search && !url.hash && profilePath.test(url.pathname)
+          ? url.href : null;
+      } catch (_) { return null; }
+    }).filter((href) => typeof href === 'string')));
+    return {postLinks: posts, headerLinks: authors};
+  };
+  const commonAncestor = (left, right) => {
+    const leftAncestors = new Set();
+    for (let current = left; current; current = current.parentElement) leftAncestors.add(current);
+    for (let current = right; current; current = current.parentElement) {
+      if (leftAncestors.has(current)) return current;
+    }
+    return null;
+  };
+  const withinActiveTab = (card) => {
+    const context = commonAncestor(activeFilter, card);
+    return Boolean(context && context !== document.body && context !== document.documentElement &&
+      context.contains(input) && !context.matches('nav,footer,blockquote') && visible(context, root));
+  };
+  const candidateCards = [];
+  let unverifiedPostAnchor = false;
+  for (const card of semanticCards) {
+    const data = cardData(card, true);
+    if (data.postLinks.length === 0) continue;
+    if (data.postLinks.length !== 1 || data.headerLinks.length !== 1) {
+      unverifiedPostAnchor = true;
+      continue;
+    }
+    if (!withinActiveTab(card)) {
+      unverifiedPostAnchor = true;
+      continue;
+    }
+    candidateCards.push(data);
+  }
   const rootPostAnchors = Array.from(root.querySelectorAll('a[href]')).filter((anchor) => {
     if (!visible(anchor, root) || anchor.closest('blockquote,nav,footer')) return false;
     try {
@@ -549,38 +614,103 @@ _ASSISTED_SEARCH_SNAPSHOT_SCRIPT = r"""
     return {state: 'SEARCH_RESULTS_LIMIT_EXCEEDED'};
   }
 
-  const cards = [];
-  let boundPostAnchors = 0;
+  const coveredAnchors = new Set();
   for (const card of semanticCards) {
-    const owns = (anchor) => anchor.closest(semanticCard) === card;
-    const anchors = Array.from(card.querySelectorAll('a[href]')).filter((anchor) =>
-      owns(anchor) && visible(anchor, root) && !anchor.closest('blockquote,nav,footer')
-    );
-    const postLinks = anchors.map((anchor) => {
-      try {
-        const url = new URL(anchor.getAttribute('href'), window.location.href);
-        return url.origin === window.location.origin && !url.search && !url.hash && postPath.test(url.pathname)
-          ? url.href : null;
-      } catch (_) { return null; }
-    }).filter((href) => typeof href === 'string');
-    if (postLinks.length === 0) continue;
-    const authorLinks = anchors.map((anchor) => {
-      try {
-        const url = new URL(anchor.getAttribute('href'), window.location.href);
-        return url.origin === window.location.origin && !url.search && !url.hash && profilePath.test(url.pathname)
-          ? url.href : null;
-      } catch (_) { return null; }
-    }).filter((href) => typeof href === 'string');
-    const uniqueAuthors = Array.from(new Set(authorLinks));
-    boundPostAnchors += postLinks.length;
-    cards.push({postLinks, headerLinks: uniqueAuthors});
+    const data = cardData(card, true);
+    if (data.postLinks.length === 1 && data.headerLinks.length === 1) {
+      for (const anchor of Array.from(card.querySelectorAll('a[href]'))) {
+        try {
+          const url = new URL(anchor.getAttribute('href'), window.location.href);
+          if (url.origin === window.location.origin && !url.search && !url.hash && postPath.test(url.pathname)) {
+            coveredAnchors.add(anchor);
+          }
+        } catch (_) { /* A malformed link is not post provenance. */ }
+      }
+    }
   }
-  if (boundPostAnchors !== rootPostAnchors.length) return {state: 'SEARCH_RESULTS_UNPROVEN', regionKind};
-  if (cards.length > maxCards) return {state: 'SEARCH_RESULTS_LIMIT_EXCEEDED'};
-  if (cards.length === 0) {
+  const genericRoots = new Set();
+  for (const anchor of rootPostAnchors) {
+    if (coveredAnchors.has(anchor) || anchor.closest(semanticCard)) continue;
+    let current = anchor.parentElement;
+    for (let depth = 0; current && current !== root && depth < 12; depth++, current = current.parentElement) {
+      if (!visible(current, root) || current.closest('blockquote,nav,footer')) continue;
+      const data = cardData(current, false);
+      if (data.postLinks.length === 1 && data.headerLinks.length === 1) {
+        genericRoots.add(current);
+        break;
+      }
+    }
+  }
+  for (const card of genericRoots) {
+    const data = cardData(card, false);
+    if (data.postLinks.length !== 1 || data.headerLinks.length !== 1 || !withinActiveTab(card)) {
+      unverifiedPostAnchor = true;
+      continue;
+    }
+    candidateCards.push(data);
+    for (const anchor of Array.from(card.querySelectorAll('a[href]'))) {
+      try {
+        const url = new URL(anchor.getAttribute('href'), window.location.href);
+        if (url.origin === window.location.origin && !url.search && !url.hash && postPath.test(url.pathname)) {
+          coveredAnchors.add(anchor);
+        }
+      } catch (_) { /* A malformed link is not post provenance. */ }
+    }
+  }
+  if (rootPostAnchors.some((anchor) => !coveredAnchors.has(anchor))) unverifiedPostAnchor = true;
+  if (unverifiedPostAnchor) return {state: 'SEARCH_RESULTS_UNPROVEN', regionKind};
+  if (candidateCards.length > maxCards) return {state: 'SEARCH_RESULTS_LIMIT_EXCEEDED'};
+  if (candidateCards.length === 0) {
     return {state: noResults ? 'SEARCH_NO_RESULTS' : 'SEARCH_RESULTS_LOADING', regionKind};
   }
-  return {state: 'SEARCH_RESULTS_CANDIDATES', regionKind, cards};
+  return {state: 'SEARCH_RESULTS_CANDIDATES', regionKind, cards: candidateCards};
+}
+"""
+
+_ASSISTED_SEARCH_SCROLL_SCRIPT = r"""
+({expectedQuery}) => {
+  const normalize = (value) => typeof value === 'string'
+    ? value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase() : '';
+  const visible = (element) => {
+    if (!element || element.hidden) return false;
+    for (let current = element; current; current = current.parentElement) {
+      const style = window.getComputedStyle(current);
+      if (current.hidden || current.getAttribute('aria-hidden') === 'true' ||
+          style.display === 'none' || style.visibility === 'hidden' || Number.parseFloat(style.opacity) === 0) return false;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const pageUrl = new URL(window.location.href);
+  if (pageUrl.origin !== window.location.origin || pageUrl.pathname !== '/search' ||
+      pageUrl.searchParams.getAll('q').length !== 1 || pageUrl.searchParams.get('q') !== expectedQuery) {
+    return {scrolled: false};
+  }
+  const inputs = Array.from(document.querySelectorAll('input,textarea,[role="searchbox"]')).filter((element) => {
+    if (!visible(element)) return false;
+    const label = normalize(element.getAttribute('aria-label') || element.getAttribute('title'));
+    return normalize(element.getAttribute('role')) === 'searchbox' ||
+      normalize(element.getAttribute('type')) === 'search' || label === 'search' || label === 'search and explore';
+  });
+  if (inputs.length !== 1 || String(inputs[0].value || '') !== expectedQuery) return {scrolled: false};
+  const filters = Array.from(document.querySelectorAll('button,[role="button"],[role="tab"],a[href]'))
+    .filter((element) => visible(element) && ['posts','top','recent'].includes(normalize(
+      element.getAttribute('aria-label') || element.getAttribute('title') || element.innerText || ''
+    )))
+    .filter((element) => element.getAttribute('aria-selected') === 'true' ||
+      element.getAttribute('aria-pressed') === 'true' || element.getAttribute('aria-current') === 'page');
+  if (filters.length !== 1) return {scrolled: false};
+  for (let current = filters[0].parentElement; current && current !== document.body; current = current.parentElement) {
+    const style = window.getComputedStyle(current);
+    if (['auto', 'scroll'].includes(style.overflowY) && current.scrollHeight > current.clientHeight + 2) {
+      const before = current.scrollTop;
+      current.scrollTop = before + Math.max(1, Math.floor(current.clientHeight * 0.8));
+      return {scrolled: current.scrollTop > before};
+    }
+  }
+  const before = window.scrollY;
+  window.scrollBy({top: Math.max(1, Math.floor(window.innerHeight * 0.8)), behavior: 'instant'});
+  return {scrolled: window.scrollY > before};
 }
 """
 
@@ -593,7 +723,9 @@ _SCROLL_SCRIPT = r"""
     return rect.width > 0 && rect.height > 0 && window.getComputedStyle(element).visibility !== 'hidden';
   };
   if (searchPanel) {
-    const inputs = Array.from(document.querySelectorAll('input[type="search"], [role="searchbox"]')).filter(visible);
+    const inputs = Array.from(document.querySelectorAll(
+      'input[type="search"], [role="searchbox"], input[role="textbox"][aria-label="Search" i], input[aria-label="Search and explore" i]'
+    )).filter(visible);
     const panels = Array.from(document.querySelectorAll(
       'aside, [role="complementary"], [role="dialog"], [role="region"][aria-label]'
     )).filter((panel) => visible(panel) && inputs.filter((input) => panel.contains(input)).length === 1);
@@ -1168,7 +1300,13 @@ class AsyncThreadsJobUiReader:
         )
         return state
 
-    async def search(self, query: str, *, expected_actor: str) -> tuple[UiFeedBatch, ...]:
+    async def search(
+        self,
+        query: str,
+        *,
+        expected_actor: str,
+        one_post: bool = False,
+    ) -> tuple[UiFeedBatch, ...]:
         """Search bounded visible feed batches, validating account UI at each step."""
 
         self._scroll_count = 0
@@ -1178,6 +1316,25 @@ class AsyncThreadsJobUiReader:
             raise BrowserAdapterError("BROWSER_ACTOR_INVALID")
         if self._search_panel_mode:
             await self._open_search_panel(query, expected_actor=expected_actor)
+            page_state, page_url = await self._page_state(
+                expected_path="/search",
+                expected_query=query,
+                expected_actor=expected_actor,
+                require_search=True,
+            )
+            if page_state is not UiPageState.READY:
+                return (UiFeedBatch(0, page_url, page_state, (), False),)
+            if one_post:
+                try:
+                    cards = await self.assisted_search_results(
+                        query,
+                        expected_actor=expected_actor,
+                    )
+                except BrowserAdapterError as error:
+                    if error.code == "SEARCH_NO_RESULTS":
+                        return (UiFeedBatch(0, self._page.url, UiPageState.READY, (), False),)
+                    raise
+                return (UiFeedBatch(0, self._page.url, UiPageState.READY, cards, False),)
         else:
             search_url = f"{self._origin}/search?{urlencode({'q': query})}"
             await self._goto(search_url)
@@ -1193,12 +1350,26 @@ class AsyncThreadsJobUiReader:
             if page_state is not UiPageState.READY:
                 batches.append(UiFeedBatch(batch_index, page_url, page_state, (), False))
                 return tuple(batches)
-            snapshot = await self._feed_batch_snapshot(
-                batch_index,
-                query,
-                search_panel=self._search_panel_mode,
-                wait_for_cards=batch_index == 0,
-            )
+            try:
+                snapshot = await self._feed_batch_snapshot(
+                    batch_index,
+                    query,
+                    search_panel=self._search_panel_mode,
+                    wait_for_cards=batch_index == 0,
+                )
+            except BrowserAdapterError as error:
+                if not self._search_panel_mode or error.code != "SEARCH_ROOT_UNRECOGNIZED":
+                    raise
+                try:
+                    cards = await self.assisted_search_results(
+                        query,
+                        expected_actor=expected_actor,
+                    )
+                except BrowserAdapterError as assisted_error:
+                    if assisted_error.code == "SEARCH_NO_RESULTS":
+                        return (UiFeedBatch(0, self._page.url, UiPageState.READY, (), False),)
+                    raise
+                return (UiFeedBatch(0, self._page.url, UiPageState.READY, cards, False),)
             raw_cards = snapshot.get("cards")
             if not isinstance(raw_cards, list):
                 raise BrowserAdapterError("SEARCH_CARD_UNRECOGNIZED")
@@ -1246,6 +1417,7 @@ class AsyncThreadsJobUiReader:
         previous_state: str | None = None
         stable_polls = 0
         last_code = "SEARCH_RESULTS_REGION_UNPROVEN"
+        scroll_attempted = False
         while True:
             if _page_origin(self._page.url) != self._origin:
                 raise BrowserAdapterError("BROWSER_NAVIGATION_BLOCKED")
@@ -1306,6 +1478,17 @@ class AsyncThreadsJobUiReader:
                 previous_state = state
                 last_code = state
 
+            if state == "SEARCH_RESULTS_LOADING" and not scroll_attempted:
+                scroll_attempted = True
+                scroll_result = _object(
+                    await self._evaluate(
+                        _ASSISTED_SEARCH_SCROLL_SCRIPT,
+                        {"expectedQuery": query},
+                    )
+                )
+                if scroll_result.get("scrolled") is True:
+                    self._scroll_count += 1
+
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise BrowserAdapterError(last_code)
@@ -1324,34 +1507,59 @@ class AsyncThreadsJobUiReader:
         if state is not UiPageState.READY:
             raise BrowserAdapterError("HOME_UI_NOT_READY")
         try:
-            navigation = self._page.locator('nav:visible, [role="navigation"]:visible')
-            if await navigation.count() != 1:
-                raise BrowserAdapterError("SEARCH_CONTROL_UNRECOGNIZED")
-            links = navigation.get_by_role("link", name="Search", exact=True)
-            buttons = navigation.get_by_role("button", name="Search", exact=True)
-            link_count = await links.count()
-            button_count = await buttons.count()
-            if link_count + button_count != 1:
-                raise BrowserAdapterError("SEARCH_CONTROL_UNRECOGNIZED")
-            await (links if link_count == 1 else buttons).click()
-            inputs = self._page.locator('input[type="search"]:visible, [role="searchbox"]:visible')
-            await inputs.first.wait_for(state="visible", timeout=self._timeout_ms)
-            if await inputs.count() != 1:
-                raise BrowserAdapterError("SEARCH_ROOT_UNRECOGNIZED")
-            await inputs.first.fill(query)
-            await inputs.first.press("Enter")
+            await self._goto(f"{self._origin}/search")
+            inputs = self._page.locator(
+                'input[type="search"]:visible, [role="searchbox"]:visible, '
+                'input[role="textbox"][aria-label="Search" i]:visible, '
+                'input[role="textbox"][title="Search" i]:visible, '
+                'input[aria-label="Search and explore" i]:visible'
+            )
+            input_deadline = self._readiness_deadline()
+            while True:
+                input_count = await inputs.count()
+                if input_count == 1:
+                    break
+                if input_count > 1:
+                    raise BrowserAdapterError("SEARCH_INPUT_UNVERIFIED")
+                remaining = input_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise BrowserAdapterError("SEARCH_INPUT_UNVERIFIED")
+                await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
+            await inputs.wait_for(state="visible", timeout=self._timeout_ms)
+            await inputs.fill(query)
+            await inputs.press("Enter")
+            await self._wait_for_applied_search_query(query)
         except BrowserAdapterError:
             raise
         except AsyncPlaywrightTimeoutError:
-            raise BrowserAdapterError("SEARCH_UI_NOT_READY") from None
+            raise BrowserAdapterError("SEARCH_INPUT_UNVERIFIED") from None
         except AsyncPlaywrightError:
             if self._page.is_closed():
                 raise BrowserProcessCrashed() from None
-            raise BrowserAdapterError("SEARCH_CONTROL_UNRECOGNIZED") from None
+            raise BrowserAdapterError("SEARCH_NAVIGATION_FAILED") from None
         except Exception:  # noqa: BLE001 - browser backend details stay private.
             if self._page.is_closed():
                 raise BrowserProcessCrashed() from None
-            raise BrowserAdapterError("SEARCH_CONTROL_UNRECOGNIZED") from None
+            raise BrowserAdapterError("SEARCH_NAVIGATION_FAILED") from None
+
+    async def _wait_for_applied_search_query(self, query: str) -> None:
+        deadline = self._readiness_deadline()
+        while True:
+            page_url = self._page.url
+            if _page_origin(page_url) != self._origin:
+                raise BrowserAdapterError("BROWSER_NAVIGATION_BLOCKED")
+            try:
+                parsed = urlsplit(page_url)
+                query_values = parse_qs(parsed.query, strict_parsing=True).get("q", [])
+            except ValueError:
+                query_values = []
+                parsed = urlsplit(self._origin)
+            if parsed.path == "/search" and query_values == [query] and not parsed.fragment:
+                return
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise BrowserAdapterError("BROWSER_QUERY_MISMATCH")
+            await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
 
     async def read_exact_post(
         self,
@@ -1605,7 +1813,11 @@ class AsyncThreadsJobUiReader:
                 # explicitly labelled self-profile link inside that navigation.
                 root_ready = navigations == 1
             elif stage == "SEARCH" and self._search_panel_mode:
-                root_ready = result.get("searchRootCount") == 1
+                root_ready = (
+                    parsed.path == "/search"
+                    and len(search_values) == 1
+                    and search_values[0] == expected_query
+                )
             elif stage == "SEARCH" and mains == 0:
                 root_ready = len(search_values) == 1 and search_values[0] == expected_query
             elif stage == "DETAIL" and mains == 0:
@@ -1696,7 +1908,7 @@ class AsyncThreadsJobUiReader:
             search_values = result.get("searchValues")
             values = cast(list[object], search_values) if isinstance(search_values, list) else []
             root_ready = (
-                result.get("searchRootCount") == 1
+                len(values) == 1 and values[0] == expected_query
                 if result.get("searchPanelMode") is True
                 else mains == 1 or (mains == 0 and len(values) == 1 and values[0] == expected_query)
             )

@@ -169,6 +169,7 @@ class BrowserNurtureUiSession(Protocol):
         *,
         expected_actor: str,
         origin: str,
+        one_post: bool = False,
     ) -> tuple[UiFeedBatch, ...]: ...
 
     async def assisted_search_ui_results(
@@ -407,6 +408,7 @@ class BrowserNurtureRunner:
         max_cycles: int | None = 1,
         continuous: bool = False,
         idle_seconds: int | None = None,
+        smoke: bool = False,
         stop_event: asyncio.Event | None = None,
     ) -> BrowserNurtureRunResult:
         if source is None and fixture is None:
@@ -421,11 +423,20 @@ class BrowserNurtureRunner:
             raise BrowserNurtureError("RUN_POLICY_INVALID") from None
         if (
             type(continuous) is not bool
+            or type(smoke) is not bool
             or (not continuous and max_cycles is None)
             or (
                 selected_source is BrowserNurtureSource.BROWSER_UI
                 and not continuous
                 and max_cycles != 1
+            )
+            or (
+                smoke
+                and (
+                    selected_source is not BrowserNurtureSource.BROWSER_UI
+                    or continuous
+                    or max_cycles != 1
+                )
             )
             or (selected_source is BrowserNurtureSource.UI_FIXTURE) != (fixture is not None)
         ):
@@ -472,7 +483,9 @@ class BrowserNurtureRunner:
                     raise BrowserNurtureError("RUN_POLICY_INVALID")
                 checkpoint = self._state.load_checkpoint(
                     lease.account.id,
-                    policy_fingerprint=browser_nurture_policy_fingerprint(config),
+                    policy_fingerprint=(
+                        None if smoke else browser_nurture_policy_fingerprint(config)
+                    ),
                 )
                 if (
                     continuous
@@ -503,8 +516,16 @@ class BrowserNurtureRunner:
                             session_open_count,
                         )
                     try:
-                        cycle = await self._run_cycle(session, config, origin, checkpoint)
+                        cycle = await self._run_cycle(
+                            session,
+                            config,
+                            origin,
+                            checkpoint,
+                            smoke=smoke,
+                        )
                     except BrowserProcessCrashed:
+                        if smoke:
+                            raise BrowserNurtureError("BROWSER_PROCESS_CRASHED") from None
                         if checkpoint.crash_recovery_pending:
                             return _run_result(
                                 BrowserNurtureStatus.FAILED,
@@ -538,9 +559,19 @@ class BrowserNurtureRunner:
                                 checkpoint,
                                 session_open_count,
                             )
-                    checkpoint = self._commit_cycle(checkpoint, cycle, len(config.topics))
                     run_counts.add(cycle)
                     attempt_count += 1
+                    if smoke:
+                        if cycle.scanned != 1:
+                            raise BrowserNurtureError("SEARCH_POST_NOT_FOUND")
+                        return _run_result(
+                            BrowserNurtureStatus.COMPLETE,
+                            None,
+                            run_counts,
+                            checkpoint,
+                            session_open_count,
+                        )
+                    checkpoint = self._commit_cycle(checkpoint, cycle, len(config.topics))
                     if stop_event is not None and stop_event.is_set():
                         return _run_result(
                             BrowserNurtureStatus.STOPPED,
@@ -786,6 +817,8 @@ class BrowserNurtureRunner:
         config: BrowserNurtureConfigV1,
         origin: str,
         checkpoint: BrowserNurtureCheckpointV2,
+        *,
+        smoke: bool = False,
     ) -> BrowserNurtureCycleMetrics:
         try:
             async with asyncio.timeout(MAX_NURTURE_CYCLE_SECONDS):
@@ -794,21 +827,32 @@ class BrowserNurtureRunner:
                     origin=origin,
                 )
                 _require_ready_state(state)
-                already_seen = set(checkpoint.seen_fingerprints)
+                already_seen: set[str] = set() if smoke else set(checkpoint.seen_fingerprints)
                 current_fingerprints: set[str] = set()
                 targets: list[tuple[str, UiPostTarget]] = []
                 duplicates = 0
                 feed_candidates = 0
                 scrolls = 0
                 topic_queries = 0
-                topic_start = checkpoint.next_topic_index % len(config.topics)
-                ordered_topics = config.topics[topic_start:] + config.topics[:topic_start]
+                if smoke:
+                    ordered_topics = config.topics[:1]
+                else:
+                    topic_start = checkpoint.next_topic_index % len(config.topics)
+                    ordered_topics = config.topics[topic_start:] + config.topics[:topic_start]
                 for topic in ordered_topics:
-                    batches = await session.search_ui_feed(
-                        topic,
-                        expected_actor=config.expected_username,
-                        origin=origin,
-                    )
+                    if smoke:
+                        batches = await session.search_ui_feed(
+                            topic,
+                            expected_actor=config.expected_username,
+                            origin=origin,
+                            one_post=True,
+                        )
+                    else:
+                        batches = await session.search_ui_feed(
+                            topic,
+                            expected_actor=config.expected_username,
+                            origin=origin,
+                        )
                     topic_queries += 1
                     scrolls += _ui_reader_scroll_count(session)
                     for batch in batches:
@@ -819,15 +863,21 @@ class BrowserNurtureRunner:
                             if fingerprint in already_seen or fingerprint in current_fingerprints:
                                 duplicates += 1
                                 continue
-                            if len(targets) >= config.max_posts_per_cycle:
+                            if len(targets) >= (1 if smoke else config.max_posts_per_cycle):
                                 continue
                             current_fingerprints.add(fingerprint)
                             targets.append((fingerprint, target))
+                            if smoke:
+                                break
                             if feed_candidates >= MAX_NURTURE_FEED_CANDIDATES_PER_CYCLE:
                                 break
+                        if smoke and targets:
+                            break
                         if feed_candidates >= MAX_NURTURE_FEED_CANDIDATES_PER_CYCLE:
                             break
-                    if feed_candidates >= MAX_NURTURE_FEED_CANDIDATES_PER_CYCLE:
+                    if (
+                        smoke and targets
+                    ) or feed_candidates >= MAX_NURTURE_FEED_CANDIDATES_PER_CYCLE:
                         break
                 relevant = 0
                 irrelevant = 0
@@ -844,6 +894,12 @@ class BrowserNurtureRunner:
                         or detail.author_username != target.author_username
                     ):
                         raise BrowserNurtureError("BROWSER_TARGET_MISMATCH")
+                    if smoke and (
+                        detail.body_visibility is not UiBodyVisibility.FULL_VISIBLE
+                        or detail.body is None
+                        or not detail.body.strip()
+                    ):
+                        raise BrowserNurtureError("DETAIL_BODY_UNVERIFIED")
                     classification = classify_browser_nurture_post(
                         detail,
                         config.relevance_terms,
