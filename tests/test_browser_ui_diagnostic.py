@@ -4,6 +4,8 @@ import asyncio
 import io
 import json
 import os
+import sys
+import types
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -446,12 +448,11 @@ def test_operator_waiter_keeps_async_event_loop_responsive(
                 await asyncio.sleep(0.005)
                 ticks += 1
 
-        async def fake_console_waiter() -> Literal["OBSERVE", "STOP"]:
-            await asyncio.sleep(0.025)
-            return "OBSERVE"
+        fake_console = types.ModuleType("msvcrt")
+        fake_console.__dict__.update({"kbhit": lambda: ticks >= 1, "getwch": lambda: "\r"})
 
         monkeypatch.setattr(diagnostic.os, "name", "nt")
-        monkeypatch.setattr(diagnostic, "_wait_for_windows_choice", fake_console_waiter)
+        monkeypatch.setitem(sys.modules, "msvcrt", fake_console)
         task = asyncio.create_task(ticker())
         choice = await diagnostic.wait_for_diagnostic_choice(
             "synthetic prompt\n",

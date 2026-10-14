@@ -71,6 +71,12 @@ class BrowserUiDiagnosticSession(Protocol):
     ) -> UiDiagnosticSnapshot: ...
 
 
+class _WindowsConsole(Protocol):
+    def kbhit(self) -> bool: ...
+
+    def getwch(self) -> str: ...
+
+
 def _safe_reason_code(value: str) -> str:
     return value if value in _SAFE_REASON_CODES else "DIAGNOSTIC_FAILED"
 
@@ -78,9 +84,10 @@ def _safe_reason_code(value: str) -> str:
 async def _wait_for_windows_choice() -> DiagnosticChoice:
     import msvcrt
 
+    console = cast(_WindowsConsole, msvcrt)
     while True:
-        if msvcrt.kbhit():
-            key = msvcrt.getwch()
+        if console.kbhit():
+            key = console.getwch()
             if key in {"\r", "\n"}:
                 return "OBSERVE"
             if key.lower() == "s" or key in {"\x03", "\x1a"}:
