@@ -108,6 +108,8 @@ FULL_ONLY_TESTS = (
 WINDOWS_SHARED_SMOKE_TESTS = (
     "test_accounts.py",
     "test_architecture_boundary.py",
+    "test_browser_engine.py",
+    "test_browser_mvp_integration.py",
     "test_browser_runtime.py",
     "test_browser_security.py",
     "test_cli_smoke.py",
@@ -185,10 +187,10 @@ _BROWSER_SOURCE_FILES = frozenset(
     )
 )
 _TEST_LANES = {
-    **dict.fromkeys(API_TESTS, "API"),
-    **dict.fromkeys(BROWSER_TESTS, "BROWSER"),
-    **dict.fromkeys(SHARED_TESTS, "SHARED"),
-    **dict.fromkeys(FULL_ONLY_TESTS, "FULL"),
+    **{f"tests/{path}": "API" for path in API_TESTS},
+    **{f"tests/{path}": "BROWSER" for path in BROWSER_TESTS},
+    **{f"tests/{path}": "SHARED" for path in SHARED_TESTS},
+    **{f"tests/{path}": "FULL" for path in FULL_ONLY_TESTS},
 }
 _REQUIRED_JOBS = {
     "DOCS_ONLY": (),
@@ -242,7 +244,7 @@ def _path_lane(path: str) -> str | None:
     if normalized.startswith((".github/", ".agents/")):
         return "FULL"
     if normalized.startswith("tests/"):
-        return _TEST_LANES.get(Path(normalized).name, "FULL")
+        return _TEST_LANES.get(normalized, "FULL")
     if normalized.startswith("src/threads_platform/api/"):
         return "API"
     if normalized.startswith("src/threads_platform/browser/"):
@@ -277,7 +279,9 @@ def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
             return Classification("FULL", has_docs=has_docs, paths=normalized_paths)
         lanes.add(lane)
 
-    if "SHARED" in lanes or len(lanes) > 1:
+    if len(lanes) > 1:
+        lane_name = "FULL"
+    elif lanes == {"SHARED"}:
         lane_name = "SHARED"
     elif lanes == {"API"}:
         lane_name = "API_ONLY"
@@ -450,6 +454,28 @@ def _test_files(suite: str, test_root: Path) -> list[Path]:
     return [test_root / name for name in dict.fromkeys(names)]
 
 
+def _test_manifest_errors(repo_root: Path) -> list[str]:
+    test_root = repo_root / "tests"
+    if not test_root.is_dir():
+        return ["tests directory is missing"]
+
+    configured = set(_TEST_LANES)
+    discovered = {
+        path.relative_to(repo_root).as_posix()
+        for pattern in ("test_*.py", "*_test.py")
+        for path in test_root.rglob(pattern)
+        if path.is_file()
+    }
+    missing = sorted(configured - discovered)
+    unclassified = sorted(discovered - configured)
+    errors = []
+    if missing:
+        errors.append(f"configured test modules are missing: {', '.join(missing)}")
+    if unclassified:
+        errors.append(f"unclassified test modules were discovered: {', '.join(unclassified)}")
+    return errors
+
+
 def run_tests(suite: str) -> int:
     suite = {
         "API_ONLY": "api",
@@ -457,7 +483,13 @@ def run_tests(suite: str) -> int:
         "SHARED": "full",
         "FULL": "full",
     }.get(suite, suite)
-    test_root = Path(__file__).resolve().parents[2] / "tests"
+    repo_root = Path(__file__).resolve().parents[2]
+    manifest_errors = _test_manifest_errors(repo_root)
+    if manifest_errors:
+        print("Test manifest verification failed:", *manifest_errors, sep="\n  ", file=sys.stderr)
+        return 2
+
+    test_root = repo_root / "tests"
     paths = _test_files(suite, test_root)
     missing = [str(path) for path in paths if not path.exists()]
     if missing:

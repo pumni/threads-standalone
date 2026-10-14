@@ -134,6 +134,12 @@ jobs:
       - name: Sync locked environment
         run: uv sync --locked
 
+      - name: Verify Windows API and Browser CLI startup
+        run: |
+          uv run --locked threads-local --help
+          uv run --locked threads-local api --help
+          uv run --locked threads-local browser --help
+
       - name: Run Windows filesystem, lock, process, CLI, and Browser lifecycle smoke
         run: uv run --locked python .github/scripts/ci.py run-tests windows-smoke
 
