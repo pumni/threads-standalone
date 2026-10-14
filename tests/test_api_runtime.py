@@ -115,3 +115,6 @@ def test_api_error_does_not_include_the_resolved_token(tmp_path: Path) -> None:
     assert _SYNTHETIC_TOKEN not in str(error.value)
     assert _SYNTHETIC_TOKEN not in repr(error.value)
     assert resolver.references == [_CREDENTIAL_REF]
+
+
+# Temporary API_ONLY hosted workflow validation; no behavior change.
