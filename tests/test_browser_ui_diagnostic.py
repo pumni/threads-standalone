@@ -334,6 +334,9 @@ def _account_runtime(
     tmp_path: Path,
 ) -> tuple[LocalRuntime, LocalAccount, BrowserNurtureConfigV1, _DiagnosticEngine]:
     root = tmp_path / "synthetic-diagnostic-root"
+    root.mkdir(mode=0o700)
+    if os.name != "nt":
+        os.chmod(root, 0o700)
     accounts = LocalAccountStore(root)
     account = accounts.add("diagnostic_operator")
     profile = root / "profiles" / str(account.id)
