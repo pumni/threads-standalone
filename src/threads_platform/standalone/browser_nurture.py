@@ -652,8 +652,6 @@ class BrowserNurtureRunner:
                     return await finish(result(status, reason, "HOME"))
                 progress("HOME_VERIFIED", None)
 
-                await operator_step("OPEN_SEARCH")
-
                 async def read_search_region() -> tuple[UiPostTarget, ...]:
                     return await session.assisted_search_ui_results(
                         config.topics[0],
@@ -661,7 +659,11 @@ class BrowserNurtureRunner:
                         origin=origin,
                     )
 
-                search = await _retry_manual_assist_step("SEARCH", read_search_region, decide)
+                async def open_search_and_read() -> tuple[UiPostTarget, ...]:
+                    await operator_step("OPEN_SEARCH")
+                    return await read_search_region()
+
+                search = await _retry_manual_assist_step("SEARCH", open_search_and_read, decide)
                 if search.action != "READY" or search.value is None:
                     status = (
                         BrowserNurtureStatus.FAILED

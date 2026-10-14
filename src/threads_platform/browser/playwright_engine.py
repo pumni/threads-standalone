@@ -631,11 +631,11 @@ class _PlaywrightBrowserSession:
             click = self._ui_diagnostic_operator_click
             clicked_path = self._ui_diagnostic_operator_click_path
             if click is not None:
-                if (
-                    click.get("source_route") != "SEARCH"
-                    or click.get("is_post_permalink") is not True
-                    or clicked_path not in paths
-                ):
+                if click.get("source_route") != "SEARCH":
+                    raise BrowserAdapterError("DETAIL_SELECTION_NOT_IN_RESULTS")
+                if click.get("is_post_permalink") is not True:
+                    raise BrowserAdapterError("DETAIL_SELECTION_UNVERIFIED")
+                if clicked_path not in paths:
                     raise BrowserAdapterError("DETAIL_SELECTION_NOT_IN_RESULTS")
                 try:
                     current = urlsplit(self._page.url)
