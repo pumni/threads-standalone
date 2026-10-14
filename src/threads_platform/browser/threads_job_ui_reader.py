@@ -131,6 +131,19 @@ _PAGE_STATE_SCRIPT = r"""
   };
   const origin = window.location.origin;
   const pathname = window.location.pathname;
+  let searchQueryMatches = !requireSearch;
+  if (requireSearch) {
+    try {
+      const currentUrl = new URL(window.location.href);
+      const entries = Array.from(currentUrl.searchParams.entries());
+      searchQueryMatches = (
+        currentUrl.pathname === '/search' && entries.length === 1 &&
+        entries[0][0] === 'q' && entries[0][1] === expectedQuery && !currentUrl.hash
+      ) || (
+        searchPanelMode && currentUrl.pathname === '/' && entries.length === 0 && !currentUrl.hash
+      );
+    } catch (_) { searchQueryMatches = false; }
+  }
   let state = 'READY';
   if (origin !== expectedOrigin) state = 'REDIRECTED';
   else if (Array.from(document.querySelectorAll('iframe[title*="challenge" i], [aria-label*="captcha" i], [role="dialog"][aria-label*="challenge" i]')).some(visible)) {
@@ -235,6 +248,7 @@ _PAGE_STATE_SCRIPT = r"""
     searchRootCount: searchRootCandidates.length,
     actorLinks: verifiedActorLinks,
     searchValues,
+    searchQueryMatches,
     detailRootCount,
     searchPanelMode,
     visibleBodyChildCount
@@ -1277,6 +1291,7 @@ class AsyncThreadsJobUiReader:
         self._max_cards_per_batch = max_cards_per_batch
         self._scroll_count = 0
         self._search_panel_mode = self._origin == BROWSER_FEED_ORIGIN
+        self._applied_search_query: str | None = None
         page.set_default_timeout(action_timeout_ms)
         page.set_default_navigation_timeout(action_timeout_ms)
 
@@ -1495,6 +1510,7 @@ class AsyncThreadsJobUiReader:
             await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
 
     async def _open_search_panel(self, query: str, *, expected_actor: str) -> None:
+        self._applied_search_query = None
         home_url = f"{self._origin}/"
         if self._page.url != home_url:
             await self._goto(home_url)
@@ -1527,8 +1543,32 @@ class AsyncThreadsJobUiReader:
                 await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
             await inputs.wait_for(state="visible", timeout=self._timeout_ms)
             await inputs.fill(query)
-            await inputs.press("Enter")
+            input_deadline = self._readiness_deadline()
+            while True:
+                if _page_origin(self._page.url) != self._origin:
+                    raise BrowserAdapterError("BROWSER_NAVIGATION_BLOCKED")
+                input_count = await inputs.count()
+                if input_count > 1:
+                    raise BrowserAdapterError("SEARCH_INPUT_UNVERIFIED")
+                remaining = input_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise BrowserAdapterError("SEARCH_INPUT_VALUE_UNCONFIRMED")
+                if input_count == 1:
+                    try:
+                        input_value = await inputs.input_value(
+                            timeout=max(1, min(self._timeout_ms, int(remaining * 1000)))
+                        )
+                    except AsyncPlaywrightTimeoutError:
+                        input_value = None
+                    if input_value == query:
+                        break
+                remaining = input_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise BrowserAdapterError("SEARCH_INPUT_VALUE_UNCONFIRMED")
+                await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
+            await inputs.press("Enter", timeout=self._timeout_ms)
             await self._wait_for_applied_search_query(query)
+            self._applied_search_query = query
         except BrowserAdapterError:
             raise
         except AsyncPlaywrightTimeoutError:
@@ -1544,22 +1584,21 @@ class AsyncThreadsJobUiReader:
 
     async def _wait_for_applied_search_query(self, query: str) -> None:
         deadline = self._readiness_deadline()
-        while True:
-            page_url = self._page.url
-            if _page_origin(page_url) != self._origin:
-                raise BrowserAdapterError("BROWSER_NAVIGATION_BLOCKED")
-            try:
-                parsed = urlsplit(page_url)
-                query_values = parse_qs(parsed.query, strict_parsing=True).get("q", [])
-            except ValueError:
-                query_values = []
-                parsed = urlsplit(self._origin)
-            if parsed.path == "/search" and query_values == [query] and not parsed.fragment:
-                return
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise BrowserAdapterError("BROWSER_QUERY_MISMATCH")
-            await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise BrowserAdapterError("SEARCH_SUBMIT_NOT_APPLIED")
+        try:
+            await self._page.wait_for_url(
+                lambda value: _search_url_matches_query(value, self._origin, query),
+                wait_until="commit",
+                timeout=max(1, min(self._timeout_ms, int(remaining * 1000))),
+            )
+        except AsyncPlaywrightTimeoutError:
+            if _page_origin(self._page.url) != self._origin:
+                raise BrowserAdapterError("BROWSER_NAVIGATION_BLOCKED") from None
+            raise BrowserAdapterError("SEARCH_SUBMIT_NOT_APPLIED") from None
+        if _page_origin(self._page.url) != self._origin:
+            raise BrowserAdapterError("BROWSER_NAVIGATION_BLOCKED")
 
     async def read_exact_post(
         self,
@@ -1722,15 +1761,19 @@ class AsyncThreadsJobUiReader:
         stage = "HOME" if expected_path == "/" else "SEARCH" if require_search else "DETAIL"
         deadline = self._readiness_deadline()
         last_result: dict[str, object] = {}
+        query_submission_confirmed = require_search and self._applied_search_query == expected_query
+        query_state_unstable = False
+        previous_search_signature: tuple[object, ...] | None = None
+        stable_search_samples = 0
         while True:
-            page_url = self._page.url
+            page_url_before = self._page.url
             try:
-                parsed = urlsplit(page_url)
+                parsed_before = urlsplit(page_url_before)
             except ValueError:
-                return UiPageState.REDIRECTED, page_url
+                return UiPageState.REDIRECTED, page_url_before
             origin = urlsplit(self._origin)
-            if parsed.scheme != "https" or parsed.netloc != origin.netloc:
-                return UiPageState.REDIRECTED, page_url
+            if parsed_before.scheme != "https" or parsed_before.netloc != origin.netloc:
+                return UiPageState.REDIRECTED, page_url_before
             try:
                 page_payload = await self._evaluate(
                     _PAGE_STATE_SCRIPT,
@@ -1745,6 +1788,22 @@ class AsyncThreadsJobUiReader:
                 )
             except BrowserReadTimeout:
                 raise BrowserAdapterError(f"{stage}_UI_NOT_READY") from None
+            page_url = self._page.url
+            try:
+                parsed = urlsplit(page_url)
+            except ValueError:
+                return UiPageState.REDIRECTED, page_url
+            if parsed.scheme != "https" or parsed.netloc != origin.netloc:
+                return UiPageState.REDIRECTED, page_url
+            if query_submission_confirmed and page_url_before != page_url:
+                query_state_unstable = True
+                previous_search_signature = None
+                stable_search_samples = 0
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise BrowserAdapterError("SEARCH_QUERY_STATE_UNSTABLE")
+                await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
+                continue
             try:
                 result = _object(page_payload)
             except BrowserAdapterError:
@@ -1755,10 +1814,22 @@ class AsyncThreadsJobUiReader:
             except TypeError, ValueError:
                 state = UiPageState.UNKNOWN
             if state is not UiPageState.READY:
-                if state is not UiPageState.UNKNOWN:
+                if state in {
+                    UiPageState.CHALLENGE,
+                    UiPageState.LOGIN_WALL,
+                    UiPageState.RATE_LIMITED,
+                }:
+                    return state, page_url
+                if state is UiPageState.REDIRECTED and query_submission_confirmed:
+                    query_state_unstable = True
+                    previous_search_signature = None
+                    stable_search_samples = 0
+                elif state is not UiPageState.UNKNOWN:
                     return state, page_url
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
+                    if query_state_unstable:
+                        raise BrowserAdapterError("SEARCH_QUERY_STATE_UNSTABLE")
                     raise BrowserAdapterError(
                         self._readiness_error_code(stage, last_result, expected_query)
                     )
@@ -1769,7 +1840,7 @@ class AsyncThreadsJobUiReader:
                 try:
                     parsed_query = parse_qs(parsed.query, strict_parsing=True)
                 except ValueError:
-                    return UiPageState.REDIRECTED, page_url
+                    parsed_query = {}
                 allowed_paths = {"/search"}
                 allowed_queries = [{"q": [expected_query]}]
                 if self._search_panel_mode:
@@ -1781,7 +1852,27 @@ class AsyncThreadsJobUiReader:
                     or parsed_query not in allowed_queries
                     or parsed.fragment
                 ):
-                    raise BrowserAdapterError("BROWSER_QUERY_MISMATCH")
+                    if not query_submission_confirmed:
+                        raise BrowserAdapterError("BROWSER_QUERY_MISMATCH")
+                    query_state_unstable = True
+                    previous_search_signature = None
+                    stable_search_samples = 0
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise BrowserAdapterError("SEARCH_QUERY_STATE_UNSTABLE")
+                    await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
+                    continue
+                if result.get("searchQueryMatches") is not True:
+                    if not query_submission_confirmed:
+                        raise BrowserAdapterError("BROWSER_QUERY_MISMATCH")
+                    query_state_unstable = True
+                    previous_search_signature = None
+                    stable_search_samples = 0
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise BrowserAdapterError("SEARCH_QUERY_STATE_UNSTABLE")
+                    await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
+                    continue
             elif parsed.path != expected_path or parsed.query or parsed.fragment:
                 return UiPageState.REDIRECTED, page_url
 
@@ -1826,6 +1917,10 @@ class AsyncThreadsJobUiReader:
             query_ready = True
             if require_search:
                 query_ready = len(search_values) == 1 and search_values[0] == expected_query
+                if query_submission_confirmed and not query_ready:
+                    query_state_unstable = True
+                    previous_search_signature = None
+                    stable_search_samples = 0
 
             self_profile_count = result.get("selfProfileControlCount")
             actor_ready = navigations == 1 and self_profile_count == 1 and len(actors) == 1
@@ -1833,10 +1928,36 @@ class AsyncThreadsJobUiReader:
                 actor_ready = len(actors) == 1
             actor_ready = actor_ready and actors[0] == expected_actor
             if root_ready and query_ready and actor_ready:
+                if query_submission_confirmed:
+                    signature = (
+                        parsed.path,
+                        result.get("state"),
+                        result.get("mains"),
+                        result.get("navigations"),
+                        result.get("searchRootCount"),
+                        result.get("selfProfileControlCount"),
+                        result.get("visibleBodyChildCount"),
+                        root_ready,
+                        query_ready,
+                        actor_ready,
+                    )
+                    stable_search_samples = (
+                        stable_search_samples + 1 if signature == previous_search_signature else 1
+                    )
+                    previous_search_signature = signature
+                    if stable_search_samples < 2:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            raise BrowserAdapterError("SEARCH_QUERY_STATE_UNSTABLE")
+                        await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
+                        continue
+                    self._applied_search_query = None
                 return UiPageState.READY, page_url
 
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
+                if query_state_unstable:
+                    raise BrowserAdapterError("SEARCH_QUERY_STATE_UNSTABLE")
                 raise BrowserAdapterError(
                     self._readiness_error_code(stage, last_result, expected_query)
                 )
@@ -1983,6 +2104,22 @@ def _page_origin(value: str) -> str:
     except ValueError:
         return ""
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _search_url_matches_query(value: str, origin: str, query: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        base = urlsplit(origin)
+        query_values = parse_qs(parsed.query, strict_parsing=True)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc == base.netloc
+        and parsed.path == "/search"
+        and query_values == {"q": [query]}
+        and not parsed.fragment
+    )
 
 
 def _parse_post_target(value: object, origin: str) -> tuple[str, str, str]:

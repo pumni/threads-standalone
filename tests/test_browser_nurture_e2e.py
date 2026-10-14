@@ -1137,6 +1137,168 @@ def test_browser_nurture_smoke_automates_search_and_reads_one_generic_result_wit
     )
 
 
+def test_browser_nurture_smoke_waits_for_delayed_search_commit_and_stable_ui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "automatic-search-delayed-commit-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    state = BrowserNurtureStateStore(root)
+    checkpoint = BrowserNurtureCheckpointV2(
+        account_uuid=account.id,
+        completed_cycles=1,
+        scanned=1,
+        relevant=1,
+        irrelevant=0,
+        policy_fingerprint="e" * 64,
+        next_topic_index=1,
+        seen_fingerprints=("b" * 64,),
+    )
+    state.save_checkpoint(checkpoint)
+    checkpoint_path = root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json"
+    checkpoint_before = checkpoint_path.read_bytes()
+
+    pages = _offline_live_pages(actor)
+    search_html = _generic_search_results(actor, "", _visual_card("001"))
+    search_html = search_html.replace(
+        "</body>",
+        """<script>
+        const form = document.querySelector('form');
+        const input = form.querySelector('input');
+        input.addEventListener('input', () => {
+          const expected = input.value;
+          input.value = '';
+          setTimeout(() => { input.value = expected; }, 400);
+        });
+        form.addEventListener('submit', (event) => {
+          event.preventDefault();
+          const query = input.value;
+          setTimeout(() => {
+            history.pushState({}, '', '/search?q=' + encodeURIComponent(query));
+          }, 700);
+        });
+        </script></body>""",
+    )
+    pages[f"{BROWSER_FEED_ORIGIN}/search"] = search_html
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+        smoke=True,
+    )
+
+    detail_url = _target("001").replace(_ORIGIN, BROWSER_FEED_ORIGIN)
+    assert exit_code == 0, output.out + output.err
+    assert "AUTO_READ status=COMPLETE reason=NONE posts_read=1" in output.out
+    assert "checkpoint=UNCHANGED" in output.out
+    assert requested_urls[:2] == [f"{BROWSER_FEED_ORIGIN}/", f"{BROWSER_FEED_ORIGIN}/search"]
+    assert requested_urls.count(detail_url) == 1
+    assert checkpoint_path.read_bytes() == checkpoint_before
+    assert "design" not in output.out + output.err
+
+
+def test_browser_nurture_smoke_distinguishes_search_submit_timeout_without_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    monkeypatch.setattr(ui_reader_module, "_READINESS_TIMEOUT_MS", 350)
+    root = tmp_path / "automatic-search-uncommitted-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    search_html = _search_panel(actor, _visual_card("001"), query="")
+    pages[f"{BROWSER_FEED_ORIGIN}/search"] = search_html.replace(
+        "</body>",
+        "<script>document.querySelector('form').addEventListener('submit', "
+        "event => event.preventDefault());</script></body>",
+    )
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+        smoke=True,
+    )
+
+    assert exit_code == 1
+    assert "AUTO_READ status=STOPPED reason=SEARCH_SUBMIT_NOT_APPLIED posts_read=0" in output.out
+    assert "checkpoint=UNCHANGED" in output.out
+    assert requested_urls == [f"{BROWSER_FEED_ORIGIN}/", f"{BROWSER_FEED_ORIGIN}/search"]
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+    assert "design" not in output.out + output.err
+
+
+def test_browser_nurture_smoke_retries_query_change_during_ui_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    monkeypatch.setattr(ui_reader_module, "_READINESS_TIMEOUT_MS", 350)
+    root = tmp_path / "automatic-search-unstable-query-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _offline_live_pages(actor)
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _search_panel(
+        actor,
+        _visual_card("001"),
+        query="design",
+    )
+    original_evaluate = ui_reader_module.AsyncThreadsJobUiReader._evaluate
+
+    async def change_query_during_snapshot(
+        reader: Any,
+        script: str,
+        argument: object,
+    ) -> object:
+        if (
+            script == ui_reader_module._PAGE_STATE_SCRIPT
+            and reader._applied_search_query == "design"
+        ):
+            stable_url = reader._page.url
+            transient_url = f"{BROWSER_FEED_ORIGIN}/search?q=transient"
+            await reader._page.evaluate("url => history.replaceState({}, '', url)", transient_url)
+            result = await original_evaluate(reader, script, argument)
+            await reader._page.evaluate("url => history.replaceState({}, '', url)", stable_url)
+            return result
+        return await original_evaluate(reader, script, argument)
+
+    monkeypatch.setattr(
+        ui_reader_module.AsyncThreadsJobUiReader,
+        "_evaluate",
+        change_query_during_snapshot,
+    )
+
+    exit_code, output, requested_urls = _run_offline_browser_source_cli(
+        root,
+        account,
+        pages,
+        monkeypatch,
+        capsys,
+        smoke=True,
+    )
+
+    assert exit_code == 1
+    assert "AUTO_READ status=STOPPED reason=SEARCH_QUERY_STATE_UNSTABLE posts_read=0" in output.out
+    assert "checkpoint=UNCHANGED" in output.out
+    assert not any("/post/" in url for url in requested_urls)
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+    assert "design" not in output.out + output.err
+
+
 def test_browser_nurture_smoke_rejects_home_feed_outside_active_search_tab(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
