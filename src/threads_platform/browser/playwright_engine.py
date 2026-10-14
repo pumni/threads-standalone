@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -190,10 +191,13 @@ _THREAD_OPEN_SCRIPT = r"""
 
 
 _OPERATOR_CLICK_OBSERVER_SCRIPT = r"""
-(() => {
+({allowedOrigin, sourceRoute, bindingName}) => {
   const stateKey = '__threadsLocalUiDiagnosticClickState';
-  if (window[stateKey] && window[stateKey].installed === true) return;
-  const state = {installed: true, armed: false, expectedOrigin: null, sourceRoute: null};
+  if (window[stateKey] && window[stateKey].installed === true) return true;
+  const state = {installed: true, armed: true, expectedOrigin: allowedOrigin, sourceRoute};
+  const bucket = (count) => count === 0 ? 'ZERO' : count === 1 ? 'ONE' : 'MANY';
+  const normalize = (value) => typeof value === 'string'
+    ? value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase() : '';
   const safeTag = (element) => [
     'A', 'BUTTON', 'INPUT', 'TEXTAREA', 'NAV', 'MAIN', 'ARTICLE', 'HEADER',
     'SECTION', 'ASIDE', 'DIV', 'FORM'
@@ -219,6 +223,12 @@ _OPERATOR_CLICK_OBSERVER_SCRIPT = r"""
     if (name === 'recent') return 'RECENT';
     return 'OTHER';
   };
+  const roleOf = (element) => {
+    const role = normalize(element.getAttribute('role'));
+    if (role === 'button' || element.tagName === 'BUTTON') return 'BUTTON';
+    if (role === 'link' || element.tagName === 'A') return 'LINK';
+    return 'OTHER';
+  };
   const visible = (element) => {
     let current = element;
     for (let depth = 0; current && depth < 32; current = current.parentElement, depth += 1) {
@@ -229,9 +239,9 @@ _OPERATOR_CLICK_OBSERVER_SCRIPT = r"""
           current.hasAttribute('inert') || Number.parseFloat(style.opacity) === 0) return false;
     }
     if (current !== null) return false;
-    const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.left < window.innerWidth &&
-      rect.bottom > 0 && rect.top < window.innerHeight;
+    const rects = Array.from(element.getClientRects());
+    return rects.some((rect) => rect.width > 0 && rect.height > 0 && rect.right > 0 &&
+      rect.left < window.innerWidth && rect.bottom > 0 && rect.top < window.innerHeight);
   };
   const routeClass = () => {
     if (window.location.origin !== state.expectedOrigin) return 'OTHER';
@@ -243,15 +253,35 @@ _OPERATOR_CLICK_OBSERVER_SCRIPT = r"""
     if (path === '/' || /^\/(home|for_you)$/i.test(path)) return 'HOME';
     return 'OTHER';
   };
+  const visibleSearchboxes = () => Array.from(document.querySelectorAll(
+    'input,textarea,[role="searchbox"],[role="textbox"]'
+  )).filter((element) => {
+    if (!visible(element)) return false;
+    const role = normalize(element.getAttribute('role'));
+    const isTextEntry = ['INPUT', 'TEXTAREA'].includes(element.tagName);
+    return role === 'searchbox' || isTextEntry &&
+      (safeLabel(element) === 'SEARCH' || normalize(element.getAttribute('type')) === 'search');
+  });
   window.addEventListener('click', (event) => {
     if (!state.armed || !event.isTrusted || routeClass() !== state.sourceRoute) return;
     const control = event.composedPath().slice(0, 32).find((item) => item instanceof Element &&
       item.matches('a[href],button,[role="button"],[role="link"]'));
     if (!(control instanceof Element) || !visible(control)) return;
     const navigationCandidates = Array.from(document.querySelectorAll('nav,[role="navigation"]'));
-    if (navigationCandidates.length > 3_000) return;
+    const controlCandidates = Array.from(document.querySelectorAll(
+      'a[href],button,[role="button"],[role="link"]'
+    ));
+    const searchboxCandidates = visibleSearchboxes();
+    if (navigationCandidates.length > 3_000 || controlCandidates.length > 3_000 ||
+        searchboxCandidates.length > 3_000) return;
     state.armed = false;
     const navigation = navigationCandidates.filter(visible);
+    const label = safeLabel(control);
+    const role = safeRole(control);
+    const tag = safeTag(control);
+    const semanticMatches = label === 'OTHER' ? [] : controlCandidates.filter((candidate) =>
+      visible(candidate) && safeRole(candidate) === role && safeLabel(candidate) === label
+    );
     const anchor = control.closest('a[href]');
     let targetPath = null;
     if (anchor) {
@@ -266,31 +296,28 @@ _OPERATOR_CLICK_OBSERVER_SCRIPT = r"""
       } catch (_) { /* Keep malformed destinations out of the diagnostic. */ }
     }
     const report = {
+      event_is_trusted: true,
       source_route: routeClass(),
-      role: safeRole(control),
-      tag: safeTag(control),
-      label: safeLabel(control),
+      role,
+      tag,
+      label,
       within_unique_navigation: navigation.length === 1 && navigation[0].contains(control),
+      stable_semantic_locator_unique: semanticMatches.length === 1,
+      before_searchboxes: bucket(searchboxCandidates.length),
       is_post_permalink: targetPath !== null,
       target_path: targetPath
     };
-    const binding = window.__threadsLocalUiDiagnosticRecordClick;
-    if (typeof binding === 'function') binding(report).catch(() => {});
+    try {
+      window[bindingName](JSON.stringify(report));
+    } catch (_) { /* A lost CDP binding leaves the action unverified. */ }
   }, true);
   window[stateKey] = state;
-})();
-"""
-
-_ARM_OPERATOR_CLICK_SCRIPT = r"""
-({allowedOrigin, sourceRoute}) => {
-  const state = window.__threadsLocalUiDiagnosticClickState;
-  if (!state || state.installed !== true || window.location.origin !== allowedOrigin) return false;
-  state.expectedOrigin = allowedOrigin;
-  state.sourceRoute = sourceRoute;
-  state.armed = true;
   return true;
 }
 """
+
+_UI_DIAGNOSTIC_CDP_WORLD_PREFIX = "threadsLocalUiDiagnostic"
+_UI_DIAGNOSTIC_CDP_BINDING_PREFIX = "threadsLocalUiDiagnosticRecord"
 
 _BROWSER_READ_READINESS_TIMEOUT_SECONDS = 2.0
 _BROWSER_READ_READINESS_POLL_SECONDS = 0.05
@@ -426,8 +453,14 @@ class _PlaywrightBrowserSession:
         self._synthetic_blocked_request_count = 0
         self._async_ui_reader: AsyncThreadsJobUiReader | None = None
         self._async_ui_reader_origin: str | None = None
-        self._ui_diagnostic_click_binding_installed = False
+        self._ui_diagnostic_cdp_session: Any = None
+        self._ui_diagnostic_cdp_sequence = 0
+        self._ui_diagnostic_cdp_context_frames: dict[int, str] = {}
         self._ui_diagnostic_click_armed_route: str | None = None
+        self._ui_diagnostic_click_context_id: int | None = None
+        self._ui_diagnostic_click_binding_name: str | None = None
+        self._ui_diagnostic_click_main_frame_id: str | None = None
+        self._ui_diagnostic_action_status = "UNVERIFIED"
         self._ui_diagnostic_operator_click: dict[str, object] | None = None
         # Volatile comparison input only; it is never copied to a report or log.
         self._ui_diagnostic_operator_click_path: str | None = None
@@ -530,6 +563,88 @@ class _PlaywrightBrowserSession:
         await self._raise_ui_policy_error()
         return result
 
+    async def _ensure_ui_diagnostic_cdp(self) -> Any:
+        if self._ui_diagnostic_cdp_session is not None:
+            return self._ui_diagnostic_cdp_session
+        session = cast(Any, await self._context.new_cdp_session(self._page))
+        try:
+            await session.send("Page.enable")
+            await session.send("Runtime.enable")
+        except PlaywrightError:
+            try:
+                await session.detach()
+            except PlaywrightError:
+                pass
+            raise
+        session.on("Runtime.bindingCalled", self._receive_ui_diagnostic_operator_click)
+        self._ui_diagnostic_cdp_session = session
+        return session
+
+    async def _create_ui_diagnostic_world(self) -> tuple[Any, int, str]:
+        session = await self._ensure_ui_diagnostic_cdp()
+        frame_reply = cast(dict[str, object], await session.send("Page.getFrameTree"))
+        raw_frame_tree = frame_reply.get("frameTree")
+        if not isinstance(raw_frame_tree, dict):
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        frame_tree = cast(dict[str, object], raw_frame_tree)
+        frame = frame_tree.get("frame")
+        if not isinstance(frame, dict):
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        frame_dict = cast(dict[str, object], frame)
+        frame_id = frame_dict.get("id")
+        frame_url = frame_dict.get("url")
+        if (
+            not isinstance(frame_id, str)
+            or not isinstance(frame_url, str)
+            or _normalized_browser_origin(frame_url)
+            not in {
+                BROWSER_FEED_ORIGIN,
+                "https://threads.example.invalid",
+            }
+        ):
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        self._ui_diagnostic_cdp_sequence += 1
+        world_name = f"{_UI_DIAGNOSTIC_CDP_WORLD_PREFIX}{self._ui_diagnostic_cdp_sequence}"
+        world_reply = cast(
+            dict[str, object],
+            await session.send(
+                "Page.createIsolatedWorld",
+                {"frameId": frame_id, "worldName": world_name},
+            ),
+        )
+        context_id = world_reply.get("executionContextId")
+        if type(context_id) is not int:
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        return session, context_id, frame_id
+
+    @staticmethod
+    async def _evaluate_ui_diagnostic_world(
+        session: Any,
+        context_id: int,
+        script: str,
+        parameters: Mapping[str, object],
+    ) -> object:
+        expression = f"({script})({json.dumps(parameters, separators=(',', ':'))})"
+        reply = cast(
+            dict[str, object],
+            await session.send(
+                "Runtime.evaluate",
+                {
+                    "expression": expression,
+                    "contextId": context_id,
+                    "returnByValue": True,
+                    "awaitPromise": False,
+                },
+            ),
+        )
+        if "exceptionDetails" in reply:
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        raw_result = reply.get("result")
+        if not isinstance(raw_result, dict) or "value" not in raw_result:
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        result = cast(dict[str, object], raw_result)
+        return result["value"]
+
     async def inspect_ui_diagnostic(
         self,
         *,
@@ -550,8 +665,11 @@ class _PlaywrightBrowserSession:
         await self._raise_navigation_policy_error()
         try:
             operator_click = self._ui_diagnostic_operator_click
+            cdp_session, context_id, _ = await self._create_ui_diagnostic_world()
             raw_snapshot = await asyncio.wait_for(
-                self._page.evaluate(
+                self._evaluate_ui_diagnostic_world(
+                    cdp_session,
+                    context_id,
                     DIAGNOSTIC_SCRIPT,
                     {
                         "allowedOrigin": origin,
@@ -562,6 +680,7 @@ class _PlaywrightBrowserSession:
                         "maxRelations": 480,
                         "operatorClick": operator_click,
                         "operatorClickPath": self._ui_diagnostic_operator_click_path,
+                        "operatorActionStatus": self._ui_diagnostic_action_status,
                     },
                 ),
                 timeout=3.0,
@@ -578,7 +697,7 @@ class _PlaywrightBrowserSession:
             raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_SCHEMA_INVALID") from None
 
     async def arm_ui_diagnostic_operator_click(self, *, source_route: str) -> None:
-        """Record one trusted operator click as bounded semantic metadata."""
+        """Observe one trusted main-frame click in a CDP isolated world."""
 
         if source_route not in {"HOME", "SEARCH", "POST", "OTHER"}:
             raise UnsupportedUIState()
@@ -592,52 +711,105 @@ class _PlaywrightBrowserSession:
         } or self._allowed_navigation_origins != frozenset({origin}):
             raise UnsupportedUIState()
         await self._raise_navigation_policy_error()
+        if self._ui_diagnostic_click_context_id is not None:
+            self._ui_diagnostic_cdp_context_frames.pop(self._ui_diagnostic_click_context_id, None)
         self._ui_diagnostic_operator_click = None
         self._ui_diagnostic_operator_click_path = None
         self._ui_diagnostic_click_armed_route = source_route
+        self._ui_diagnostic_action_status = "UNVERIFIED"
+        context_id: int | None = None
         try:
-            if not self._ui_diagnostic_click_binding_installed:
-                await cast(Any, self._page).expose_binding(
-                    "__threadsLocalUiDiagnosticRecordClick",
-                    self._receive_ui_diagnostic_operator_click,
-                )
-                await self._page.add_init_script(_OPERATOR_CLICK_OBSERVER_SCRIPT)
-                self._ui_diagnostic_click_binding_installed = True
-            await self._page.evaluate(_OPERATOR_CLICK_OBSERVER_SCRIPT)
-            armed = await self._page.evaluate(
-                _ARM_OPERATOR_CLICK_SCRIPT,
-                {"allowedOrigin": origin, "sourceRoute": source_route},
+            cdp_session, context_id, frame_id = await self._create_ui_diagnostic_world()
+            binding_name = f"{_UI_DIAGNOSTIC_CDP_BINDING_PREFIX}{self._ui_diagnostic_cdp_sequence}"
+            # The context ID was created from Page.getFrameTree's main-frame ID;
+            # the site and child frames have no access to this isolated-world binding.
+            await cdp_session.send(
+                "Runtime.addBinding",
+                {"name": binding_name, "executionContextId": context_id},
+            )
+            self._ui_diagnostic_click_context_id = context_id
+            self._ui_diagnostic_click_binding_name = binding_name
+            self._ui_diagnostic_click_main_frame_id = frame_id
+            self._ui_diagnostic_cdp_context_frames[context_id] = frame_id
+            armed = await self._evaluate_ui_diagnostic_world(
+                cdp_session,
+                context_id,
+                _OPERATOR_CLICK_OBSERVER_SCRIPT,
+                {
+                    "allowedOrigin": origin,
+                    "sourceRoute": source_route,
+                    "bindingName": binding_name,
+                },
             )
         except PlaywrightError:
             self._ensure_alive()
             await self._raise_navigation_policy_error()
             self._ui_diagnostic_click_armed_route = None
+            self._ui_diagnostic_click_context_id = None
+            self._ui_diagnostic_click_binding_name = None
+            self._ui_diagnostic_click_main_frame_id = None
+            if context_id is not None:
+                self._ui_diagnostic_cdp_context_frames.pop(context_id, None)
             raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE") from None
+        except BrowserRuntimeUnavailable:
+            self._ui_diagnostic_click_armed_route = None
+            self._ui_diagnostic_click_context_id = None
+            self._ui_diagnostic_click_binding_name = None
+            self._ui_diagnostic_click_main_frame_id = None
+            if context_id is not None:
+                self._ui_diagnostic_cdp_context_frames.pop(context_id, None)
+            raise
         if armed is not True:
             self._ui_diagnostic_click_armed_route = None
+            self._ui_diagnostic_click_context_id = None
+            self._ui_diagnostic_click_binding_name = None
+            self._ui_diagnostic_click_main_frame_id = None
+            self._ui_diagnostic_cdp_context_frames.pop(context_id, None)
             raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
         await self._raise_navigation_policy_error()
 
-    async def _receive_ui_diagnostic_operator_click(
-        self,
-        source: dict[str, object],
-        payload: object,
-    ) -> None:
+    def _receive_ui_diagnostic_operator_click(self, event: object) -> None:
         expected_route = self._ui_diagnostic_click_armed_route
+        expected_context_id = self._ui_diagnostic_click_context_id
+        expected_binding_name = self._ui_diagnostic_click_binding_name
+        expected_frame_id = self._ui_diagnostic_click_main_frame_id
         if (
             expected_route is None
             or self._ui_diagnostic_operator_click is not None
-            or source.get("page") is not self._page
-            or not isinstance(payload, dict)
+            or type(expected_context_id) is not int
+            or not isinstance(expected_binding_name, str)
+            or not isinstance(expected_frame_id, str)
+            or not isinstance(event, dict)
         ):
             return
-        value = cast(dict[str, object], payload)
+        event_dict = cast(dict[str, object], event)
+        context_id = event_dict.get("executionContextId")
+        payload = event_dict.get("payload")
+        if (
+            event_dict.get("name") != expected_binding_name
+            or type(context_id) is not int
+            or context_id != expected_context_id
+            or self._ui_diagnostic_cdp_context_frames.get(context_id) != expected_frame_id
+            or not isinstance(payload, str)
+            or len(payload) > 4_096
+        ):
+            return
+        try:
+            parsed_payload = json.loads(payload)
+        except TypeError, json.JSONDecodeError:
+            return
+        if not isinstance(parsed_payload, dict):
+            return
+        value = cast(dict[str, object], parsed_payload)
         expected_keys = {
+            "event_is_trusted",
             "source_route",
             "role",
             "tag",
             "label",
             "within_unique_navigation",
+            "stable_semantic_locator_unique",
+            "before_searchboxes",
             "is_post_permalink",
             "target_path",
         }
@@ -646,10 +818,13 @@ class _PlaywrightBrowserSession:
         tag = value.get("tag")
         label = value.get("label")
         within_unique_navigation = value.get("within_unique_navigation")
+        stable_semantic_locator_unique = value.get("stable_semantic_locator_unique")
+        before_searchboxes = value.get("before_searchboxes")
         is_post_permalink = value.get("is_post_permalink")
         target_path = value.get("target_path")
         if (
             set(value) != expected_keys
+            or value.get("event_is_trusted") is not True
             or source_route != expected_route
             or not isinstance(role, str)
             or role not in {"BUTTON", "LINK", "OTHER"}
@@ -673,6 +848,9 @@ class _PlaywrightBrowserSession:
             or not isinstance(label, str)
             or label not in {"HOME", "SEARCH", "PROFILE", "FOR_YOU", "TOP", "RECENT", "OTHER"}
             or type(within_unique_navigation) is not bool
+            or type(stable_semantic_locator_unique) is not bool
+            or not isinstance(before_searchboxes, str)
+            or before_searchboxes not in {"ZERO", "ONE", "MANY"}
             or type(is_post_permalink) is not bool
             or (target_path is not None and not isinstance(target_path, str))
         ):
@@ -691,10 +869,17 @@ class _PlaywrightBrowserSession:
             "tag": tag,
             "label": label,
             "within_unique_navigation": within_unique_navigation,
+            "stable_semantic_locator_unique": stable_semantic_locator_unique,
+            "before_searchboxes": before_searchboxes,
             "is_post_permalink": is_post_permalink,
         }
         self._ui_diagnostic_operator_click_path = safe_path
+        self._ui_diagnostic_action_status = "VERIFIED"
         self._ui_diagnostic_click_armed_route = None
+        self._ui_diagnostic_click_context_id = None
+        self._ui_diagnostic_click_binding_name = None
+        self._ui_diagnostic_click_main_frame_id = None
+        self._ui_diagnostic_cdp_context_frames.clear()
 
     async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
         self._ensure_alive()
@@ -967,8 +1152,18 @@ class _PlaywrightBrowserSession:
             return
         self._closed = True
         self._ui_diagnostic_click_armed_route = None
+        self._ui_diagnostic_click_context_id = None
+        self._ui_diagnostic_click_binding_name = None
+        self._ui_diagnostic_click_main_frame_id = None
+        self._ui_diagnostic_cdp_context_frames.clear()
         self._ui_diagnostic_operator_click = None
         self._ui_diagnostic_operator_click_path = None
+        if self._ui_diagnostic_cdp_session is not None:
+            try:
+                await self._ui_diagnostic_cdp_session.detach()
+            except Exception:  # noqa: BLE001, S110
+                pass
+            self._ui_diagnostic_cdp_session = None
         try:
             await self._context.close()
         except Exception:  # noqa: BLE001, S110

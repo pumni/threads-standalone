@@ -28,7 +28,6 @@ from threads_platform.browser.contracts import (
     RemoteSessionStateUncertain,
 )
 from threads_platform.browser.playwright_engine import (
-    _ARM_OPERATOR_CLICK_SCRIPT,
     _OPERATOR_CLICK_OBSERVER_SCRIPT,
     PlaywrightBrowserEngine,
 )
@@ -96,7 +95,11 @@ def _valid_raw_snapshot() -> dict[str, object]:
             }
         ],
         "operator_action": None,
-        "query_match": True,
+        "operator_action_status": "UNVERIFIED",
+        "search_input_matches_query": True,
+        "url_query_matches": False,
+        "query_application_status": "UNVERIFIED",
+        "search_results_status": "UNVERIFIED",
         "self_profile_match": True,
         "body_status": "UNKNOWN",
         "document_ready": True,
@@ -136,12 +139,15 @@ def test_diagnostic_schema_rejects_page_strings_and_unbounded_values() -> None:
         "tag": "DIV",
         "label": "OTHER",
         "within_unique_navigation": True,
+        "stable_semantic_locator_unique": False,
+        "before_searchboxes": "ZERO",
         "is_post_permalink": False,
         "destination_route": "SEARCH",
         "destination_searchboxes": "ONE",
-        "search_query_entered": True,
-        "search_query_applied": False,
-        "search_destination_relation": True,
+        "search_input_matches_query": True,
+        "url_query_matches": False,
+        "search_state_change_status": "CHANGE_VERIFIED",
+        "search_destination_relation": False,
         "clicked_post_matches_destination": False,
         "unique_co_container_author_matches_clicked_post": False,
         "target_path": "/@private_candidate_86/post/privatepostid71",
@@ -166,6 +172,16 @@ def test_diagnostic_schema_rejects_page_strings_and_unbounded_values() -> None:
     with pytest.raises(UiDiagnosticSchemaError):
         validate_ui_diagnostic_snapshot(raw)
 
+    for field, value in (
+        ("query_application_status", "APPLIED"),
+        ("search_results_status", "LOADED"),
+        ("body_status", "PRESENT"),
+    ):
+        raw = _valid_raw_snapshot()
+        raw[field] = value
+        with pytest.raises(UiDiagnosticSchemaError):
+            validate_ui_diagnostic_snapshot(raw)
+
 
 def test_diagnostic_report_contains_only_allowlisted_semantics() -> None:
     snapshot = validate_ui_diagnostic_snapshot(_valid_raw_snapshot())
@@ -186,9 +202,7 @@ def test_diagnostic_report_contains_only_allowlisted_semantics() -> None:
 
 
 def test_browser_probe_script_is_read_only_and_has_no_credential_or_upload_access() -> None:
-    script = (
-        DIAGNOSTIC_SCRIPT + _OPERATOR_CLICK_OBSERVER_SCRIPT + _ARM_OPERATOR_CLICK_SCRIPT
-    ).lower()
+    script = (DIAGNOSTIC_SCRIPT + _OPERATOR_CLICK_OBSERVER_SCRIPT).lower()
     for forbidden in (
         "document.cookie",
         "localstorage",
@@ -368,8 +382,14 @@ def test_synthetic_chromium_home_search_detail_report_is_private(tmp_path: Path)
     assert home["route_class"] == "HOME"
     assert home["self_profile_match"] is True
     assert search["route_class"] == "SEARCH"
-    assert search["query_match"] is True
-    assert query_from_url["query_match"] is True
+    assert search["search_input_matches_query"] is True
+    assert search["url_query_matches"] is False
+    assert search["query_application_status"] == "UNVERIFIED"
+    assert search["search_results_status"] == "UNVERIFIED"
+    assert query_from_url["search_input_matches_query"] is False
+    assert query_from_url["url_query_matches"] is True
+    assert query_from_url["query_application_status"] == "UNVERIFIED"
+    assert query_from_url["search_results_status"] == "UNVERIFIED"
     search_counts = cast(dict[str, object], search["counts"])
     search_relations = cast(list[dict[str, object]], search["relations"])
     detail_relations = cast(list[dict[str, object]], detail["relations"])
@@ -380,13 +400,14 @@ def test_synthetic_chromium_home_search_detail_report_is_private(tmp_path: Path)
         for relation in search_relations
     )
     assert detail["route_class"] == "POST"
-    assert detail["body_status"] == "PARTIAL"
+    assert detail["body_status"] == "UNKNOWN"
     assert any(
         relation["relation"] == "DETAIL_POST_AND_AUTHOR_SHARE_CONTAINER"
         for relation in detail_relations
     )
     assert home_overlay["route_class"] == "HOME"
-    assert home_overlay["query_match"] is True
+    assert home_overlay["search_input_matches_query"] is True
+    assert home_overlay["url_query_matches"] is False
     assert cast(dict[str, object], home_overlay["counts"])["visible_candidates"] != "ZERO"
     assert unknown_detail["route_class"] == "OTHER"
     assert cast(dict[str, object], unknown_detail["counts"])["article_landmarks"] == "ONE"
@@ -416,7 +437,7 @@ def test_synthetic_chromium_operator_click_correlation_is_bounded_and_private(
     home_html = f"""
       <style>[role="button"]{{display:inline-block;width:32px;height:32px}}</style>
       <div role="navigation">
-        <div role="button" id="search-trigger"></div>
+        <div role="button" id="search-trigger" aria-label="Search"></div>
         <div role="button" id="search-overlay-trigger"></div>
         <div role="button" id="other-control"></div>
         <a href="/@{_PRIVATE_USERNAME}" aria-label="Profile">Profile</a>
@@ -443,7 +464,13 @@ def test_synthetic_chromium_operator_click_correlation_is_bounded_and_private(
     """
 
     async def observe_transitions() -> tuple[
-        dict[str, object], dict[str, object], dict[str, object], dict[str, object]
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
     ]:
         profile = tmp_path / "synthetic-action-profile"
         profile.mkdir()
@@ -485,6 +512,56 @@ def test_synthetic_chromium_operator_click_correlation_is_bounded_and_private(
             assert mismatch.value.code == "BROWSER_SESSION_MISMATCH"
             await session.navigate(home_url, allowed_origins=frozenset({_SYNTHETIC_ORIGIN}))
             await session.arm_ui_diagnostic_operator_click(source_route="HOME")
+            implementation = cast(Any, browser_session)
+            binding_name = implementation._ui_diagnostic_click_binding_name
+            binding_context_id = implementation._ui_diagnostic_click_context_id
+            assert isinstance(binding_name, str)
+            assert type(binding_context_id) is int
+            assert await page.evaluate("(name) => typeof window[name]", binding_name) == "undefined"
+            iframe_binding = await page.evaluate(
+                """async (name) => {
+                  const frame = document.createElement('iframe');
+                  frame.srcdoc = '<!doctype html><body></body>';
+                  document.body.append(frame);
+                  await new Promise((resolve) => frame.addEventListener('load', resolve, {once: true}));
+                  return typeof frame.contentWindow[name];
+                }""",
+                binding_name,
+            )
+            assert iframe_binding == "undefined"
+            await page.evaluate(
+                """() => document.querySelector('#other-control').dispatchEvent(
+                  new MouseEvent('click', {bubbles: true})
+                )"""
+            )
+            forged_payload = json.dumps(
+                {
+                    "event_is_trusted": True,
+                    "source_route": "HOME",
+                    "role": "BUTTON",
+                    "tag": "DIV",
+                    "label": "SEARCH",
+                    "within_unique_navigation": True,
+                    "stable_semantic_locator_unique": True,
+                    "before_searchboxes": "ZERO",
+                    "is_post_permalink": False,
+                    "target_path": None,
+                }
+            )
+            implementation._receive_ui_diagnostic_operator_click(
+                {
+                    "name": binding_name,
+                    "executionContextId": binding_context_id + 10_000,
+                    "payload": forged_payload,
+                }
+            )
+            assert implementation._ui_diagnostic_operator_click is None
+            forged_snapshot = await session.inspect_ui_diagnostic(
+                expected_username=_PRIVATE_USERNAME,
+                configured_topic=_PRIVATE_QUERY,
+            )
+            assert forged_snapshot.to_document()["operator_action_status"] == "UNVERIFIED"
+            assert forged_snapshot.to_document()["operator_action"] is None
             await page.locator("#search-trigger").click()
             search_snapshot = await session.inspect_ui_diagnostic(
                 expected_username=_PRIVATE_USERNAME,
@@ -499,6 +576,24 @@ def test_synthetic_chromium_operator_click_correlation_is_bounded_and_private(
                 configured_topic=_PRIVATE_QUERY,
             )
             detail_report = detail_snapshot.to_document()
+
+            await session.navigate(home_url, allowed_origins=frozenset({_SYNTHETIC_ORIGIN}))
+            await page.evaluate(
+                """() => {
+                  const duplicate = document.createElement('div');
+                  duplicate.setAttribute('role', 'button');
+                  duplicate.setAttribute('aria-label', 'Search');
+                  document.querySelector('[role="navigation"]').append(duplicate);
+                }"""
+            )
+            await session.arm_ui_diagnostic_operator_click(source_route="HOME")
+            await page.locator("#search-trigger").click()
+            duplicate_search_snapshot = await session.inspect_ui_diagnostic(
+                expected_username=_PRIVATE_USERNAME,
+                configured_topic=_PRIVATE_QUERY,
+            )
+            duplicate_search_report = duplicate_search_snapshot.to_document()
+
             await session.navigate(home_url, allowed_origins=frozenset({_SYNTHETIC_ORIGIN}))
             await session.arm_ui_diagnostic_operator_click(source_route="HOME")
             await page.locator("#search-overlay-trigger").click()
@@ -507,27 +602,70 @@ def test_synthetic_chromium_operator_click_correlation_is_bounded_and_private(
                 configured_topic=_PRIVATE_QUERY,
             )
             overlay_report = overlay_snapshot.to_document()
+
+            await session.navigate(home_url, allowed_origins=frozenset({_SYNTHETIC_ORIGIN}))
+            await page.evaluate(
+                """() => {
+                  const input = document.createElement('input');
+                  input.setAttribute('role', 'textbox');
+                  input.setAttribute('aria-label', 'Search');
+                  document.body.append(input);
+                }"""
+            )
+            await session.arm_ui_diagnostic_operator_click(source_route="HOME")
+            await page.locator("#other-control").click()
+            preexisting_search_snapshot = await session.inspect_ui_diagnostic(
+                expected_username=_PRIVATE_USERNAME,
+                configured_topic=_PRIVATE_QUERY,
+            )
+            preexisting_search_report = preexisting_search_snapshot.to_document()
+
+            await session.navigate(home_url, allowed_origins=frozenset({_SYNTHETIC_ORIGIN}))
+            await session.arm_ui_diagnostic_operator_click(source_route="HOME")
+            await page.locator("#other-control").click()
+            await page.evaluate(
+                """() => {
+                  const input = document.createElement('input');
+                  input.setAttribute('role', 'textbox');
+                  input.setAttribute('aria-label', 'Search');
+                  document.body.append(input);
+                }"""
+            )
+            manually_opened_search_snapshot = await session.inspect_ui_diagnostic(
+                expected_username=_PRIVATE_USERNAME,
+                configured_topic=_PRIVATE_QUERY,
+            )
+            manually_opened_search_report = manually_opened_search_snapshot.to_document()
         finally:
             await cast(Any, browser_session).close()
         return (
             {"state": str(home_state)},
             search_report,
             detail_report,
+            duplicate_search_report,
             overlay_report,
+            preexisting_search_report,
+            manually_opened_search_report,
         )
 
-    home, search, detail, overlay = asyncio.run(observe_transitions())
+    home, search, detail, duplicate_search, overlay, preexisting, manually_opened = asyncio.run(
+        observe_transitions()
+    )
     assert home["state"] == "READY"
     search_action = cast(dict[str, object], search["operator_action"])
+    assert search["operator_action_status"] == "VERIFIED"
     assert search_action["source_route"] == "HOME"
     assert search_action["role"] == "BUTTON"
     assert search_action["tag"] == "DIV"
-    assert search_action["label"] == "OTHER"
+    assert search_action["label"] == "SEARCH"
     assert search_action["within_unique_navigation"] is True
+    assert search_action["stable_semantic_locator_unique"] is True
+    assert search_action["before_searchboxes"] == "ZERO"
     assert search_action["search_destination_relation"] is True
     assert search_action["destination_searchboxes"] == "ONE"
-    assert search_action["search_query_entered"] is True
-    assert search_action["search_query_applied"] is False
+    assert search_action["search_input_matches_query"] is True
+    assert search_action["url_query_matches"] is False
+    assert search_action["search_state_change_status"] == "CHANGE_VERIFIED"
     detail_action = cast(dict[str, object], detail["operator_action"])
     assert detail_action["source_route"] == "SEARCH"
     assert detail_action["role"] == "LINK"
@@ -535,12 +673,38 @@ def test_synthetic_chromium_operator_click_correlation_is_bounded_and_private(
     assert detail_action["clicked_post_matches_destination"] is True
     assert detail_action["unique_co_container_author_matches_clicked_post"] is True
     assert detail["route_class"] == "POST"
+    assert detail["body_status"] == "UNKNOWN"
+    duplicate_action = cast(dict[str, object], duplicate_search["operator_action"])
+    assert duplicate_action["source_route"] == "HOME"
+    assert duplicate_action["label"] == "SEARCH"
+    assert duplicate_action["stable_semantic_locator_unique"] is False
+    assert duplicate_action["search_state_change_status"] == "CHANGE_VERIFIED"
+    assert duplicate_action["search_destination_relation"] is False
     overlay_action = cast(dict[str, object], overlay["operator_action"])
     assert overlay["route_class"] == "HOME"
     assert overlay_action["destination_route"] == "HOME"
-    assert overlay_action["search_destination_relation"] is True
+    assert overlay_action["stable_semantic_locator_unique"] is False
+    assert overlay_action["before_searchboxes"] == "ZERO"
+    assert overlay_action["search_state_change_status"] == "CHANGE_VERIFIED"
+    assert overlay_action["search_destination_relation"] is False
     assert overlay_action["destination_searchboxes"] == "ONE"
-    encoded = json.dumps((search, detail, overlay), sort_keys=True)
+    preexisting_action = cast(dict[str, object], preexisting["operator_action"])
+    assert preexisting_action["label"] == "OTHER"
+    assert preexisting_action["before_searchboxes"] == "ONE"
+    assert preexisting_action["destination_searchboxes"] == "ONE"
+    assert preexisting_action["search_state_change_status"] == "NO_CHANGE"
+    assert preexisting_action["search_destination_relation"] is False
+    manually_opened_action = cast(dict[str, object], manually_opened["operator_action"])
+    assert manually_opened_action["label"] == "OTHER"
+    assert manually_opened_action["stable_semantic_locator_unique"] is False
+    assert manually_opened_action["before_searchboxes"] == "ZERO"
+    assert manually_opened_action["destination_searchboxes"] == "ONE"
+    assert manually_opened_action["search_state_change_status"] == "CHANGE_VERIFIED"
+    assert manually_opened_action["search_destination_relation"] is False
+    encoded = json.dumps(
+        (search, detail, duplicate_search, overlay, preexisting, manually_opened),
+        sort_keys=True,
+    )
     for private_value in (
         _PRIVATE_USERNAME,
         _PRIVATE_QUERY,

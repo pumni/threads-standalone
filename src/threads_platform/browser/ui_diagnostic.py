@@ -46,6 +46,9 @@ _TAGS = frozenset(
     }
 )
 _LABELS = frozenset({"HOME", "SEARCH", "PROFILE", "FOR_YOU", "TOP", "RECENT", "OTHER"})
+_ACTION_STATUSES = frozenset({"VERIFIED", "UNVERIFIED"})
+_SEARCH_CHANGE_STATUSES = frozenset({"CHANGE_VERIFIED", "NO_CHANGE", "UNVERIFIED"})
+_QUERY_STATUSES = frozenset({"UNVERIFIED"})
 _RELATIONS = frozenset(
     {
         "CONTROL_DESCENDANT_OF_NAV",
@@ -55,7 +58,7 @@ _RELATIONS = frozenset(
         "DETAIL_POST_AND_AUTHOR_SHARE_CONTAINER",
     }
 )
-_BODY_STATES = frozenset({"PRESENT", "PARTIAL", "ABSENT", "UNKNOWN"})
+_BODY_STATES = frozenset({"UNKNOWN"})
 _OBSERVED_KEYS = frozenset(
     {
         "status",
@@ -64,7 +67,11 @@ _OBSERVED_KEYS = frozenset(
         "nodes",
         "relations",
         "operator_action",
-        "query_match",
+        "operator_action_status",
+        "search_input_matches_query",
+        "url_query_matches",
+        "query_application_status",
+        "search_results_status",
         "self_profile_match",
         "body_status",
         "document_ready",
@@ -126,11 +133,14 @@ class UiDiagnosticOperatorAction:
     tag: str
     label: str
     within_unique_navigation: bool
+    stable_semantic_locator_unique: bool
+    before_searchboxes: str
     is_post_permalink: bool
     destination_route: str
     destination_searchboxes: str
-    search_query_entered: bool
-    search_query_applied: bool
+    search_input_matches_query: bool
+    url_query_matches: bool
+    search_state_change_status: str
     search_destination_relation: bool
     clicked_post_matches_destination: bool
     unique_co_container_author_matches_clicked_post: bool
@@ -142,11 +152,14 @@ class UiDiagnosticOperatorAction:
             "tag": self.tag,
             "label": self.label,
             "within_unique_navigation": self.within_unique_navigation,
+            "stable_semantic_locator_unique": self.stable_semantic_locator_unique,
+            "before_searchboxes": self.before_searchboxes,
             "is_post_permalink": self.is_post_permalink,
             "destination_route": self.destination_route,
             "destination_searchboxes": self.destination_searchboxes,
-            "search_query_entered": self.search_query_entered,
-            "search_query_applied": self.search_query_applied,
+            "search_input_matches_query": self.search_input_matches_query,
+            "url_query_matches": self.url_query_matches,
+            "search_state_change_status": self.search_state_change_status,
             "search_destination_relation": self.search_destination_relation,
             "clicked_post_matches_destination": self.clicked_post_matches_destination,
             "unique_co_container_author_matches_clicked_post": (
@@ -162,7 +175,11 @@ class UiDiagnosticSnapshot:
     counts: tuple[tuple[str, str], ...] = ()
     nodes: tuple[UiDiagnosticNode, ...] = ()
     relations: tuple[UiDiagnosticRelation, ...] = ()
-    query_match: bool = False
+    operator_action_status: str = "UNVERIFIED"
+    search_input_matches_query: bool = False
+    url_query_matches: bool = False
+    query_application_status: str = "UNVERIFIED"
+    search_results_status: str = "UNVERIFIED"
     self_profile_match: bool = False
     body_status: str = "UNKNOWN"
     document_ready: bool = False
@@ -180,7 +197,11 @@ class UiDiagnosticSnapshot:
             "operator_action": (
                 None if self.operator_action is None else self.operator_action.to_document()
             ),
-            "query_match": self.query_match,
+            "operator_action_status": self.operator_action_status,
+            "search_input_matches_query": self.search_input_matches_query,
+            "url_query_matches": self.url_query_matches,
+            "query_application_status": self.query_application_status,
+            "search_results_status": self.search_results_status,
             "self_profile_match": self.self_profile_match,
             "body_status": self.body_status,
             "document_ready": self.document_ready,
@@ -189,7 +210,7 @@ class UiDiagnosticSnapshot:
 
 DIAGNOSTIC_SCRIPT = r"""
 ({allowedOrigin, expectedUsername, configuredTopic, maxCandidates, maxNodes, maxRelations,
-  operatorClick, operatorClickPath}) => {
+  operatorClick, operatorClickPath, operatorActionStatus}) => {
   const bucket = (count) => count === 0 ? 'ZERO' : count === 1 ? 'ONE' : 'MANY';
   const normalize = (value) => {
     const text = typeof value === 'string' ? value : '';
@@ -404,10 +425,10 @@ DIAGNOSTIC_SCRIPT = r"""
       (descriptions.get(element).label === 'SEARCH' || normalize(element.getAttribute('type')) === 'search');
   });
   const queryValue = normalize(configuredTopic);
-  const queryMatch = queryValue.length > 0 && (
-    searchboxes.some((element) => normalize(element.value) === queryValue) ||
-    normalize(url.searchParams.get('q')) === queryValue
-  );
+  const searchInputMatchesQuery = queryValue.length > 0 &&
+    searchboxes.some((element) => normalize(element.value) === queryValue);
+  const urlQueryMatches = queryValue.length > 0 &&
+    normalize(url.searchParams.get('q')) === queryValue;
   const searchControls = visibleCandidates.filter((element) => descriptions.get(element).label === 'SEARCH');
   const profileControls = visibleCandidates.filter((element) => descriptions.get(element).label === 'PROFILE');
   const homeControls = visibleCandidates.filter((element) =>
@@ -518,8 +539,6 @@ DIAGNOSTIC_SCRIPT = r"""
           profilePathOf(authors[0]) === clickedPostAuthorPath;
       })
     : [];
-  const searchQueryEntered = searchboxes.some((element) => normalize(element.value) === queryValue);
-  const searchQueryApplied = normalize(url.searchParams.get('q')) === queryValue;
   let bodyStatus = 'UNKNOWN';
   for (const [postLink, group] of authorGroups.entries()) {
     const isDetail = routeClass === 'POST' && currentPostLinks.length === 1 && postLink === currentPostLinks[0];
@@ -533,26 +552,6 @@ DIAGNOSTIC_SCRIPT = r"""
       if (relationOverflow) break;
     }
     if (relationOverflow) break;
-    if (isDetail) {
-      const bodyParagraphs = Array.from(group.container.querySelectorAll('p,[role="paragraph"]'));
-      if (bodyParagraphs.length > maxCandidates) return {status: 'NODE_BOUND_EXCEEDED'};
-      const hasBodyText = bodyParagraphs.some((element) => {
-        if (!visible(element)) return false;
-        const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
-        for (let index = 0; index < 32; index += 1) {
-          const node = walker.nextNode();
-          if (!node) return false;
-          const value = node.nodeValue || '';
-          if (/\S/.test(value.slice(0, 240))) return true;
-        }
-        return false;
-      });
-      const moreControl = Array.from(group.container.querySelectorAll('button,a,[role="button"]'))
-        .some((element) => visible(element) && ['see more', 'show more', 'read more'].includes(nameOf(element)));
-      if (moreControl) bodyStatus = 'PARTIAL';
-      else if (hasBodyText) bodyStatus = 'PRESENT';
-      else if (group.container.querySelector('p,[role="paragraph"]')) bodyStatus = 'ABSENT';
-    }
   }
   if (relationOverflow) return {status: 'NODE_BOUND_EXCEEDED'};
 
@@ -588,18 +587,31 @@ DIAGNOSTIC_SCRIPT = r"""
       tag: operatorClick.tag,
       label: operatorClick.label,
       within_unique_navigation: operatorClick.within_unique_navigation,
+      stable_semantic_locator_unique: operatorClick.stable_semantic_locator_unique,
+      before_searchboxes: operatorClick.before_searchboxes,
       is_post_permalink: operatorClick.is_post_permalink,
       destination_route: routeClass,
       destination_searchboxes: bucket(searchboxes.length),
-      search_query_entered: searchQueryEntered,
-      search_query_applied: searchQueryApplied,
+      search_input_matches_query: searchInputMatchesQuery,
+      url_query_matches: urlQueryMatches,
+      search_state_change_status: operatorClick.source_route !== 'HOME'
+        ? 'UNVERIFIED'
+        : operatorClick.source_route !== routeClass ||
+            operatorClick.before_searchboxes !== bucket(searchboxes.length)
+          ? 'CHANGE_VERIFIED' : 'NO_CHANGE',
       search_destination_relation: operatorClick.source_route === 'HOME' &&
-        operatorClick.within_unique_navigation && ['HOME', 'SEARCH'].includes(routeClass) &&
-        searchboxes.length === 1,
+        operatorClick.within_unique_navigation &&
+        operatorClick.stable_semantic_locator_unique && operatorClick.label === 'SEARCH' &&
+        operatorClick.before_searchboxes === 'ZERO' && bucket(searchboxes.length) === 'ONE' &&
+        ['HOME', 'SEARCH'].includes(routeClass),
       clicked_post_matches_destination: clickedPostMatchesDestination,
       unique_co_container_author_matches_clicked_post: clickedPostAuthorMatches.length === 1
     },
-    query_match: queryMatch,
+    operator_action_status: operatorActionStatus,
+    search_input_matches_query: searchInputMatchesQuery,
+    url_query_matches: urlQueryMatches,
+    query_application_status: 'UNVERIFIED',
+    search_results_status: 'UNVERIFIED',
     self_profile_match: selfProfileLinks.length > 0,
     body_status: bodyStatus,
     document_ready: document.readyState !== 'loading'
@@ -625,7 +637,11 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
     raw_nodes = value_dict.get("nodes")
     raw_relations = value_dict.get("relations")
     raw_operator_action = value_dict.get("operator_action")
-    query_match = value_dict.get("query_match")
+    operator_action_status = value_dict.get("operator_action_status")
+    search_input_matches_query = value_dict.get("search_input_matches_query")
+    url_query_matches = value_dict.get("url_query_matches")
+    query_application_status = value_dict.get("query_application_status")
+    search_results_status = value_dict.get("search_results_status")
     self_profile_match = value_dict.get("self_profile_match")
     body_status = value_dict.get("body_status")
     document_ready = value_dict.get("document_ready")
@@ -642,11 +658,19 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
         or frozenset(counts_dict) != frozenset(_COUNT_KEYS)
         or len(nodes_list) > _MAX_DIAGNOSTIC_NODES
         or len(relations_list) > _MAX_DIAGNOSTIC_RELATIONS
-        or type(query_match) is not bool
+        or not isinstance(operator_action_status, str)
+        or operator_action_status not in _ACTION_STATUSES
+        or type(search_input_matches_query) is not bool
+        or type(url_query_matches) is not bool
+        or not isinstance(query_application_status, str)
+        or query_application_status not in _QUERY_STATUSES
+        or not isinstance(search_results_status, str)
+        or search_results_status not in _QUERY_STATUSES
         or type(self_profile_match) is not bool
         or not isinstance(body_status, str)
         or body_status not in _BODY_STATES
         or type(document_ready) is not bool
+        or (raw_operator_action is None and operator_action_status != "UNVERIFIED")
     ):
         raise UiDiagnosticSchemaError
 
@@ -716,11 +740,14 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
                 "tag",
                 "label",
                 "within_unique_navigation",
+                "stable_semantic_locator_unique",
+                "before_searchboxes",
                 "is_post_permalink",
                 "destination_route",
                 "destination_searchboxes",
-                "search_query_entered",
-                "search_query_applied",
+                "search_input_matches_query",
+                "url_query_matches",
+                "search_state_change_status",
                 "search_destination_relation",
                 "clicked_post_matches_destination",
                 "unique_co_container_author_matches_clicked_post",
@@ -732,11 +759,14 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
         label = action_dict.get("label")
         destination_route = action_dict.get("destination_route")
         destination_searchboxes = action_dict.get("destination_searchboxes")
+        before_searchboxes = action_dict.get("before_searchboxes")
+        search_state_change_status = action_dict.get("search_state_change_status")
         bool_fields = (
             "within_unique_navigation",
+            "stable_semantic_locator_unique",
             "is_post_permalink",
-            "search_query_entered",
-            "search_query_applied",
+            "search_input_matches_query",
+            "url_query_matches",
             "search_destination_relation",
             "clicked_post_matches_destination",
             "unique_co_container_author_matches_clicked_post",
@@ -755,7 +785,38 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
             or destination_route not in _ROUTES
             or not isinstance(destination_searchboxes, str)
             or destination_searchboxes not in _CARDINALITIES
+            or not isinstance(before_searchboxes, str)
+            or before_searchboxes not in _CARDINALITIES
+            or not isinstance(search_state_change_status, str)
+            or search_state_change_status not in _SEARCH_CHANGE_STATUSES
             or any(type(action_dict.get(field)) is not bool for field in bool_fields)
+            or operator_action_status != "VERIFIED"
+            or (source_route != "HOME" and search_state_change_status != "UNVERIFIED")
+            or (
+                source_route == "HOME"
+                and search_state_change_status
+                != (
+                    "NO_CHANGE"
+                    if (
+                        source_route == destination_route
+                        and before_searchboxes == destination_searchboxes
+                    )
+                    else "CHANGE_VERIFIED"
+                )
+            )
+            or (
+                action_dict.get("search_destination_relation") is True
+                and not (
+                    source_route == "HOME"
+                    and label == "SEARCH"
+                    and action_dict.get("within_unique_navigation") is True
+                    and action_dict.get("stable_semantic_locator_unique") is True
+                    and before_searchboxes == "ZERO"
+                    and destination_searchboxes == "ONE"
+                    and destination_route in {"HOME", "SEARCH"}
+                    and search_state_change_status == "CHANGE_VERIFIED"
+                )
+            )
         ):
             raise UiDiagnosticSchemaError
         operator_action = UiDiagnosticOperatorAction(
@@ -764,11 +825,16 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
             tag=tag,
             label=label,
             within_unique_navigation=cast(bool, action_dict["within_unique_navigation"]),
+            stable_semantic_locator_unique=cast(
+                bool, action_dict["stable_semantic_locator_unique"]
+            ),
+            before_searchboxes=before_searchboxes,
             is_post_permalink=cast(bool, action_dict["is_post_permalink"]),
             destination_route=destination_route,
             destination_searchboxes=destination_searchboxes,
-            search_query_entered=cast(bool, action_dict["search_query_entered"]),
-            search_query_applied=cast(bool, action_dict["search_query_applied"]),
+            search_input_matches_query=cast(bool, action_dict["search_input_matches_query"]),
+            url_query_matches=cast(bool, action_dict["url_query_matches"]),
+            search_state_change_status=search_state_change_status,
             search_destination_relation=cast(bool, action_dict["search_destination_relation"]),
             clicked_post_matches_destination=cast(
                 bool, action_dict["clicked_post_matches_destination"]
@@ -784,7 +850,11 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
         counts=tuple(counts),
         nodes=tuple(nodes),
         relations=tuple(relations),
-        query_match=query_match,
+        operator_action_status=operator_action_status,
+        search_input_matches_query=search_input_matches_query,
+        url_query_matches=url_query_matches,
+        query_application_status=query_application_status,
+        search_results_status=search_results_status,
         self_profile_match=self_profile_match,
         body_status=body_status,
         document_ready=document_ready,
