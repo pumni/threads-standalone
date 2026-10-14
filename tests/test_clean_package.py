@@ -54,6 +54,7 @@ def test_installed_distribution_and_optional_wheel_are_source_free() -> None:
     if os.environ.get("THREADS_STANDALONE_WHEEL_SMOKE") != "1":
         return
 
+    assert "PYTHONPATH" not in os.environ
     imported_path = Path(threads_platform.__file__).resolve()
     assert "site-packages" in str(imported_path).casefold()
     checkout_paths = {
