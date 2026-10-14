@@ -424,6 +424,166 @@ _FEED_BATCH_SCRIPT = r"""
 }
 """
 
+_ASSISTED_SEARCH_SNAPSHOT_SCRIPT = r"""
+({expectedQuery, maxCards}) => {
+  const visible = (element, boundary = null) => {
+    if (!element || element.hidden) return false;
+    let current = element;
+    while (current) {
+      const style = window.getComputedStyle(current);
+      if (current.hidden || current.hasAttribute('inert') ||
+          current.getAttribute('aria-hidden') === 'true' || style.display === 'none' ||
+          style.visibility === 'hidden' || style.visibility === 'collapse' ||
+          style.contentVisibility === 'hidden' || Number.parseFloat(style.opacity) === 0) return false;
+      if (current === boundary) break;
+      current = current.parentElement;
+    }
+    if (boundary && current !== boundary) return false;
+    const rect = element.getBoundingClientRect();
+    let clip = {top: 0, right: window.innerWidth, bottom: window.innerHeight, left: 0};
+    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+      const style = window.getComputedStyle(parent);
+      if (/auto|scroll|hidden|clip/.test(`${style.overflowX} ${style.overflowY}`)) {
+        const box = parent.getBoundingClientRect();
+        clip = {
+          top: Math.max(clip.top, box.top), right: Math.min(clip.right, box.right),
+          bottom: Math.min(clip.bottom, box.bottom), left: Math.max(clip.left, box.left)
+        };
+      }
+      if (parent === boundary) break;
+    }
+    return rect.width > 0 && rect.height > 0 && rect.bottom > clip.top && rect.top < clip.bottom &&
+      rect.right > clip.left && rect.left < clip.right;
+  };
+  const normalize = (value) => typeof value === 'string'
+    ? value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase() : '';
+  const inputs = Array.from(document.querySelectorAll('input,textarea,[role="searchbox"],[role="textbox"]'))
+    .filter((element) => visible(element));
+  const searchInputs = inputs.filter((element) => {
+    const role = normalize(element.getAttribute('role'));
+    const type = normalize(element.getAttribute('type'));
+    const label = normalize(element.getAttribute('aria-label') || element.getAttribute('title'));
+    return role === 'searchbox' || type === 'search' ||
+      (['INPUT', 'TEXTAREA'].includes(element.tagName) &&
+        (role === 'textbox' || label === 'search' || label === 'search and explore'));
+  });
+  if (searchInputs.length !== 1) return {state: 'SEARCH_INPUT_UNVERIFIED'};
+  const input = searchInputs[0];
+  if (String(input.value || '') !== expectedQuery) return {state: 'SEARCH_QUERY_UNAPPLIED'};
+
+  let pageUrl;
+  try { pageUrl = new URL(window.location.href); }
+  catch (_) { return {state: 'SEARCH_ROUTE_UNSUPPORTED'}; }
+  if (pageUrl.origin !== window.location.origin) return {state: 'SEARCH_ROUTE_UNSUPPORTED'};
+  const queryValues = pageUrl.searchParams.getAll('q');
+  if (queryValues.length !== 1 || queryValues[0] !== expectedQuery) {
+    return {state: 'SEARCH_QUERY_UNAPPLIED'};
+  }
+
+  const routePath = pageUrl.pathname.replace(/\/$/, '') || '/';
+  const visibleMains = Array.from(document.querySelectorAll('main,[role="main"]'))
+    .filter((element) => visible(element));
+  const labeledSearchRegions = Array.from(document.querySelectorAll(
+    '[role="dialog"],[role="search"],[role="region"][aria-label]'
+  )).filter((element) => {
+    if (!visible(element) || !element.contains(input)) return false;
+    const role = normalize(element.getAttribute('role'));
+    const label = normalize(element.getAttribute('aria-label') || element.getAttribute('title'));
+    return role === 'search' || role === 'dialog' && label.startsWith('search') ||
+      role === 'region' && label.startsWith('search');
+  });
+  const minimalSearchRegions = labeledSearchRegions.filter((region) =>
+    !labeledSearchRegions.some((other) => other !== region && region.contains(other))
+  );
+
+  let root = null;
+  let regionKind = null;
+  if (['/search', '/explore'].includes(routePath)) {
+    const matchingMains = visibleMains.filter((main) => main.contains(input));
+    if (matchingMains.length === 1 && visibleMains.length === 1) {
+      root = matchingMains[0];
+      regionKind = 'SEARCH_ROUTE_MAIN';
+    } else if (minimalSearchRegions.length === 1) {
+      root = minimalSearchRegions[0];
+      regionKind = 'SEARCH_OVERLAY';
+    }
+  } else if (['/', '/home', '/for_you'].includes(routePath) && minimalSearchRegions.length === 1) {
+    root = minimalSearchRegions[0];
+    regionKind = 'SEARCH_OVERLAY';
+  }
+  if (!root) return {state: 'SEARCH_RESULTS_REGION_UNPROVEN'};
+
+  const filters = Array.from(root.querySelectorAll('button,[role="button"],[role="tab"],a[href]'))
+    .filter((element) => visible(element, root))
+    .filter((element) => ['top', 'recent'].includes(normalize(
+      element.getAttribute('aria-label') || element.getAttribute('title') || element.innerText || ''
+    )));
+  if (filters.length === 0) return {state: 'SEARCH_RESULTS_REGION_UNPROVEN'};
+
+  const busy = root.getAttribute('aria-busy') === 'true' ||
+    Array.from(root.querySelectorAll('[aria-busy="true"],[role="progressbar"]'))
+      .some((element) => visible(element, root));
+  const statusText = Array.from(root.querySelectorAll('[role="status"],[role="alert"]'))
+    .filter((element) => visible(element, root))
+    .map((element) => normalize(element.innerText || element.getAttribute('aria-label') || ''));
+  const noResults = statusText.some((text) =>
+    /^no results(?: found)?(?: for .+)?[.!]?$/.test(text) ||
+    /^no posts found(?: for .+)?[.!]?$/.test(text)
+  );
+  if (busy) return {state: 'SEARCH_RESULTS_LOADING', regionKind};
+
+  const postPath = /^\/@[A-Za-z0-9._:-]{1,96}\/(?:post-[A-Za-z0-9._:-]{1,128}|post\/[A-Za-z0-9._:-]{1,128})$/;
+  const profilePath = /^\/@[A-Za-z0-9._:-]{1,96}$/;
+  const semanticCard = 'article,[role="article"],[role="listitem"],li';
+  const semanticCards = Array.from(root.querySelectorAll(semanticCard)).filter((card) =>
+    visible(card, root)
+  );
+  const rootPostAnchors = Array.from(root.querySelectorAll('a[href]')).filter((anchor) => {
+    if (!visible(anchor, root) || anchor.closest('blockquote,nav,footer')) return false;
+    try {
+      const url = new URL(anchor.getAttribute('href'), window.location.href);
+      return url.origin === window.location.origin && !url.search && !url.hash && postPath.test(url.pathname);
+    } catch (_) { return false; }
+  });
+  if (rootPostAnchors.length > 300 || semanticCards.length > maxCards) {
+    return {state: 'SEARCH_RESULTS_LIMIT_EXCEEDED'};
+  }
+
+  const cards = [];
+  let boundPostAnchors = 0;
+  for (const card of semanticCards) {
+    const owns = (anchor) => anchor.closest(semanticCard) === card;
+    const anchors = Array.from(card.querySelectorAll('a[href]')).filter((anchor) =>
+      owns(anchor) && visible(anchor, root) && !anchor.closest('blockquote,nav,footer')
+    );
+    const postLinks = anchors.map((anchor) => {
+      try {
+        const url = new URL(anchor.getAttribute('href'), window.location.href);
+        return url.origin === window.location.origin && !url.search && !url.hash && postPath.test(url.pathname)
+          ? url.href : null;
+      } catch (_) { return null; }
+    }).filter((href) => typeof href === 'string');
+    if (postLinks.length === 0) continue;
+    const authorLinks = anchors.map((anchor) => {
+      try {
+        const url = new URL(anchor.getAttribute('href'), window.location.href);
+        return url.origin === window.location.origin && !url.search && !url.hash && profilePath.test(url.pathname)
+          ? url.href : null;
+      } catch (_) { return null; }
+    }).filter((href) => typeof href === 'string');
+    const uniqueAuthors = Array.from(new Set(authorLinks));
+    boundPostAnchors += postLinks.length;
+    cards.push({postLinks, headerLinks: uniqueAuthors});
+  }
+  if (boundPostAnchors !== rootPostAnchors.length) return {state: 'SEARCH_RESULTS_UNPROVEN', regionKind};
+  if (cards.length > maxCards) return {state: 'SEARCH_RESULTS_LIMIT_EXCEEDED'};
+  if (cards.length === 0) {
+    return {state: noResults ? 'SEARCH_NO_RESULTS' : 'SEARCH_RESULTS_LOADING', regionKind};
+  }
+  return {state: 'SEARCH_RESULTS_CANDIDATES', regionKind, cards};
+}
+"""
+
 _SCROLL_SCRIPT = r"""
 ((options) => {
   const searchPanel = Boolean(options && options.searchPanel === true);
@@ -1068,6 +1228,89 @@ class AsyncThreadsJobUiReader:
             raise BrowserAdapterError("SEARCH_UI_NOT_READY")
         return tuple(batches)
 
+    async def assisted_search_results(
+        self,
+        query: str,
+        *,
+        expected_actor: str,
+    ) -> tuple[UiPostTarget, ...]:
+        """Read stable visible cards only within a semantically scoped Search region."""
+
+        if not query.strip() or len(query) > _MAX_QUERY_CODEPOINTS:
+            raise BrowserAdapterError("BROWSER_QUERY_INVALID")
+        if not _USERNAME_RE.fullmatch(expected_actor):
+            raise BrowserAdapterError("BROWSER_ACTOR_INVALID")
+
+        deadline = self._readiness_deadline()
+        previous_signature: tuple[tuple[str, str], ...] | None = None
+        previous_state: str | None = None
+        stable_polls = 0
+        last_code = "SEARCH_RESULTS_REGION_UNPROVEN"
+        while True:
+            if _page_origin(self._page.url) != self._origin:
+                raise BrowserAdapterError("BROWSER_NAVIGATION_BLOCKED")
+            try:
+                payload = await self._evaluate(
+                    _ASSISTED_SEARCH_SNAPSHOT_SCRIPT,
+                    {"expectedQuery": query, "maxCards": self._max_cards_per_batch},
+                )
+                snapshot = _object(payload)
+            except BrowserReadTimeout:
+                raise BrowserAdapterError("SEARCH_UI_NOT_READY") from None
+            except BrowserAdapterError:
+                raise BrowserAdapterError("SEARCH_RESULTS_UNPROVEN") from None
+
+            state = snapshot.get("state")
+            allowed_states = {
+                "SEARCH_INPUT_UNVERIFIED",
+                "SEARCH_QUERY_UNAPPLIED",
+                "SEARCH_ROUTE_UNSUPPORTED",
+                "SEARCH_RESULTS_REGION_UNPROVEN",
+                "SEARCH_RESULTS_LOADING",
+                "SEARCH_NO_RESULTS",
+                "SEARCH_RESULTS_LIMIT_EXCEEDED",
+                "SEARCH_RESULTS_UNPROVEN",
+                "SEARCH_RESULTS_CANDIDATES",
+            }
+            if not isinstance(state, str) or state not in allowed_states:
+                raise BrowserAdapterError("SEARCH_RESULTS_UNPROVEN")
+            if state == "SEARCH_RESULTS_LIMIT_EXCEEDED":
+                raise BrowserAdapterError(state)
+            if state == "SEARCH_RESULTS_CANDIDATES":
+                raw_cards = snapshot.get("cards")
+                if not isinstance(raw_cards, list) or not raw_cards:
+                    raise BrowserAdapterError("SEARCH_RESULTS_UNPROVEN")
+                card_values = cast(list[object], raw_cards)
+                if len(card_values) > self._max_cards_per_batch:
+                    raise BrowserAdapterError("SEARCH_RESULTS_LIMIT_EXCEEDED")
+                targets = tuple(self._decode_card(card) for card in card_values)
+                signature = tuple(
+                    (target.canonical_post_url, target.author_username) for target in targets
+                )
+                stable_polls = stable_polls + 1 if signature == previous_signature else 0
+                if stable_polls >= 1:
+                    return targets
+                previous_signature = signature
+                previous_state = state
+                last_code = "SEARCH_RESULTS_UNSTABLE"
+            elif state == "SEARCH_NO_RESULTS":
+                stable_polls = stable_polls + 1 if previous_state == state else 0
+                previous_signature = None
+                previous_state = state
+                last_code = state
+                if stable_polls >= 1:
+                    raise BrowserAdapterError(state)
+            else:
+                stable_polls = 0
+                previous_signature = None
+                previous_state = state
+                last_code = state
+
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise BrowserAdapterError(last_code)
+            await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
+
     async def _open_search_panel(self, query: str, *, expected_actor: str) -> None:
         home_url = f"{self._origin}/"
         if self._page.url != home_url:
@@ -1118,10 +1361,45 @@ class AsyncThreadsJobUiReader:
     ) -> UiPostDetail:
         """Read one exact root post with B1's same-card author/body rules."""
 
+        return await self._read_exact_post(
+            target, expected_actor=expected_actor, current_page=False
+        )
+
+    async def read_current_exact_post(
+        self,
+        target: str,
+        *,
+        expected_actor: str,
+    ) -> UiPostDetail:
+        """Read the currently open exact post without navigating or changing user state."""
+
+        return await self._read_exact_post(target, expected_actor=expected_actor, current_page=True)
+
+    async def _read_exact_post(
+        self,
+        target: str,
+        *,
+        expected_actor: str,
+        current_page: bool,
+    ) -> UiPostDetail:
+
         canonical_target, target_path, _ = _parse_post_target(target, self._origin)
         if not _USERNAME_RE.fullmatch(expected_actor):
             raise BrowserAdapterError("BROWSER_ACTOR_INVALID")
-        await self._goto(canonical_target)
+        if current_page:
+            try:
+                current = urlsplit(self._page.url)
+            except ValueError:
+                raise BrowserAdapterError("DETAIL_PROVENANCE_UNVERIFIED") from None
+            if (
+                _page_origin(self._page.url) != self._origin
+                or current.path != target_path
+                or current.query
+                or current.fragment
+            ):
+                raise BrowserAdapterError("DETAIL_PROVENANCE_UNVERIFIED")
+        else:
+            await self._goto(canonical_target)
         state, page_url = await self._page_state(
             expected_path=target_path,
             expected_query=None,

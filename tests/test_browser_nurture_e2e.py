@@ -730,16 +730,70 @@ def _offline_live_pages(actor: str) -> dict[str, str]:
     return pages
 
 
+def _manual_assist_pages(actor: str, *, scoped_search: bool = True) -> dict[str, str]:
+    target = _target("001").replace(_ORIGIN, "")
+    card = (
+        '<article><header><a href="/@synthetic.author">@synthetic.author</a>'
+        f'<a id="selected-post-link" href="{target}">time</a></header>'
+        f'<div dir="auto">{_BODIES["001"]}</div></article>'
+    )
+    root_open = (
+        '<div role="dialog" aria-label="Search">'
+        if scoped_search
+        else '<div class="search-overlay">'
+    )
+    root_close = "</div>"
+    search = (
+        "<!doctype html><html><head><meta charset=utf-8></head><body>"
+        '<nav role="navigation"><a href="/@'
+        f'{actor}" aria-label="Profile">Profile</a></nav>'
+        '<main><article><header><a href="/@home.author">@home.author</a>'
+        '<a id="home-only-link" href="/@home.author/post/home-only">time</a></header>'
+        "<div dir=auto>Home feed must stay outside Search results.</div></article></main>"
+        f"{root_open}"
+        '<input type="search" role="searchbox" aria-label="Search" value="design">'
+        '<div role="tablist"><button role="tab" aria-selected="true">Top</button>'
+        '<button role="tab" aria-selected="false">Recent</button></div>'
+        f'<section role="region" aria-label="Search results">{card}</section>{root_close}'
+        "</body></html>"
+    )
+    detail = (
+        "<!doctype html><html><head><meta charset=utf-8></head><body>"
+        f'<nav role="navigation"><a href="/@{actor}" aria-label="Profile">Profile</a></nav>'
+        '<main><article><header><a href="/@synthetic.author">@synthetic.author</a>'
+        f'<a href="{target}">time</a></header><div dir="auto">{_BODIES["001"]}</div>'
+        "</article></main></body></html>"
+    )
+    other_detail = (
+        "<!doctype html><html><head><meta charset=utf-8></head><body>"
+        f'<nav role="navigation"><a href="/@{actor}" aria-label="Profile">Profile</a></nav>'
+        '<main><article><header><a href="/@home.author">@home.author</a>'
+        '<a href="/@home.author/post/home-only">time</a></header>'
+        "<div dir=auto>Home-only synthetic content.</div></article></main></body></html>"
+    )
+    return {
+        f"{BROWSER_FEED_ORIGIN}/": _two_area_home(actor),
+        f"{BROWSER_FEED_ORIGIN}/search?q=design": search,
+        f"{BROWSER_FEED_ORIGIN}{target}": detail,
+        f"{BROWSER_FEED_ORIGIN}/@home.author/post/home-only": other_detail,
+    }
+
+
 def _install_offline_live_browser_transport(
     monkeypatch: pytest.MonkeyPatch,
     pages: dict[str, str],
+    *,
+    opened_sessions: list[Any] | None = None,
 ) -> list[str]:
     original_open = playwright_engine_module.PlaywrightBrowserEngine.open
     requested_urls: list[str] = []
 
     async def headless_chromium_for_test(engine: Any, request: BrowserLaunchRequest) -> Any:
         assert request.headless is False
-        return await original_open(engine, replace(request, headless=True))
+        session = await original_open(engine, replace(request, headless=True))
+        if opened_sessions is not None:
+            opened_sessions.append(session)
+        return session
 
     async def fulfill_offline_pages(_session: Any, route: Any) -> None:
         url = route.request.url
@@ -1857,3 +1911,213 @@ def test_long_lived_profile_lease_excludes_existing_one_shot_browser_commands(
             assert caught.value.code == "ACCOUNT_BUSY"
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("clicked_link", "expected_status", "expected_read_count"),
+    [
+        ("selected-post-link", "COMPLETE", 1),
+        ("home-only-link", "STOPPED", 0),
+    ],
+)
+def test_manual_assist_reads_only_a_trusted_search_result_and_preserves_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    clicked_link: str,
+    expected_status: str,
+    expected_read_count: int,
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / f"manual-assist-{expected_status.casefold()}-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _manual_assist_pages(actor)
+    opened_sessions: list[Any] = []
+    requested_urls = _install_offline_live_browser_transport(
+        monkeypatch,
+        pages,
+        opened_sessions=opened_sessions,
+    )
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", os.fspath(root))
+
+    checkpoint_path = root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json"
+    state = BrowserNurtureStateStore(root)
+    config = state.load_config(account.id)
+    assert config is not None
+    checkpoint = state.load_checkpoint(
+        account.id,
+        policy_fingerprint=browser_nurture_policy_fingerprint(config),
+    )
+    state.save_checkpoint(replace(checkpoint, completed_cycles=1, scanned=1))
+    checkpoint_before = checkpoint_path.read_bytes()
+
+    from threads_platform.standalone import __main__ as cli_module
+
+    monkeypatch.setattr(cli_module, "_browser_nurture_interactive_console", lambda: True)
+    prompt_count = 0
+    decision_prompt_count = 0
+
+    async def operator_input(*, timeout_seconds: float) -> str | None:
+        nonlocal decision_prompt_count, prompt_count
+        if prompt_count >= 2:
+            assert timeout_seconds == 60
+            assert not opened_sessions[-1]._page.is_closed()
+            if clicked_link == "home-only-link" and decision_prompt_count == 0:
+                decision_prompt_count += 1
+                return "K\n"
+            return "\n"
+        assert timeout_seconds == 300
+        page = opened_sessions[-1]._page
+        if prompt_count == 0:
+            await page.goto(f"{BROWSER_FEED_ORIGIN}/search?q=design")
+        elif prompt_count == 1:
+            await page.locator(f"#{clicked_link}").click()
+        prompt_count += 1
+        return "\n"
+
+    monkeypatch.setattr(cli_module, "_read_terminal_line", operator_input)
+    exit_code = cli_module.main(
+        (
+            "browser-nurture",
+            "manual-assist",
+            account.alias,
+            "--confirm-live-read-only",
+        )
+    )
+
+    output = capsys.readouterr()
+    assert exit_code == 0, output.out + output.err
+    assert f"status={expected_status}" in output.out
+    assert "search_candidates=1" in output.out
+    assert f"posts_read={expected_read_count}" in output.out
+    assert "checkpoint=UNCHANGED effects=NONE" in output.out
+    assert "ACTION CLOSE_BROWSER browser=OPEN" in output.out
+    assert checkpoint_path.read_bytes() == checkpoint_before
+    assert requested_urls
+    assert set(requested_urls).issubset(pages)
+    assert all(
+        secret not in output.out + output.err
+        for secret in (
+            actor,
+            "synthetic.author",
+            "Home feed must stay outside Search results.",
+            _BODIES["001"],
+            "/@synthetic.author/post/001",
+            "design",
+        )
+    )
+    if clicked_link == "home-only-link":
+        assert "DETAIL_SELECTION_NOT_IN_RESULTS chromium=OPEN stage=DETAIL" in output.err
+        assert "classification=UNKNOWN body=NOT_READ" in output.out
+    else:
+        assert "search_region=VERIFIED search_candidates=1" in output.out
+        assert "classification=RELEVANT body=FULL_VISIBLE" in output.out
+        assert "ERROR " not in output.err
+
+
+def test_manual_assist_rejects_unscoped_search_container_without_reading_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_local_chromium()
+    root = tmp_path / "manual-assist-unscoped-root"
+    _secure_directory(root)
+    actor = "offline.operator"
+    account = _create_browser_source_account(root, actor)
+    pages = _manual_assist_pages(actor, scoped_search=False)
+    opened_sessions: list[Any] = []
+    requested_urls = _install_offline_live_browser_transport(
+        monkeypatch,
+        pages,
+        opened_sessions=opened_sessions,
+    )
+    monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", os.fspath(root))
+    monkeypatch.setattr(ui_reader_module, "_READINESS_TIMEOUT_MS", 250)
+
+    from threads_platform.standalone import __main__ as cli_module
+
+    monkeypatch.setattr(cli_module, "_browser_nurture_interactive_console", lambda: True)
+    prompt_count = 0
+
+    async def operator_input(*, timeout_seconds: float) -> str | None:
+        nonlocal prompt_count
+        if prompt_count == 0:
+            assert timeout_seconds == 300
+            await opened_sessions[-1]._page.goto(f"{BROWSER_FEED_ORIGIN}/search?q=design")
+            prompt_count += 1
+            return "\n"
+        assert timeout_seconds == 60
+        assert not opened_sessions[-1]._page.is_closed()
+        if prompt_count == 1:
+            prompt_count += 1
+            return "K\n"
+        return None
+
+    monkeypatch.setattr(cli_module, "_read_terminal_line", operator_input)
+    exit_code = cli_module.main(
+        (
+            "browser-nurture",
+            "manual-assist",
+            account.alias,
+            "--confirm-live-read-only",
+        )
+    )
+
+    output = capsys.readouterr()
+    assert exit_code == 0
+    assert "SEARCH_RESULTS_REGION_UNPROVEN chromium=OPEN stage=SEARCH" in output.err
+    assert "status=STOPPED" in output.out
+    assert "search_region=NOT_VERIFIED search_candidates=0 posts_read=0" in output.out
+    assert "checkpoint=UNCHANGED effects=NONE" in output.out
+    assert "CLOSE_CONFIRMATION_TIMEOUT chromium=OPEN action=AUTO_CLOSE" in output.err
+    assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
+    assert "Home feed must stay outside Search results." not in output.out + output.err
+    assert "Home-only synthetic content." not in output.out + output.err
+    assert all(url in pages for url in requested_urls)
+
+
+def test_manual_assist_terminal_wait_is_bounded_without_blocking_async_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from threading import Event
+
+    from threads_platform.standalone import __main__ as cli_module
+
+    release = Event()
+    reader_started = Event()
+
+    class DelayedInput:
+        def readline(self) -> str:
+            reader_started.set()
+            release.wait(timeout=2)
+            return "continue\n"
+
+    monkeypatch.setattr(cli_module.sys, "stdin", DelayedInput())
+
+    async def responsive_read() -> str | None:
+        read_task = asyncio.create_task(cli_module._read_terminal_line(timeout_seconds=1))
+        await asyncio.sleep(0.02)
+        assert reader_started.is_set()
+        assert not read_task.done()
+        release.set()
+        return await read_task
+
+    assert asyncio.run(responsive_read()) == "continue\n"
+
+    release.clear()
+    reader_started.clear()
+
+    async def bounded_read() -> tuple[str | None, float]:
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        value = await cli_module._read_terminal_line(timeout_seconds=0.02)
+        return value, loop.time() - started_at
+
+    value, elapsed = asyncio.run(bounded_read())
+    release.set()
+    assert reader_started.is_set()
+    assert value is None
+    assert elapsed < 0.2

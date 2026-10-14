@@ -44,6 +44,7 @@ from threads_platform.browser.threads_job_ui_reader import (
     UiFeedBatch,
     UiPageState,
     UiPostDetail,
+    UiPostTarget,
 )
 from threads_platform.browser.ui_diagnostic import (
     DIAGNOSTIC_SCRIPT,
@@ -54,6 +55,7 @@ from threads_platform.browser.ui_diagnostic import (
 
 _MAX_SYNTHETIC_FIXTURE_PAGES = 128
 _MAX_SYNTHETIC_FIXTURE_HTML_CODEPOINTS = 1_100_000
+_MANUAL_ASSIST_CLICK_TIMEOUT_SECONDS = 20
 
 _FEED_SCAN_SCRIPT = r"""
 ({allowedOrigin, candidateBound}) => {
@@ -552,6 +554,119 @@ class _PlaywrightBrowserSession:
         self._ensure_alive()
         try:
             result = await self._get_async_ui_reader(origin).read_exact_post(
+                target,
+                expected_actor=expected_actor,
+            )
+        except BrowserAdapterError:
+            self._ensure_alive()
+            await self._raise_ui_policy_error()
+            raise
+        self._ensure_alive()
+        await self._raise_ui_policy_error()
+        return result
+
+    async def assisted_search_ui_results(
+        self,
+        query: str,
+        *,
+        expected_actor: str,
+        origin: str,
+    ) -> tuple[UiPostTarget, ...]:
+        self._ensure_alive()
+        try:
+            result = await self._get_async_ui_reader(origin).assisted_search_results(
+                query,
+                expected_actor=expected_actor,
+            )
+        except BrowserAdapterError:
+            self._ensure_alive()
+            await self._raise_ui_policy_error()
+            raise
+        self._ensure_alive()
+        await self._raise_ui_policy_error()
+        return result
+
+    async def wait_for_assisted_post_click(
+        self,
+        candidates: tuple[UiPostTarget, ...],
+        *,
+        origin: str,
+    ) -> str:
+        """Bind one trusted Search-result click to the currently opened same-origin post."""
+
+        self._ensure_alive()
+        normalized_origin = _normalized_browser_origin(origin)
+        if (
+            normalized_origin not in {BROWSER_FEED_ORIGIN, "https://threads.example.invalid"}
+            or self._allowed_navigation_origins != frozenset({normalized_origin})
+            or not candidates
+        ):
+            raise UnsupportedUIState()
+        paths: dict[str, str] = {}
+        for candidate in candidates:
+            parsed = urlsplit(candidate.canonical_post_url)
+            if (
+                _normalized_browser_origin(candidate.canonical_post_url) != normalized_origin
+                or parsed.query
+                or parsed.fragment
+                or not re.fullmatch(
+                    r"/@[A-Za-z0-9._:-]{1,96}/(?:post-[A-Za-z0-9._:-]{1,128}|post/[A-Za-z0-9._:-]{1,128})",
+                    parsed.path,
+                )
+            ):
+                raise BrowserAdapterError("SEARCH_RESULTS_UNPROVEN")
+            paths[parsed.path] = candidate.canonical_post_url
+        if len(paths) != len(candidates):
+            raise BrowserAdapterError("SEARCH_RESULTS_UNPROVEN")
+
+        if (
+            self._ui_diagnostic_click_armed_route != "SEARCH"
+            and self._ui_diagnostic_operator_click is None
+        ):
+            raise UnsupportedUIState()
+        deadline = asyncio.get_running_loop().time() + _MANUAL_ASSIST_CLICK_TIMEOUT_SECONDS
+        while True:
+            self._ensure_alive()
+            await self._raise_navigation_policy_error()
+            click = self._ui_diagnostic_operator_click
+            clicked_path = self._ui_diagnostic_operator_click_path
+            if click is not None:
+                if (
+                    click.get("source_route") != "SEARCH"
+                    or click.get("is_post_permalink") is not True
+                    or clicked_path not in paths
+                ):
+                    raise BrowserAdapterError("DETAIL_SELECTION_NOT_IN_RESULTS")
+                try:
+                    current = urlsplit(self._page.url)
+                except ValueError:
+                    raise BrowserAdapterError("DETAIL_PROVENANCE_UNVERIFIED") from None
+                if (
+                    _normalized_browser_origin(self._page.url) != normalized_origin
+                    or current.path != clicked_path
+                    or current.query
+                    or current.fragment
+                ):
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise BrowserAdapterError("DETAIL_PROVENANCE_UNVERIFIED")
+                else:
+                    return paths[clicked_path]
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise BrowserAdapterError("DETAIL_SELECTION_UNVERIFIED")
+            await asyncio.sleep(min(0.1, remaining))
+
+    async def read_current_ui_post(
+        self,
+        target: str,
+        *,
+        expected_actor: str,
+        origin: str,
+    ) -> UiPostDetail:
+        self._ensure_alive()
+        try:
+            result = await self._get_async_ui_reader(origin).read_current_exact_post(
                 target,
                 expected_actor=expected_actor,
             )
