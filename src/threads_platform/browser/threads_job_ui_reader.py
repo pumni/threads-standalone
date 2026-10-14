@@ -1523,7 +1523,12 @@ class AsyncThreadsJobUiReader:
         if state is not UiPageState.READY:
             raise BrowserAdapterError("HOME_UI_NOT_READY")
         try:
-            await self._goto(f"{self._origin}/search")
+            search_url = f"{self._origin}/search?{urlencode({'q': query})}"
+            await self._goto(search_url)
+            if _page_origin(self._page.url) != self._origin:
+                raise BrowserAdapterError("BROWSER_NAVIGATION_BLOCKED")
+            if not _search_url_matches_query(self._page.url, self._origin, query):
+                raise BrowserAdapterError("SEARCH_NAVIGATION_FAILED")
             inputs = self._page.locator(
                 'input[type="search"]:visible, [role="searchbox"]:visible, '
                 'input[role="textbox"][aria-label="Search" i]:visible, '
@@ -1539,19 +1544,6 @@ class AsyncThreadsJobUiReader:
                     raise BrowserAdapterError("SEARCH_INPUT_UNVERIFIED")
                 remaining = input_deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
-                    raise BrowserAdapterError("SEARCH_INPUT_UNVERIFIED")
-                await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
-            await inputs.wait_for(state="visible", timeout=self._timeout_ms)
-            await inputs.fill(query)
-            input_deadline = self._readiness_deadline()
-            while True:
-                if _page_origin(self._page.url) != self._origin:
-                    raise BrowserAdapterError("BROWSER_NAVIGATION_BLOCKED")
-                input_count = await inputs.count()
-                if input_count > 1:
-                    raise BrowserAdapterError("SEARCH_INPUT_UNVERIFIED")
-                remaining = input_deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
                     raise BrowserAdapterError("SEARCH_INPUT_VALUE_UNCONFIRMED")
                 if input_count == 1:
                     try:
@@ -1562,12 +1554,7 @@ class AsyncThreadsJobUiReader:
                         input_value = None
                     if input_value == query:
                         break
-                remaining = input_deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise BrowserAdapterError("SEARCH_INPUT_VALUE_UNCONFIRMED")
                 await self._wait_for_render(remaining_ms=max(1, int(remaining * 1000)))
-            await inputs.press("Enter", timeout=self._timeout_ms)
-            await self._wait_for_applied_search_query(query)
             self._applied_search_query = query
         except BrowserAdapterError:
             raise
@@ -1581,24 +1568,6 @@ class AsyncThreadsJobUiReader:
             if self._page.is_closed():
                 raise BrowserProcessCrashed() from None
             raise BrowserAdapterError("SEARCH_NAVIGATION_FAILED") from None
-
-    async def _wait_for_applied_search_query(self, query: str) -> None:
-        deadline = self._readiness_deadline()
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            raise BrowserAdapterError("SEARCH_SUBMIT_NOT_APPLIED")
-        try:
-            await self._page.wait_for_url(
-                lambda value: _search_url_matches_query(value, self._origin, query),
-                wait_until="commit",
-                timeout=max(1, min(self._timeout_ms, int(remaining * 1000))),
-            )
-        except AsyncPlaywrightTimeoutError:
-            if _page_origin(self._page.url) != self._origin:
-                raise BrowserAdapterError("BROWSER_NAVIGATION_BLOCKED") from None
-            raise BrowserAdapterError("SEARCH_SUBMIT_NOT_APPLIED") from None
-        if _page_origin(self._page.url) != self._origin:
-            raise BrowserAdapterError("BROWSER_NAVIGATION_BLOCKED")
 
     async def read_exact_post(
         self,

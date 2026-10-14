@@ -1080,6 +1080,8 @@ def test_browser_nurture_smoke_automates_search_and_reads_one_generic_result_wit
     state = BrowserNurtureStateStore(root)
     config = state.load_config(account.id)
     assert config is not None
+    query = "design & systems"
+    state.save_config(replace(config, topics=(query, *config.topics[1:])))
     state.save_checkpoint(
         BrowserNurtureCheckpointV2(
             account_uuid=account.id,
@@ -1096,9 +1098,10 @@ def test_browser_nurture_smoke_automates_search_and_reads_one_generic_result_wit
     checkpoint_before = checkpoint_path.read_bytes()
 
     pages = _offline_live_pages(actor)
-    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = _generic_search_results(
+    search_url = f"{BROWSER_FEED_ORIGIN}/search?{urlencode({'q': query})}"
+    pages[search_url] = _generic_search_results(
         actor,
-        "design",
+        query,
         _visual_card("001"),
     )
     exit_code, output, requested_urls = _run_offline_browser_source_cli(
@@ -1115,11 +1118,7 @@ def test_browser_nurture_smoke_automates_search_and_reads_one_generic_result_wit
     assert output.err == ""
     assert "AUTO_READ status=COMPLETE reason=NONE posts_read=1" in output.out
     assert "classification=RELEVANT checkpoint=UNCHANGED" in output.out
-    assert requested_urls[:3] == [
-        f"{BROWSER_FEED_ORIGIN}/",
-        f"{BROWSER_FEED_ORIGIN}/search",
-        f"{BROWSER_FEED_ORIGIN}/search?q=design",
-    ]
+    assert requested_urls[:2] == [f"{BROWSER_FEED_ORIGIN}/", search_url]
     assert requested_urls.count(detail_url) == 1
     assert len([url for url in requested_urls if "/post/" in url]) == 1
     assert set(requested_urls).issubset(pages)
@@ -1129,7 +1128,7 @@ def test_browser_nurture_smoke_automates_search_and_reads_one_generic_result_wit
         for private_value in (
             account.alias,
             actor,
-            "design",
+            query,
             _BODIES["001"],
             detail_url,
             BROWSER_FEED_ORIGIN,
@@ -1137,7 +1136,7 @@ def test_browser_nurture_smoke_automates_search_and_reads_one_generic_result_wit
     )
 
 
-def test_browser_nurture_smoke_waits_for_delayed_search_commit_and_stable_ui(
+def test_browser_nurture_smoke_waits_for_delayed_search_input_hydration_and_stable_ui(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1167,23 +1166,11 @@ def test_browser_nurture_smoke_waits_for_delayed_search_commit_and_stable_ui(
     search_html = search_html.replace(
         "</body>",
         """<script>
-        const form = document.querySelector('form');
-        const input = form.querySelector('input');
-        input.addEventListener('input', () => {
-          const expected = input.value;
-          input.value = '';
-          setTimeout(() => { input.value = expected; }, 400);
-        });
-        form.addEventListener('submit', (event) => {
-          event.preventDefault();
-          const query = input.value;
-          setTimeout(() => {
-            history.pushState({}, '', '/search?q=' + encodeURIComponent(query));
-          }, 700);
-        });
+        const input = document.querySelector('input');
+        setTimeout(() => { input.value = 'design'; }, 400);
         </script></body>""",
     )
-    pages[f"{BROWSER_FEED_ORIGIN}/search"] = search_html
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = search_html
 
     exit_code, output, requested_urls = _run_offline_browser_source_cli(
         root,
@@ -1198,13 +1185,16 @@ def test_browser_nurture_smoke_waits_for_delayed_search_commit_and_stable_ui(
     assert exit_code == 0, output.out + output.err
     assert "AUTO_READ status=COMPLETE reason=NONE posts_read=1" in output.out
     assert "checkpoint=UNCHANGED" in output.out
-    assert requested_urls[:2] == [f"{BROWSER_FEED_ORIGIN}/", f"{BROWSER_FEED_ORIGIN}/search"]
+    assert requested_urls[:2] == [
+        f"{BROWSER_FEED_ORIGIN}/",
+        f"{BROWSER_FEED_ORIGIN}/search?q=design",
+    ]
     assert requested_urls.count(detail_url) == 1
     assert checkpoint_path.read_bytes() == checkpoint_before
     assert "design" not in output.out + output.err
 
 
-def test_browser_nurture_smoke_distinguishes_search_submit_timeout_without_checkpoint(
+def test_browser_nurture_smoke_rejects_search_url_without_matching_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1216,11 +1206,14 @@ def test_browser_nurture_smoke_distinguishes_search_submit_timeout_without_check
     actor = "offline.operator"
     account = _create_browser_source_account(root, actor)
     pages = _offline_live_pages(actor)
-    search_html = _search_panel(actor, _visual_card("001"), query="")
-    pages[f"{BROWSER_FEED_ORIGIN}/search"] = search_html.replace(
-        "</body>",
-        "<script>document.querySelector('form').addEventListener('submit', "
-        "event => event.preventDefault());</script></body>",
+    search_html = _generic_search_results(
+        actor,
+        "",
+        _visual_card("001"),
+    )
+    pages[f"{BROWSER_FEED_ORIGIN}/search?q=design"] = search_html.replace(
+        '<input type="text" name="q" role="textbox" aria-label="Search" value="">',
+        "",
     )
 
     exit_code, output, requested_urls = _run_offline_browser_source_cli(
@@ -1233,9 +1226,14 @@ def test_browser_nurture_smoke_distinguishes_search_submit_timeout_without_check
     )
 
     assert exit_code == 1
-    assert "AUTO_READ status=STOPPED reason=SEARCH_SUBMIT_NOT_APPLIED posts_read=0" in output.out
+    assert (
+        "AUTO_READ status=STOPPED reason=SEARCH_INPUT_VALUE_UNCONFIRMED posts_read=0" in output.out
+    )
     assert "checkpoint=UNCHANGED" in output.out
-    assert requested_urls == [f"{BROWSER_FEED_ORIGIN}/", f"{BROWSER_FEED_ORIGIN}/search"]
+    assert requested_urls == [
+        f"{BROWSER_FEED_ORIGIN}/",
+        f"{BROWSER_FEED_ORIGIN}/search?q=design",
+    ]
     assert not (root / "browser_nurture_v2" / "checkpoints" / f"{account.id}.json").exists()
     assert "design" not in output.out + output.err
 
