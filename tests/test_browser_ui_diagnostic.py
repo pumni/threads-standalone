@@ -204,6 +204,7 @@ def test_synthetic_chromium_home_search_detail_report_is_private(tmp_path: Path)
     search_url = f"{_SYNTHETIC_ORIGIN}/search"
     query_url = f"{_SYNTHETIC_ORIGIN}/?q={quote(_PRIVATE_QUERY, safe='')}"
     detail_url = f"{_SYNTHETIC_ORIGIN}/@{_PRIVATE_CANDIDATE}/post/{_PRIVATE_POST_ID}"
+    unknown_detail_url = f"{_SYNTHETIC_ORIGIN}/thread/{_PRIVATE_POST_ID}"
     visibility_url = f"{_SYNTHETIC_ORIGIN}/visibility"
     home_html = f"""
       <nav role="navigation" aria-label="Primary">
@@ -211,6 +212,8 @@ def test_synthetic_chromium_home_search_detail_report_is_private(tmp_path: Path)
         <button aria-label="Search">Search</button>
         <a href="/@{_PRIVATE_USERNAME.upper()}" aria-label="Profile">Profile</a>
       </nav>
+      <div role="dialog"><form><input role="searchbox" aria-label="Search"
+        value="{_PRIVATE_QUERY}"></form></div>
       <main><article><header>
         <a href="/@{_PRIVATE_CANDIDATE}">@{_PRIVATE_CANDIDATE}</a>
         <a href="/@{_PRIVATE_CANDIDATE}/post/{_PRIVATE_POST_ID}">time</a>
@@ -249,6 +252,7 @@ def test_synthetic_chromium_home_search_detail_report_is_private(tmp_path: Path)
         search_url: search_html,
         query_url: query_url_html,
         detail_url: detail_html,
+        unknown_detail_url: detail_html,
         visibility_url: visibility_html,
     }
 
@@ -281,6 +285,25 @@ def test_synthetic_chromium_home_search_detail_report_is_private(tmp_path: Path)
                     configured_topic=_PRIVATE_QUERY,
                 )
                 reports.append(snapshot.to_document())
+            await session.navigate(home_url, allowed_origins=frozenset({_SYNTHETIC_ORIGIN}))
+            home_overlay = await wait_for_stable_ui_snapshot(
+                cast(BrowserUiDiagnosticSession, session),
+                stage="search",
+                expected_username=_PRIVATE_USERNAME,
+                configured_topic=_PRIVATE_QUERY,
+            )
+            reports.append(home_overlay.to_document())
+            await session.navigate(
+                unknown_detail_url,
+                allowed_origins=frozenset({_SYNTHETIC_ORIGIN}),
+            )
+            unknown_detail = await wait_for_stable_ui_snapshot(
+                cast(BrowserUiDiagnosticSession, session),
+                stage="detail",
+                expected_username=_PRIVATE_USERNAME,
+                configured_topic=_PRIVATE_QUERY,
+            )
+            reports.append(unknown_detail.to_document())
             await session.navigate(query_url, allowed_origins=frozenset({_SYNTHETIC_ORIGIN}))
             url_snapshot = await session.inspect_ui_diagnostic(
                 expected_username=_PRIVATE_USERNAME,
@@ -299,7 +322,7 @@ def test_synthetic_chromium_home_search_detail_report_is_private(tmp_path: Path)
 
     reports = asyncio.run(observe_pages())
 
-    home, search, detail, query_from_url, visibility = reports
+    home, search, detail, home_overlay, unknown_detail, query_from_url, visibility = reports
     assert home["route_class"] == "HOME"
     assert home["self_profile_match"] is True
     assert search["route_class"] == "SEARCH"
@@ -320,6 +343,11 @@ def test_synthetic_chromium_home_search_detail_report_is_private(tmp_path: Path)
         relation["relation"] == "DETAIL_POST_AND_AUTHOR_SHARE_CONTAINER"
         for relation in detail_relations
     )
+    assert home_overlay["route_class"] == "HOME"
+    assert home_overlay["query_match"] is True
+    assert cast(dict[str, object], home_overlay["counts"])["visible_candidates"] != "ZERO"
+    assert unknown_detail["route_class"] == "OTHER"
+    assert cast(dict[str, object], unknown_detail["counts"])["article_landmarks"] == "ONE"
     visibility_counts = cast(dict[str, object], visibility["counts"])
     assert visibility_counts["search_controls"] == "ONE"
     assert visibility_counts["offscreen_candidates"] == "ONE"
@@ -509,12 +537,10 @@ def test_diagnostic_holds_existing_account_lock_and_never_changes_checkpoint(
             async with competing_runtime.own_browser_profile(account.alias):
                 pytest.fail("a second browser session acquired the same profile")
         await asyncio.sleep(0.01)
-        if "Home checkpoint" in prompt:
+        if "Home checkpoint" in prompt or "Search checkpoint" in prompt:
             engine.sessions[0].route_class = "HOME"
-        elif "Search checkpoint" in prompt:
-            engine.sessions[0].route_class = "SEARCH"
         elif "Detail checkpoint" in prompt:
-            engine.sessions[0].route_class = "POST"
+            engine.sessions[0].route_class = "OTHER"
         assert "OBSERVE" in choices
         return "OBSERVE"
 
@@ -524,6 +550,13 @@ def test_diagnostic_holds_existing_account_lock_and_never_changes_checkpoint(
     )
 
     assert report["status"] == "COMPLETE"
+    assert _report_stage(report, "home")["stage_context"] == "ROUTE_MATCH"
+    search_report = _report_stage(report, "search")
+    detail_report = _report_stage(report, "detail")
+    assert search_report["route_class"] == "HOME"
+    assert search_report["stage_context"] == "UNVERIFIED"
+    assert detail_report["route_class"] == "OTHER"
+    assert detail_report["stage_context"] == "UNVERIFIED"
     assert len(calls) == 4
     assert len(engine.sessions) == 1
     assert len(engine.sessions[0].observations) == 3 * 4

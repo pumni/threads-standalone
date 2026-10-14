@@ -77,6 +77,7 @@ BROWSER_TESTS = (
     "test_browser_runtime.py",
     "test_browser_security.py",
     "test_browser_semantics.py",
+    "test_browser_ui_diagnostic.py",
     "test_browser_ui_reader_e2e.py",
     "test_recruitment_browser_jobs_cli.py",
     "test_recruitment_job_store.py",

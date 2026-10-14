@@ -213,10 +213,8 @@ def _set_stage(
     stages[stage] = value
 
 
-def _render_ready(snapshot: UiDiagnosticSnapshot, stage: str) -> bool:
+def _render_ready(snapshot: UiDiagnosticSnapshot) -> bool:
     if snapshot.status != "OBSERVED" or not snapshot.document_ready:
-        return False
-    if snapshot.route_class != _STAGE_ROUTES[stage]:
         return False
     counts = dict(snapshot.counts)
     if counts.get("visible_candidates") == "ZERO":
@@ -245,7 +243,7 @@ async def wait_for_stable_ui_snapshot(
         )
         if snapshot.status == "NODE_BOUND_EXCEEDED":
             raise BrowserRuntimeUnavailable("NODE_BOUND_EXCEEDED")
-        if _render_ready(snapshot, stage):
+        if _render_ready(snapshot):
             if snapshot == previous:
                 stable_samples += 1
             else:
@@ -417,7 +415,15 @@ async def run_browser_ui_diagnostic(
                         _set_stage(
                             report,
                             stage,
-                            {**snapshot.to_document(), "stability": "STABLE"},
+                            {
+                                **snapshot.to_document(),
+                                "stability": "STABLE",
+                                "stage_context": (
+                                    "ROUTE_MATCH"
+                                    if snapshot.route_class == _STAGE_ROUTES[stage]
+                                    else "UNVERIFIED"
+                                ),
+                            },
                         )
                         break
 
