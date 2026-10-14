@@ -4,7 +4,7 @@ import asyncio
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 from playwright.async_api import (
@@ -188,6 +188,110 @@ _THREAD_OPEN_SCRIPT = r"""
 }
 """
 
+
+_OPERATOR_CLICK_OBSERVER_SCRIPT = r"""
+(() => {
+  const stateKey = '__threadsLocalUiDiagnosticClickState';
+  if (window[stateKey] && window[stateKey].installed === true) return;
+  const state = {installed: true, armed: false, expectedOrigin: null, sourceRoute: null};
+  const safeTag = (element) => [
+    'A', 'BUTTON', 'INPUT', 'TEXTAREA', 'NAV', 'MAIN', 'ARTICLE', 'HEADER',
+    'SECTION', 'ASIDE', 'DIV', 'FORM'
+  ].includes(element.tagName) ? element.tagName : 'OTHER';
+  const safeRole = (element) => {
+    const role = (element.getAttribute('role') || '').trim().toLowerCase();
+    if (role === 'button') return 'BUTTON';
+    if (role === 'link') return 'LINK';
+    if (element.tagName === 'BUTTON') return 'BUTTON';
+    if (element.tagName === 'A') return 'LINK';
+    return 'OTHER';
+  };
+  const safeLabel = (element) => {
+    const name = (element.getAttribute('aria-label') || element.getAttribute('title') || '')
+      .replace(/\s+/g, ' ').trim().toLowerCase();
+    if (name === 'search' || name === 'search and explore') return 'SEARCH';
+    if (['profile', 'your profile', 'my profile', 'account', 'your account'].includes(name)) {
+      return 'PROFILE';
+    }
+    if (name === 'home') return 'HOME';
+    if (name === 'for you') return 'FOR_YOU';
+    if (name === 'top') return 'TOP';
+    if (name === 'recent') return 'RECENT';
+    return 'OTHER';
+  };
+  const visible = (element) => {
+    let current = element;
+    for (let depth = 0; current && depth < 32; current = current.parentElement, depth += 1) {
+      if (current.hidden || current.getAttribute('aria-hidden') === 'true') return false;
+      const style = window.getComputedStyle(current);
+      if (style.display === 'none' || style.visibility === 'hidden' ||
+          style.visibility === 'collapse' || style.contentVisibility === 'hidden' ||
+          current.hasAttribute('inert') || Number.parseFloat(style.opacity) === 0) return false;
+    }
+    if (current !== null) return false;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.left < window.innerWidth &&
+      rect.bottom > 0 && rect.top < window.innerHeight;
+  };
+  const routeClass = () => {
+    if (window.location.origin !== state.expectedOrigin) return 'OTHER';
+    const path = window.location.pathname.replace(/\/$/, '') || '/';
+    if (/^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}$/i.test(path)) return 'POST';
+    if (/\/(search|explore)(\/|$)/i.test(path) || new URL(window.location.href).searchParams.has('q')) {
+      return 'SEARCH';
+    }
+    if (path === '/' || /^\/(home|for_you)$/i.test(path)) return 'HOME';
+    return 'OTHER';
+  };
+  window.addEventListener('click', (event) => {
+    if (!state.armed || !event.isTrusted || routeClass() !== state.sourceRoute) return;
+    const control = event.composedPath().slice(0, 32).find((item) => item instanceof Element &&
+      item.matches('a[href],button,[role="button"],[role="link"]'));
+    if (!(control instanceof Element) || !visible(control)) return;
+    const navigationCandidates = Array.from(document.querySelectorAll('nav,[role="navigation"]'));
+    if (navigationCandidates.length > 3_000) return;
+    state.armed = false;
+    const navigation = navigationCandidates.filter(visible);
+    const anchor = control.closest('a[href]');
+    let targetPath = null;
+    if (anchor) {
+      try {
+        const target = new URL(anchor.getAttribute('href'), window.location.href);
+        const path = target.pathname.replace(/\/$/, '');
+        if (target.origin === state.expectedOrigin && !target.username && !target.password &&
+            !target.search && !target.hash &&
+            /^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}$/.test(path)) {
+          targetPath = path;
+        }
+      } catch (_) { /* Keep malformed destinations out of the diagnostic. */ }
+    }
+    const report = {
+      source_route: routeClass(),
+      role: safeRole(control),
+      tag: safeTag(control),
+      label: safeLabel(control),
+      within_unique_navigation: navigation.length === 1 && navigation[0].contains(control),
+      is_post_permalink: targetPath !== null,
+      target_path: targetPath
+    };
+    const binding = window.__threadsLocalUiDiagnosticRecordClick;
+    if (typeof binding === 'function') binding(report).catch(() => {});
+  }, true);
+  window[stateKey] = state;
+})();
+"""
+
+_ARM_OPERATOR_CLICK_SCRIPT = r"""
+({allowedOrigin, sourceRoute}) => {
+  const state = window.__threadsLocalUiDiagnosticClickState;
+  if (!state || state.installed !== true || window.location.origin !== allowedOrigin) return false;
+  state.expectedOrigin = allowedOrigin;
+  state.sourceRoute = sourceRoute;
+  state.armed = true;
+  return true;
+}
+"""
+
 _BROWSER_READ_READINESS_TIMEOUT_SECONDS = 2.0
 _BROWSER_READ_READINESS_POLL_SECONDS = 0.05
 
@@ -322,6 +426,11 @@ class _PlaywrightBrowserSession:
         self._synthetic_blocked_request_count = 0
         self._async_ui_reader: AsyncThreadsJobUiReader | None = None
         self._async_ui_reader_origin: str | None = None
+        self._ui_diagnostic_click_binding_installed = False
+        self._ui_diagnostic_click_armed_route: str | None = None
+        self._ui_diagnostic_operator_click: dict[str, object] | None = None
+        # Volatile comparison input only; it is never copied to a report or log.
+        self._ui_diagnostic_operator_click_path: str | None = None
         page.on("crash", self._on_page_crash)
         context.on("close", self._on_context_close)
 
@@ -440,6 +549,7 @@ class _PlaywrightBrowserSession:
             raise UnsupportedUIState()
         await self._raise_navigation_policy_error()
         try:
+            operator_click = self._ui_diagnostic_operator_click
             raw_snapshot = await asyncio.wait_for(
                 self._page.evaluate(
                     DIAGNOSTIC_SCRIPT,
@@ -450,6 +560,8 @@ class _PlaywrightBrowserSession:
                         "maxCandidates": 3_000,
                         "maxNodes": 180,
                         "maxRelations": 480,
+                        "operatorClick": operator_click,
+                        "operatorClickPath": self._ui_diagnostic_operator_click_path,
                     },
                 ),
                 timeout=3.0,
@@ -464,6 +576,125 @@ class _PlaywrightBrowserSession:
             return validate_ui_diagnostic_snapshot(raw_snapshot)
         except UiDiagnosticSchemaError:
             raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_SCHEMA_INVALID") from None
+
+    async def arm_ui_diagnostic_operator_click(self, *, source_route: str) -> None:
+        """Record one trusted operator click as bounded semantic metadata."""
+
+        if source_route not in {"HOME", "SEARCH", "POST", "OTHER"}:
+            raise UnsupportedUIState()
+        self._ensure_alive()
+        origin = self._async_ui_reader_origin
+        if origin is None and len(self._allowed_navigation_origins) == 1:
+            origin = next(iter(self._allowed_navigation_origins))
+        if origin not in {
+            BROWSER_FEED_ORIGIN,
+            "https://threads.example.invalid",
+        } or self._allowed_navigation_origins != frozenset({origin}):
+            raise UnsupportedUIState()
+        await self._raise_navigation_policy_error()
+        self._ui_diagnostic_operator_click = None
+        self._ui_diagnostic_operator_click_path = None
+        self._ui_diagnostic_click_armed_route = source_route
+        try:
+            if not self._ui_diagnostic_click_binding_installed:
+                await cast(Any, self._page).expose_binding(
+                    "__threadsLocalUiDiagnosticRecordClick",
+                    self._receive_ui_diagnostic_operator_click,
+                )
+                await self._page.add_init_script(_OPERATOR_CLICK_OBSERVER_SCRIPT)
+                self._ui_diagnostic_click_binding_installed = True
+            await self._page.evaluate(_OPERATOR_CLICK_OBSERVER_SCRIPT)
+            armed = await self._page.evaluate(
+                _ARM_OPERATOR_CLICK_SCRIPT,
+                {"allowedOrigin": origin, "sourceRoute": source_route},
+            )
+        except PlaywrightError:
+            self._ensure_alive()
+            await self._raise_navigation_policy_error()
+            self._ui_diagnostic_click_armed_route = None
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE") from None
+        if armed is not True:
+            self._ui_diagnostic_click_armed_route = None
+            raise BrowserRuntimeUnavailable("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE")
+        await self._raise_navigation_policy_error()
+
+    async def _receive_ui_diagnostic_operator_click(
+        self,
+        source: dict[str, object],
+        payload: object,
+    ) -> None:
+        expected_route = self._ui_diagnostic_click_armed_route
+        if (
+            expected_route is None
+            or self._ui_diagnostic_operator_click is not None
+            or source.get("page") is not self._page
+            or not isinstance(payload, dict)
+        ):
+            return
+        value = cast(dict[str, object], payload)
+        expected_keys = {
+            "source_route",
+            "role",
+            "tag",
+            "label",
+            "within_unique_navigation",
+            "is_post_permalink",
+            "target_path",
+        }
+        source_route = value.get("source_route")
+        role = value.get("role")
+        tag = value.get("tag")
+        label = value.get("label")
+        within_unique_navigation = value.get("within_unique_navigation")
+        is_post_permalink = value.get("is_post_permalink")
+        target_path = value.get("target_path")
+        if (
+            set(value) != expected_keys
+            or source_route != expected_route
+            or not isinstance(role, str)
+            or role not in {"BUTTON", "LINK", "OTHER"}
+            or not isinstance(tag, str)
+            or tag
+            not in {
+                "A",
+                "BUTTON",
+                "INPUT",
+                "TEXTAREA",
+                "NAV",
+                "MAIN",
+                "ARTICLE",
+                "HEADER",
+                "SECTION",
+                "ASIDE",
+                "DIV",
+                "FORM",
+                "OTHER",
+            }
+            or not isinstance(label, str)
+            or label not in {"HOME", "SEARCH", "PROFILE", "FOR_YOU", "TOP", "RECENT", "OTHER"}
+            or type(within_unique_navigation) is not bool
+            or type(is_post_permalink) is not bool
+            or (target_path is not None and not isinstance(target_path, str))
+        ):
+            return
+        safe_path = (
+            target_path
+            if isinstance(target_path, str)
+            and re.fullmatch(r"/@[A-Za-z0-9._]{1,30}/post/[A-Za-z0-9_-]{1,120}", target_path)
+            else None
+        )
+        if bool(safe_path) is not is_post_permalink:
+            return
+        self._ui_diagnostic_operator_click = {
+            "source_route": source_route,
+            "role": role,
+            "tag": tag,
+            "label": label,
+            "within_unique_navigation": within_unique_navigation,
+            "is_post_permalink": is_post_permalink,
+        }
+        self._ui_diagnostic_operator_click_path = safe_path
+        self._ui_diagnostic_click_armed_route = None
 
     async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
         self._ensure_alive()
@@ -735,6 +966,9 @@ class _PlaywrightBrowserSession:
         if self._closed:
             return
         self._closed = True
+        self._ui_diagnostic_click_armed_route = None
+        self._ui_diagnostic_operator_click = None
+        self._ui_diagnostic_operator_click_path = None
         try:
             await self._context.close()
         except Exception:  # noqa: BLE001, S110

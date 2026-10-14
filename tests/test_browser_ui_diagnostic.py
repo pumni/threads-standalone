@@ -9,7 +9,7 @@ import types
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 from urllib.parse import quote
 from uuid import UUID
 
@@ -27,7 +27,11 @@ from threads_platform.browser.contracts import (
     BrowserRuntimeUnavailable,
     RemoteSessionStateUncertain,
 )
-from threads_platform.browser.playwright_engine import PlaywrightBrowserEngine
+from threads_platform.browser.playwright_engine import (
+    _ARM_OPERATOR_CLICK_SCRIPT,
+    _OPERATOR_CLICK_OBSERVER_SCRIPT,
+    PlaywrightBrowserEngine,
+)
 from threads_platform.browser.ui_diagnostic import (
     DIAGNOSTIC_SCRIPT,
     UiDiagnosticSchemaError,
@@ -44,6 +48,7 @@ from threads_platform.standalone.browser_nurture_state import (
 )
 from threads_platform.standalone.browser_ui_diagnostic import (
     BrowserUiDiagnosticSession,
+    _arm_operator_action_capture,
     run_browser_ui_diagnostic,
     wait_for_stable_ui_snapshot,
 )
@@ -90,6 +95,7 @@ def _valid_raw_snapshot() -> dict[str, object]:
                 "relation": "CONTROL_DESCENDANT_OF_NAV",
             }
         ],
+        "operator_action": None,
         "query_match": True,
         "self_profile_match": True,
         "body_status": "UNKNOWN",
@@ -120,6 +126,26 @@ def test_diagnostic_schema_rejects_page_strings_and_unbounded_values() -> None:
     private_value = "cookie=private-cookie; username=private-name; https://private.invalid/post/91"
     raw = _valid_raw_snapshot()
     raw["content"] = private_value
+    with pytest.raises(UiDiagnosticSchemaError):
+        validate_ui_diagnostic_snapshot(raw)
+
+    raw = _valid_raw_snapshot()
+    raw["operator_action"] = {
+        "source_route": "HOME",
+        "role": "BUTTON",
+        "tag": "DIV",
+        "label": "OTHER",
+        "within_unique_navigation": True,
+        "is_post_permalink": False,
+        "destination_route": "SEARCH",
+        "destination_searchboxes": "ONE",
+        "search_query_entered": True,
+        "search_query_applied": False,
+        "search_destination_relation": True,
+        "clicked_post_matches_destination": False,
+        "unique_co_container_author_matches_clicked_post": False,
+        "target_path": "/@private_candidate_86/post/privatepostid71",
+    }
     with pytest.raises(UiDiagnosticSchemaError):
         validate_ui_diagnostic_snapshot(raw)
 
@@ -160,7 +186,9 @@ def test_diagnostic_report_contains_only_allowlisted_semantics() -> None:
 
 
 def test_browser_probe_script_is_read_only_and_has_no_credential_or_upload_access() -> None:
-    script = DIAGNOSTIC_SCRIPT.lower()
+    script = (
+        DIAGNOSTIC_SCRIPT + _OPERATOR_CLICK_OBSERVER_SCRIPT + _ARM_OPERATOR_CLICK_SCRIPT
+    ).lower()
     for forbidden in (
         "document.cookie",
         "localstorage",
@@ -175,6 +203,8 @@ def test_browser_probe_script_is_read_only_and_has_no_credential_or_upload_acces
         "form.submit(",
         "innerhtml",
         "screenshot",
+        "innertext",
+        "textcontent",
     ):
         assert forbidden not in script
 
@@ -188,6 +218,18 @@ class _SyntheticUiDiagnosticSession(Protocol):
     ) -> None: ...
 
     async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None: ...
+
+    async def arm_ui_diagnostic_operator_click(self, *, source_route: str) -> None: ...
+
+    async def verify_ui_account(self, expected_actor: str, *, origin: str) -> object: ...
+
+    async def search_ui_feed(
+        self,
+        query: str,
+        *,
+        expected_actor: str,
+        origin: str,
+    ) -> object: ...
 
     async def inspect_ui_diagnostic(
         self,
@@ -363,6 +405,154 @@ def test_synthetic_chromium_home_search_detail_report_is_private(tmp_path: Path)
         assert private_value not in encoded
 
 
+def test_synthetic_chromium_operator_click_correlation_is_bounded_and_private(
+    tmp_path: Path,
+) -> None:
+    home_url = f"{_SYNTHETIC_ORIGIN}/"
+    action_candidate = "phasebfixture"
+    action_post_id = "phasebpost71"
+    detail_path = f"/@{action_candidate}/post/{action_post_id}"
+    detail_url = f"{_SYNTHETIC_ORIGIN}{detail_path}"
+    home_html = f"""
+      <style>[role="button"]{{display:inline-block;width:32px;height:32px}}</style>
+      <div role="navigation">
+        <div role="button" id="search-trigger"></div>
+        <div role="button" id="search-overlay-trigger"></div>
+        <div role="button" id="other-control"></div>
+        <a href="/@{_PRIVATE_USERNAME}" aria-label="Profile">Profile</a>
+      </div>
+      <div><a href="/@{_PRIVATE_USERNAME}" aria-label="Profile">Profile</a></div>
+      <script>
+        document.querySelector('#search-trigger').addEventListener('click', () => {{
+          window.location.href = '/search';
+        }});
+        document.querySelector('#search-overlay-trigger').addEventListener('click', () => {{
+          document.body.insertAdjacentHTML('beforeend',
+            '<input id="overlay-query" role="textbox" aria-label="Search" ' +
+            'value="{_PRIVATE_QUERY}">');
+        }});
+      </script>
+    """
+    search_html = f"""
+      <input id="query" role="textbox" aria-label="Search" value="{_PRIVATE_QUERY}">
+      <a id="post-link" href="{detail_path}">time</a>
+    """
+    detail_html = f"""
+      <div><a href="/@{action_candidate}">author</a>
+      <a href="{detail_path}">time</a><p>{_PRIVATE_POST_TEXT}</p></div>
+    """
+
+    async def observe_transitions() -> tuple[
+        dict[str, object], dict[str, object], dict[str, object], dict[str, object]
+    ]:
+        profile = tmp_path / "synthetic-action-profile"
+        profile.mkdir()
+        request = BrowserLaunchRequest(
+            profile_directory=profile,
+            network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
+            headless=True,
+        )
+        engine = PlaywrightBrowserEngine()
+        try:
+            browser_session = await engine.open(request)
+        except BrowserRuntimeUnavailable as error:
+            if error.code in {"BROWSER_BINARY_MISSING", "BROWSER_START_FAILED"}:
+                pytest.skip("Playwright Chromium is not available in this environment")
+            raise
+        session = cast(_SyntheticUiDiagnosticSession, browser_session)
+        try:
+            await session.install_synthetic_fixture_pages(
+                {
+                    home_url: home_html,
+                    f"{_SYNTHETIC_ORIGIN}/search": search_html,
+                    detail_url: detail_html,
+                },
+                origin=_SYNTHETIC_ORIGIN,
+            )
+            await session.navigate(home_url, allowed_origins=frozenset({_SYNTHETIC_ORIGIN}))
+            home_state = await session.verify_ui_account(
+                _PRIVATE_USERNAME,
+                origin=_SYNTHETIC_ORIGIN,
+            )
+            page = cast(Any, session)._page
+            await page.set_content(
+                '<div role="navigation"><a href="/@wrongoperator" '
+                'aria-label="Profile">Profile</a></div>'
+                f'<a href="/@{_PRIVATE_USERNAME}" aria-label="Profile">Profile</a>'
+            )
+            with pytest.raises(BrowserAdapterError) as mismatch:
+                await session.verify_ui_account(_PRIVATE_USERNAME, origin=_SYNTHETIC_ORIGIN)
+            assert mismatch.value.code == "BROWSER_SESSION_MISMATCH"
+            await session.navigate(home_url, allowed_origins=frozenset({_SYNTHETIC_ORIGIN}))
+            await session.arm_ui_diagnostic_operator_click(source_route="HOME")
+            await page.locator("#search-trigger").click()
+            search_snapshot = await session.inspect_ui_diagnostic(
+                expected_username=_PRIVATE_USERNAME,
+                configured_topic=_PRIVATE_QUERY,
+            )
+            search_report = search_snapshot.to_document()
+
+            await session.arm_ui_diagnostic_operator_click(source_route="SEARCH")
+            await page.locator("#post-link").click()
+            detail_snapshot = await session.inspect_ui_diagnostic(
+                expected_username=_PRIVATE_USERNAME,
+                configured_topic=_PRIVATE_QUERY,
+            )
+            detail_report = detail_snapshot.to_document()
+            await session.navigate(home_url, allowed_origins=frozenset({_SYNTHETIC_ORIGIN}))
+            await session.arm_ui_diagnostic_operator_click(source_route="HOME")
+            await page.locator("#search-overlay-trigger").click()
+            overlay_snapshot = await session.inspect_ui_diagnostic(
+                expected_username=_PRIVATE_USERNAME,
+                configured_topic=_PRIVATE_QUERY,
+            )
+            overlay_report = overlay_snapshot.to_document()
+        finally:
+            await cast(Any, browser_session).close()
+        return (
+            {"state": str(home_state)},
+            search_report,
+            detail_report,
+            overlay_report,
+        )
+
+    home, search, detail, overlay = asyncio.run(observe_transitions())
+    assert home["state"] == "READY"
+    search_action = cast(dict[str, object], search["operator_action"])
+    assert search_action["source_route"] == "HOME"
+    assert search_action["role"] == "BUTTON"
+    assert search_action["tag"] == "DIV"
+    assert search_action["label"] == "OTHER"
+    assert search_action["within_unique_navigation"] is True
+    assert search_action["search_destination_relation"] is True
+    assert search_action["destination_searchboxes"] == "ONE"
+    assert search_action["search_query_entered"] is True
+    assert search_action["search_query_applied"] is False
+    detail_action = cast(dict[str, object], detail["operator_action"])
+    assert detail_action["source_route"] == "SEARCH"
+    assert detail_action["role"] == "LINK"
+    assert detail_action["is_post_permalink"] is True
+    assert detail_action["clicked_post_matches_destination"] is True
+    assert detail_action["unique_co_container_author_matches_clicked_post"] is True
+    assert detail["route_class"] == "POST"
+    overlay_action = cast(dict[str, object], overlay["operator_action"])
+    assert overlay["route_class"] == "HOME"
+    assert overlay_action["destination_route"] == "HOME"
+    assert overlay_action["search_destination_relation"] is True
+    assert overlay_action["destination_searchboxes"] == "ONE"
+    encoded = json.dumps((search, detail, overlay), sort_keys=True)
+    for private_value in (
+        _PRIVATE_USERNAME,
+        _PRIVATE_QUERY,
+        _PRIVATE_POST_TEXT,
+        action_post_id,
+        action_candidate,
+        detail_url,
+        detail_path,
+    ):
+        assert private_value not in encoded
+
+
 def test_synthetic_chromium_waits_for_delayed_hydration_and_stable_semantics(
     tmp_path: Path,
 ) -> None:
@@ -443,6 +633,8 @@ class _DiagnosticSession:
         self.route_class = "HOME"
         self.failures: list[BrowserAdapterError] = []
         self.close_observer: Callable[[], None] | None = None
+        self.armed_routes: list[str] = []
+        self.arm_failures: list[BrowserAdapterError] = []
 
     async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
         self.navigations.append((url, allowed_origins))
@@ -458,6 +650,11 @@ class _DiagnosticSession:
         if self.failures:
             raise self.failures.pop(0)
         return replace(self.snapshot, route_class=self.route_class)
+
+    async def arm_ui_diagnostic_operator_click(self, *, source_route: str) -> None:
+        self.armed_routes.append(source_route)
+        if self.arm_failures:
+            raise self.arm_failures.pop(0)
 
     async def close(self) -> None:
         self.closed = True
@@ -479,6 +676,39 @@ class _DiagnosticEngine:
         self.next_session = None
         self.sessions.append(session)
         return cast(BrowserEngineSession, session)
+
+
+def test_operator_click_capture_errors_offer_bounded_retry_before_stage() -> None:
+    session = _DiagnosticSession(validate_ui_diagnostic_snapshot(_valid_raw_snapshot()))
+    session.arm_failures.append(BrowserAdapterError("BROWSER_UI_DIAGNOSTIC_UNAVAILABLE"))
+    prompts: list[str] = []
+
+    async def choose_retry(
+        prompt: str,
+        choices: frozenset[Literal["OBSERVE", "RETRY", "SKIP", "STOP"]],
+    ) -> Literal["OBSERVE", "RETRY", "SKIP", "STOP"]:
+        prompts.append(prompt)
+        assert choices == frozenset({"RETRY", "SKIP", "STOP"})
+        return "RETRY"
+
+    output = io.StringIO()
+    status = asyncio.run(
+        _arm_operator_action_capture(
+            session,
+            stage="SEARCH",
+            source_route="HOME",
+            waiter=choose_retry,
+            output=output,
+        )
+    )
+
+    assert status == "ARMED"
+    assert session.armed_routes == ["HOME", "HOME"]
+    assert len(prompts) == 1
+    assert (
+        "DIAGNOSTIC_ERROR stage=SEARCH code=BROWSER_UI_DIAGNOSTIC_UNAVAILABLE" in output.getvalue()
+    )
+    assert "DIAGNOSTIC_RECOVERY stage=SEARCH" in output.getvalue()
 
 
 def _account_runtime(
@@ -550,9 +780,13 @@ def test_diagnostic_holds_existing_account_lock_and_never_changes_checkpoint(
     )
 
     assert report["status"] == "COMPLETE"
+    assert report["schema"] == "THREADS_UI_DIAGNOSTIC_V2"
+    assert engine.sessions[0].armed_routes == ["HOME", "HOME"]
     assert _report_stage(report, "home")["stage_context"] == "ROUTE_MATCH"
     search_report = _report_stage(report, "search")
     detail_report = _report_stage(report, "detail")
+    assert search_report["operator_action_capture"] == "ARMED"
+    assert detail_report["operator_action_capture"] == "ARMED"
     assert search_report["route_class"] == "HOME"
     assert search_report["stage_context"] == "UNVERIFIED"
     assert detail_report["route_class"] == "OTHER"

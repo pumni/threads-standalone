@@ -63,6 +63,7 @@ _OBSERVED_KEYS = frozenset(
         "counts",
         "nodes",
         "relations",
+        "operator_action",
         "query_match",
         "self_profile_match",
         "body_status",
@@ -119,6 +120,42 @@ class UiDiagnosticRelation:
 
 
 @dataclass(frozen=True, slots=True)
+class UiDiagnosticOperatorAction:
+    source_route: str
+    role: str
+    tag: str
+    label: str
+    within_unique_navigation: bool
+    is_post_permalink: bool
+    destination_route: str
+    destination_searchboxes: str
+    search_query_entered: bool
+    search_query_applied: bool
+    search_destination_relation: bool
+    clicked_post_matches_destination: bool
+    unique_co_container_author_matches_clicked_post: bool
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "source_route": self.source_route,
+            "role": self.role,
+            "tag": self.tag,
+            "label": self.label,
+            "within_unique_navigation": self.within_unique_navigation,
+            "is_post_permalink": self.is_post_permalink,
+            "destination_route": self.destination_route,
+            "destination_searchboxes": self.destination_searchboxes,
+            "search_query_entered": self.search_query_entered,
+            "search_query_applied": self.search_query_applied,
+            "search_destination_relation": self.search_destination_relation,
+            "clicked_post_matches_destination": self.clicked_post_matches_destination,
+            "unique_co_container_author_matches_clicked_post": (
+                self.unique_co_container_author_matches_clicked_post
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class UiDiagnosticSnapshot:
     status: Literal["OBSERVED", "NODE_BOUND_EXCEEDED"]
     route_class: str | None = None
@@ -129,6 +166,7 @@ class UiDiagnosticSnapshot:
     self_profile_match: bool = False
     body_status: str = "UNKNOWN"
     document_ready: bool = False
+    operator_action: UiDiagnosticOperatorAction | None = None
 
     def to_document(self) -> dict[str, object]:
         if self.status == "NODE_BOUND_EXCEEDED":
@@ -139,6 +177,9 @@ class UiDiagnosticSnapshot:
             "counts": dict(self.counts),
             "nodes": [node.to_document() for node in self.nodes],
             "relations": [relation.to_document() for relation in self.relations],
+            "operator_action": (
+                None if self.operator_action is None else self.operator_action.to_document()
+            ),
             "query_match": self.query_match,
             "self_profile_match": self.self_profile_match,
             "body_status": self.body_status,
@@ -147,7 +188,8 @@ class UiDiagnosticSnapshot:
 
 
 DIAGNOSTIC_SCRIPT = r"""
-({allowedOrigin, expectedUsername, configuredTopic, maxCandidates, maxNodes, maxRelations}) => {
+({allowedOrigin, expectedUsername, configuredTopic, maxCandidates, maxNodes, maxRelations,
+  operatorClick, operatorClickPath}) => {
   const bucket = (count) => count === 0 ? 'ZERO' : count === 1 ? 'ONE' : 'MANY';
   const normalize = (value) => {
     const text = typeof value === 'string' ? value : '';
@@ -463,6 +505,21 @@ DIAGNOSTIC_SCRIPT = r"""
     if (found) authorGroups.set(postLink, found);
   }
   const currentPostLinks = postLinks.filter((element) => postPathOf(element) === path);
+  const clickedPostMatchesDestination = typeof operatorClickPath === 'string' &&
+    /^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}$/.test(operatorClickPath) &&
+    url.search === '' && url.hash === '' && path === operatorClickPath;
+  const clickedPostAuthorPath = typeof operatorClickPath === 'string'
+    ? operatorClickPath.replace(/\/post\/[A-Za-z0-9_-]{1,120}$/, '').toLowerCase()
+    : '';
+  const clickedPostAuthorMatches = clickedPostMatchesDestination
+    ? Array.from(authorGroups.entries()).filter(([postLink, group]) => {
+        const authors = group.authors.filter((author) => profilePathOf(author) !== null);
+        return postPathOf(postLink) === operatorClickPath && authors.length === 1 &&
+          profilePathOf(authors[0]) === clickedPostAuthorPath;
+      })
+    : [];
+  const searchQueryEntered = searchboxes.some((element) => normalize(element.value) === queryValue);
+  const searchQueryApplied = normalize(url.searchParams.get('q')) === queryValue;
   let bodyStatus = 'UNKNOWN';
   for (const [postLink, group] of authorGroups.entries()) {
     const isDetail = routeClass === 'POST' && currentPostLinks.length === 1 && postLink === currentPostLinks[0];
@@ -525,6 +582,23 @@ DIAGNOSTIC_SCRIPT = r"""
     counts,
     nodes,
     relations,
+    operator_action: operatorClick === null ? null : {
+      source_route: operatorClick.source_route,
+      role: operatorClick.role,
+      tag: operatorClick.tag,
+      label: operatorClick.label,
+      within_unique_navigation: operatorClick.within_unique_navigation,
+      is_post_permalink: operatorClick.is_post_permalink,
+      destination_route: routeClass,
+      destination_searchboxes: bucket(searchboxes.length),
+      search_query_entered: searchQueryEntered,
+      search_query_applied: searchQueryApplied,
+      search_destination_relation: operatorClick.source_route === 'HOME' &&
+        operatorClick.within_unique_navigation && ['HOME', 'SEARCH'].includes(routeClass) &&
+        searchboxes.length === 1,
+      clicked_post_matches_destination: clickedPostMatchesDestination,
+      unique_co_container_author_matches_clicked_post: clickedPostAuthorMatches.length === 1
+    },
     query_match: queryMatch,
     self_profile_match: selfProfileLinks.length > 0,
     body_status: bodyStatus,
@@ -550,6 +624,7 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
     raw_counts = value_dict.get("counts")
     raw_nodes = value_dict.get("nodes")
     raw_relations = value_dict.get("relations")
+    raw_operator_action = value_dict.get("operator_action")
     query_match = value_dict.get("query_match")
     self_profile_match = value_dict.get("self_profile_match")
     body_status = value_dict.get("body_status")
@@ -629,6 +704,80 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
             raise UiDiagnosticSchemaError
         relations.append(UiDiagnosticRelation(source, target, relation))
 
+    operator_action: UiDiagnosticOperatorAction | None = None
+    if raw_operator_action is not None:
+        if not isinstance(raw_operator_action, dict):
+            raise UiDiagnosticSchemaError
+        action_dict = cast(dict[str, object], raw_operator_action)
+        action_keys = frozenset(
+            {
+                "source_route",
+                "role",
+                "tag",
+                "label",
+                "within_unique_navigation",
+                "is_post_permalink",
+                "destination_route",
+                "destination_searchboxes",
+                "search_query_entered",
+                "search_query_applied",
+                "search_destination_relation",
+                "clicked_post_matches_destination",
+                "unique_co_container_author_matches_clicked_post",
+            }
+        )
+        source_route = action_dict.get("source_route")
+        role = action_dict.get("role")
+        tag = action_dict.get("tag")
+        label = action_dict.get("label")
+        destination_route = action_dict.get("destination_route")
+        destination_searchboxes = action_dict.get("destination_searchboxes")
+        bool_fields = (
+            "within_unique_navigation",
+            "is_post_permalink",
+            "search_query_entered",
+            "search_query_applied",
+            "search_destination_relation",
+            "clicked_post_matches_destination",
+            "unique_co_container_author_matches_clicked_post",
+        )
+        if (
+            frozenset(action_dict) != action_keys
+            or not isinstance(source_route, str)
+            or source_route not in _ROUTES
+            or not isinstance(role, str)
+            or role not in _ROLES
+            or not isinstance(tag, str)
+            or tag not in _TAGS
+            or not isinstance(label, str)
+            or label not in _LABELS
+            or not isinstance(destination_route, str)
+            or destination_route not in _ROUTES
+            or not isinstance(destination_searchboxes, str)
+            or destination_searchboxes not in _CARDINALITIES
+            or any(type(action_dict.get(field)) is not bool for field in bool_fields)
+        ):
+            raise UiDiagnosticSchemaError
+        operator_action = UiDiagnosticOperatorAction(
+            source_route=source_route,
+            role=role,
+            tag=tag,
+            label=label,
+            within_unique_navigation=cast(bool, action_dict["within_unique_navigation"]),
+            is_post_permalink=cast(bool, action_dict["is_post_permalink"]),
+            destination_route=destination_route,
+            destination_searchboxes=destination_searchboxes,
+            search_query_entered=cast(bool, action_dict["search_query_entered"]),
+            search_query_applied=cast(bool, action_dict["search_query_applied"]),
+            search_destination_relation=cast(bool, action_dict["search_destination_relation"]),
+            clicked_post_matches_destination=cast(
+                bool, action_dict["clicked_post_matches_destination"]
+            ),
+            unique_co_container_author_matches_clicked_post=cast(
+                bool, action_dict["unique_co_container_author_matches_clicked_post"]
+            ),
+        )
+
     return UiDiagnosticSnapshot(
         status="OBSERVED",
         route_class=route_class,
@@ -639,4 +788,5 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
         self_profile_match=self_profile_match,
         body_status=body_status,
         document_ready=document_ready,
+        operator_action=operator_action,
     )

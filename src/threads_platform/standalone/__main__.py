@@ -765,7 +765,7 @@ def _handle_browser_ui_diagnostic(args: argparse.Namespace) -> int:
         return 1
     except KeyboardInterrupt:
         sys.stdout.write(
-            '{"schema":"THREADS_UI_DIAGNOSTIC_V1","status":"STOPPED",'
+            '{"schema":"THREADS_UI_DIAGNOSTIC_V2","status":"STOPPED",'
             '"reason_code":"INTERRUPTED","stages":{'
             '"home":{"status":"NOT_OBSERVED"},'
             '"search":{"status":"NOT_OBSERVED"},'

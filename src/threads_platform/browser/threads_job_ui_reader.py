@@ -1321,11 +1321,11 @@ class AsyncThreadsJobUiReader:
             )
             root_ready: bool = mains == 1
             if stage == "HOME" and mains == 0:
-                root_ready = (
-                    navigations == 1
-                    and result.get("hasHomeDestination") is True
-                    and result.get("hasSearchDestination") is True
-                )
+                # The observed Home layout uses a navigation landmark without a
+                # main landmark or accessible Home/Search destination labels.
+                # Account identity remains separately guarded below by the one
+                # explicitly labelled self-profile link inside that navigation.
+                root_ready = navigations == 1
             elif stage == "SEARCH" and self._search_panel_mode:
                 root_ready = result.get("searchRootCount") == 1
             elif stage == "SEARCH" and mains == 0:
@@ -1406,12 +1406,7 @@ class AsyncThreadsJobUiReader:
     ) -> str:
         mains = result.get("mains")
         if stage == "HOME":
-            root_ready = mains == 1 or (
-                mains == 0
-                and result.get("navigations") == 1
-                and result.get("hasHomeDestination") is True
-                and result.get("hasSearchDestination") is True
-            )
+            root_ready = mains == 1 or (mains == 0 and result.get("navigations") == 1)
             if not root_ready:
                 return (
                     "HOME_UI_NOT_READY"

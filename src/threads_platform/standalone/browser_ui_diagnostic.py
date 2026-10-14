@@ -83,6 +83,8 @@ DiagnosticWaiter = Callable[[str, frozenset[DiagnosticChoice]], Awaitable[Diagno
 class BrowserUiDiagnosticSession(Protocol):
     async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None: ...
 
+    async def arm_ui_diagnostic_operator_click(self, *, source_route: str) -> None: ...
+
     async def inspect_ui_diagnostic(
         self,
         *,
@@ -197,7 +199,7 @@ async def wait_for_diagnostic_choice(
 
 def _new_report() -> dict[str, object]:
     return {
-        "schema": "THREADS_UI_DIAGNOSTIC_V1",
+        "schema": "THREADS_UI_DIAGNOSTIC_V2",
         "status": "STOPPED",
         "reason_code": "NOT_STARTED",
         "stages": {stage: {"status": "NOT_OBSERVED"} for stage in _STAGE_KEYS},
@@ -279,6 +281,55 @@ async def _ask(
     return choice if choice in choices else "STOP"
 
 
+async def _arm_operator_action_capture(
+    session: BrowserUiDiagnosticSession,
+    *,
+    stage: str,
+    source_route: str,
+    waiter: DiagnosticWaiter,
+    output: TextIO,
+) -> Literal["ARMED", "SKIPPED", "STOPPED", "TIMEOUT"]:
+    attempts = 0
+    while True:
+        try:
+            await session.arm_ui_diagnostic_operator_click(source_route=source_route)
+        except BrowserAdapterError as error:
+            code = _safe_reason_code(error.code)
+            _emit(output, f"DIAGNOSTIC_ERROR stage={stage} code={code}")
+            if code not in _RECOVERABLE_UI_CODES:
+                raise
+            if attempts < _MAX_STAGE_RETRIES:
+                choices: frozenset[DiagnosticChoice] = frozenset({"RETRY", "SKIP", "STOP"})
+            else:
+                choices = frozenset({"SKIP", "STOP"})
+            options = ",".join(sorted(choices))
+            input_hint = "Press R/K/S.\n" if os.name == "nt" else "Type R/K/S, then press Enter.\n"
+            _emit(
+                output,
+                f"DIAGNOSTIC_RECOVERY stage={stage} code={code} "
+                f"attempt={attempts + 1} options={options}",
+            )
+            try:
+                recovery = await _ask(
+                    waiter,
+                    f"Recoverable diagnostic issue {code}. Choose {options}. {input_hint}",
+                    choices,
+                    output=output,
+                    timeout=_RECOVERY_WAIT_SECONDS,
+                )
+            except TimeoutError:
+                return "TIMEOUT"
+            if recovery == "RETRY":
+                attempts += 1
+                continue
+            if recovery == "SKIP":
+                _emit(output, f"DIAGNOSTIC_ACTION_CAPTURE stage={stage} status=SKIPPED code={code}")
+                return "SKIPPED"
+            return "STOPPED"
+        _emit(output, f"DIAGNOSTIC_ACTION_CAPTURE stage={stage} status=ARMED")
+        return "ARMED"
+
+
 def _emit(output: TextIO, value: str) -> None:
     output.write(value + "\n")
     output.flush()
@@ -305,6 +356,8 @@ async def run_browser_ui_diagnostic(
     hard_stop = False
     graceful_stop = False
     skipped = False
+    active_stage = "HOME"
+    next_stage_capture_status: str | None = None
 
     try:
         async with runtime.own_browser_profile(alias, headless=False) as lease:
@@ -317,6 +370,10 @@ async def run_browser_ui_diagnostic(
                 await diagnostic_session.navigate(_HOME_URL, allowed_origins=_ALLOWED_ORIGINS)
 
                 for stage in _STAGE_KEYS:
+                    active_stage = stage.upper()
+                    observed_snapshot: UiDiagnosticSnapshot | None = None
+                    stage_capture_status = next_stage_capture_status
+                    next_stage_capture_status = None
                     _emit(
                         output_stream,
                         f"DIAGNOSTIC_STAGE stage={stage.upper()} status=WAITING_FOR_OPERATOR",
@@ -412,23 +469,43 @@ async def run_browser_ui_diagnostic(
                             graceful_stop = True
                             break
 
-                        _set_stage(
-                            report,
-                            stage,
-                            {
-                                **snapshot.to_document(),
-                                "stability": "STABLE",
-                                "stage_context": (
-                                    "ROUTE_MATCH"
-                                    if snapshot.route_class == _STAGE_ROUTES[stage]
-                                    else "UNVERIFIED"
-                                ),
-                            },
-                        )
+                        stage_value = {
+                            **snapshot.to_document(),
+                            "stability": "STABLE",
+                            "stage_context": (
+                                "ROUTE_MATCH"
+                                if snapshot.route_class == _STAGE_ROUTES[stage]
+                                else "UNVERIFIED"
+                            ),
+                        }
+                        if stage_capture_status is not None:
+                            stage_value["operator_action_capture"] = stage_capture_status
+                        _set_stage(report, stage, stage_value)
+                        observed_snapshot = snapshot
                         break
 
                     if hard_stop or graceful_stop:
                         break
+                    if stage != "detail" and observed_snapshot is not None:
+                        capture_stage = "SEARCH" if stage == "home" else "DETAIL"
+                        active_stage = capture_stage
+                        capture_status = await _arm_operator_action_capture(
+                            diagnostic_session,
+                            stage=capture_stage,
+                            source_route=observed_snapshot.route_class or "OTHER",
+                            waiter=waiter,
+                            output=output_stream,
+                        )
+                        if capture_status in {"STOPPED", "TIMEOUT"}:
+                            report["status"] = "STOPPED"
+                            report["reason_code"] = (
+                                "OPERATOR_DECISION_TIMEOUT"
+                                if capture_status == "TIMEOUT"
+                                else "OPERATOR_STOP"
+                            )
+                            graceful_stop = True
+                            break
+                        next_stage_capture_status = capture_status
 
                 if not hard_stop and not graceful_stop:
                     report["status"] = "PARTIAL" if skipped else "COMPLETE"
@@ -441,18 +518,21 @@ async def run_browser_ui_diagnostic(
                 code = _safe_reason_code(error.code)
                 report["status"] = "ERROR"
                 report["reason_code"] = code
-                _emit(output_stream, f"DIAGNOSTIC_ERROR stage=HOME code={code}")
+                _emit(output_stream, f"DIAGNOSTIC_ERROR stage={active_stage} code={code}")
                 hard_stop = True
             except StandaloneRuntimeError as error:
                 code = _safe_reason_code(error.code)
                 report["status"] = "ERROR"
                 report["reason_code"] = code
-                _emit(output_stream, f"DIAGNOSTIC_ERROR stage=HOME code={code}")
+                _emit(output_stream, f"DIAGNOSTIC_ERROR stage={active_stage} code={code}")
                 hard_stop = True
             except Exception:  # noqa: BLE001 - browser details never cross the report boundary.
                 report["status"] = "ERROR"
                 report["reason_code"] = "DIAGNOSTIC_FAILED"
-                _emit(output_stream, "DIAGNOSTIC_ERROR stage=HOME code=DIAGNOSTIC_FAILED")
+                _emit(
+                    output_stream,
+                    f"DIAGNOSTIC_ERROR stage={active_stage} code=DIAGNOSTIC_FAILED",
+                )
                 hard_stop = True
 
             _emit_report(output_stream, report)
@@ -481,19 +561,19 @@ async def run_browser_ui_diagnostic(
         code = _safe_reason_code(error.code)
         report["status"] = "ERROR"
         report["reason_code"] = code
-        _emit(output_stream, f"DIAGNOSTIC_ERROR stage=HOME code={code}")
+        _emit(output_stream, f"DIAGNOSTIC_ERROR stage={active_stage} code={code}")
     except StandaloneRuntimeError as error:
         code = _safe_reason_code(error.code)
         report["status"] = "ERROR"
         report["reason_code"] = code
-        _emit(output_stream, f"DIAGNOSTIC_ERROR stage=HOME code={code}")
+        _emit(output_stream, f"DIAGNOSTIC_ERROR stage={active_stage} code={code}")
     except KeyboardInterrupt, asyncio.CancelledError:
         report["status"] = "STOPPED"
         report["reason_code"] = "INTERRUPTED"
     except Exception:  # noqa: BLE001 - fixed safe output at the CLI boundary.
         report["status"] = "ERROR"
         report["reason_code"] = "DIAGNOSTIC_FAILED"
-        _emit(output_stream, "DIAGNOSTIC_ERROR stage=HOME code=DIAGNOSTIC_FAILED")
+        _emit(output_stream, f"DIAGNOSTIC_ERROR stage={active_stage} code=DIAGNOSTIC_FAILED")
 
     if not report_emitted:
         _emit_report(output_stream, report)
