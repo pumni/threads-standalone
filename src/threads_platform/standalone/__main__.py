@@ -723,7 +723,6 @@ def _handle_browser_ui_diagnostic(args: argparse.Namespace) -> int:
         BrowserNurtureStateStore,
     )
     from threads_platform.standalone.browser_ui_diagnostic import (
-        format_browser_ui_diagnostic,
         run_browser_ui_diagnostic,
     )
     from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
@@ -753,6 +752,7 @@ def _handle_browser_ui_diagnostic(args: argparse.Namespace) -> int:
                 LocalRuntime(data_root, accounts),
                 account.alias,
                 config,
+                output=sys.stdout,
             )
         )
     except (
@@ -775,7 +775,6 @@ def _handle_browser_ui_diagnostic(args: argparse.Namespace) -> int:
     except Exception:  # noqa: BLE001 - fixed CLI boundary for private browser data.
         sys.stderr.write("ERROR DIAGNOSTIC_FAILED\n")
         return 1
-    sys.stdout.write(format_browser_ui_diagnostic(report))
     return 0 if report["status"] in {"COMPLETE", "STOPPED"} else 1
 
 

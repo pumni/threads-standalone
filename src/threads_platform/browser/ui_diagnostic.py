@@ -66,6 +66,7 @@ _OBSERVED_KEYS = frozenset(
         "query_match",
         "self_profile_match",
         "body_status",
+        "document_ready",
     }
 )
 _COUNT_KEYS = (
@@ -83,6 +84,8 @@ _COUNT_KEYS = (
     "author_profile_links",
     "panels",
     "visible_candidates",
+    "offscreen_candidates",
+    "clipped_candidates",
 )
 
 
@@ -125,6 +128,7 @@ class UiDiagnosticSnapshot:
     query_match: bool = False
     self_profile_match: bool = False
     body_status: str = "UNKNOWN"
+    document_ready: bool = False
 
     def to_document(self) -> dict[str, object]:
         if self.status == "NODE_BOUND_EXCEEDED":
@@ -138,6 +142,7 @@ class UiDiagnosticSnapshot:
             "query_match": self.query_match,
             "self_profile_match": self.self_profile_match,
             "body_status": self.body_status,
+            "document_ready": self.document_ready,
         }
 
 
@@ -148,12 +153,83 @@ DIAGNOSTIC_SCRIPT = r"""
     const text = typeof value === 'string' ? value : '';
     return text.length > 240 ? '' : text.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
   };
-  const visible = (element) => {
-    if (!(element instanceof Element)) return false;
-    const style = window.getComputedStyle(element);
-    return style.display !== 'none' && style.visibility !== 'hidden' &&
-      style.visibility !== 'collapse' && element.getClientRects().length > 0;
+  const visibilityOf = (element) => {
+    if (!(element instanceof Element) || !element.isConnected) return 'HIDDEN';
+    let opacity = 1;
+    for (let current = element, depth = 0; current && depth < 32;
+         current = current.parentElement, depth += 1) {
+      if (current.hidden || current.hasAttribute('hidden') || current.hasAttribute('inert') ||
+          normalize(current.getAttribute('aria-hidden')) === 'true') return 'HIDDEN';
+      const style = window.getComputedStyle(current);
+      if (style.display === 'none' || style.visibility === 'hidden' ||
+          style.visibility === 'collapse' || style.contentVisibility === 'hidden') return 'HIDDEN';
+      const ownOpacity = Number.parseFloat(style.opacity);
+      if (Number.isFinite(ownOpacity)) opacity *= ownOpacity;
+      if (opacity <= 0.01) return 'HIDDEN';
+      if (!current.parentElement && current.tagName !== 'HTML') return 'HIDDEN';
+    }
+    let current = element;
+    let depth = 0;
+    for (; current && current.parentElement && depth < 32; current = current.parentElement, depth += 1) {
+      // A bound overflow fails closed instead of treating a distant ancestor as visible.
+    }
+    if (current && current.parentElement) return 'HIDDEN';
+    const rects = Array.from(element.getClientRects());
+    if (rects.length === 0) return 'HIDDEN';
+    const viewport = {left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight};
+    let intersectsViewport = false;
+    for (const rect of rects) {
+      if (rect.right > viewport.left && rect.left < viewport.right &&
+          rect.bottom > viewport.top && rect.top < viewport.bottom) {
+        intersectsViewport = true;
+        break;
+      }
+    }
+    if (!intersectsViewport) return 'OFFSCREEN';
+    const clippingRects = [];
+    let hardClip = false;
+    for (let ancestor = element.parentElement, level = 0;
+         ancestor && level < 32; ancestor = ancestor.parentElement, level += 1) {
+      const style = window.getComputedStyle(ancestor);
+      if ((style.clipPath && style.clipPath !== 'none') ||
+          (style.maskImage && style.maskImage !== 'none') ||
+          (style.clip && style.clip !== 'auto')) hardClip = true;
+      const clipsX = !['visible', 'unset', 'initial'].includes(style.overflowX);
+      const clipsY = !['visible', 'unset', 'initial'].includes(style.overflowY);
+      if (clipsX || clipsY) clippingRects.push({
+        rect: ancestor.getBoundingClientRect(), clipsX, clipsY
+      });
+    }
+    const ownStyle = window.getComputedStyle(element);
+    if ((ownStyle.clipPath && ownStyle.clipPath !== 'none') ||
+        (ownStyle.maskImage && ownStyle.maskImage !== 'none') ||
+        (ownStyle.clip && ownStyle.clip !== 'auto')) hardClip = true;
+    for (const rect of rects) {
+      if (rect.right <= viewport.left || rect.left >= viewport.right ||
+          rect.bottom <= viewport.top || rect.top >= viewport.bottom) continue;
+      if (hardClip) return 'CLIPPED';
+      let clipped = {
+        left: Math.max(rect.left, viewport.left),
+        top: Math.max(rect.top, viewport.top),
+        right: Math.min(rect.right, viewport.right),
+        bottom: Math.min(rect.bottom, viewport.bottom)
+      };
+      for (const clipping of clippingRects) {
+        if (clipping.clipsX) {
+          clipped.left = Math.max(clipped.left, clipping.rect.left);
+          clipped.right = Math.min(clipped.right, clipping.rect.right);
+        }
+        if (clipping.clipsY) {
+          clipped.top = Math.max(clipped.top, clipping.rect.top);
+          clipped.bottom = Math.min(clipped.bottom, clipping.rect.bottom);
+        }
+        if (clipped.right <= clipped.left || clipped.bottom <= clipped.top) break;
+      }
+      if (clipped.right > clipped.left && clipped.bottom > clipped.top) return 'VISIBLE';
+    }
+    return intersectsViewport ? 'CLIPPED' : 'OFFSCREEN';
   };
+  const visible = (element) => visibilityOf(element) === 'VISIBLE';
   const safeUrl = (href) => {
     if (typeof href !== 'string' || !href || href.length > 512 || href.startsWith('//')) return null;
     try {
@@ -264,7 +340,10 @@ DIAGNOSTIC_SCRIPT = r"""
 
   const candidates = Array.from(document.querySelectorAll(candidateSelector));
   if (candidates.length > maxCandidates) return {status: 'NODE_BOUND_EXCEEDED'};
-  const visibleCandidates = candidates.filter(visible);
+  const candidateVisibility = new Map(candidates.map((element) => [element, visibilityOf(element)]));
+  const visibleCandidates = candidates.filter((element) => candidateVisibility.get(element) === 'VISIBLE');
+  const offscreenCandidates = candidates.filter((element) => candidateVisibility.get(element) === 'OFFSCREEN');
+  const clippedCandidates = candidates.filter((element) => candidateVisibility.get(element) === 'CLIPPED');
   const descriptions = new Map();
   for (const element of visibleCandidates) {
     descriptions.set(element, {
@@ -436,7 +515,9 @@ DIAGNOSTIC_SCRIPT = r"""
     post_permalinks: bucket(postLinks.length),
     author_profile_links: bucket(profileLinks.length),
     panels: bucket(new Set(panelFor.values()).size),
-    visible_candidates: bucket(visibleCandidates.length)
+    visible_candidates: bucket(visibleCandidates.length),
+    offscreen_candidates: bucket(offscreenCandidates.length),
+    clipped_candidates: bucket(clippedCandidates.length)
   };
   return {
     status: 'OBSERVED',
@@ -446,7 +527,8 @@ DIAGNOSTIC_SCRIPT = r"""
     relations,
     query_match: queryMatch,
     self_profile_match: selfProfileLinks.length > 0,
-    body_status: bodyStatus
+    body_status: bodyStatus,
+    document_ready: document.readyState !== 'loading'
   };
 }
 """
@@ -471,6 +553,7 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
     query_match = value_dict.get("query_match")
     self_profile_match = value_dict.get("self_profile_match")
     body_status = value_dict.get("body_status")
+    document_ready = value_dict.get("document_ready")
     if not isinstance(raw_counts, dict):
         raise UiDiagnosticSchemaError
     counts_dict = cast(dict[str, object], raw_counts)
@@ -488,6 +571,7 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
         or type(self_profile_match) is not bool
         or not isinstance(body_status, str)
         or body_status not in _BODY_STATES
+        or type(document_ready) is not bool
     ):
         raise UiDiagnosticSchemaError
 
@@ -554,4 +638,5 @@ def validate_ui_diagnostic_snapshot(value: object) -> UiDiagnosticSnapshot:
         query_match=query_match,
         self_profile_match=self_profile_match,
         body_status=body_status,
+        document_ready=document_ready,
     )
