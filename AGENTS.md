@@ -1,4 +1,4 @@
-# Repository instructions — `pumni/threads-standalone`
+# Repository instruction
 
 Python 3.14 project using `uv`. Import namespace: `threads_platform`; CLI: `threads-local`.
 
