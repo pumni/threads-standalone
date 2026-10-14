@@ -769,3 +769,6 @@ def test_nested_browser_watch_help_exposes_disabled_browser_and_synthetic_source
     assert "--fixture-file" in captured.out
     assert "disabled pending" in captured.out
     assert "operator" in captured.out
+
+
+# Temporary BROWSER_ONLY hosted workflow validation; no behavior change.
