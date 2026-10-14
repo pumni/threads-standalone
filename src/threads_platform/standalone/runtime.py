@@ -533,3 +533,6 @@ class LocalRuntime:
         except OSError, RuntimeError, ValueError:
             raise StandaloneRuntimeError("LOCAL_PROFILE_UNAVAILABLE") from None
         return path
+
+
+# Temporary SHARED hosted workflow validation; no behavior change.
